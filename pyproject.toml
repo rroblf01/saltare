@@ -1,0 +1,63 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "saltare"
+version = "0.1.0"
+description = "Low-RAM ASGI HTTP server with a Zig backbone."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Ricardo Robles", email = "ricardo.r.f@hotmail.com" }
+]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+]
+
+[project.scripts]
+saltare = "saltare.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7",
+    "httpx>=0.27",
+]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.20"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/saltare"]
+# Pyi stubs and the compiled _core extension live next to __init__.py in the wheel
+wheel.exclude = ["**/*.zig", "**/*.zon"]
+
+[tool.cibuildwheel]
+build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*", "cp314-*"]
+skip = ["*-musllinux_*", "pp*", "*-win32", "*_i686"]
+build-verbosity = 1
+test-requires = ["pytest", "httpx"]
+test-command = "pytest -q {project}/tests"
+
+[tool.cibuildwheel.linux]
+before-all = "bash {project}/scripts/install-zig.sh"
+environment = { PATH = "/usr/local/bin:$PATH", ZIG_VERSION = "0.16.0" }
+archs = ["x86_64", "aarch64"]
+
+[tool.cibuildwheel.macos]
+before-all = "bash {project}/scripts/install-zig.sh"
+environment = { PATH = "/usr/local/bin:$PATH", ZIG_VERSION = "0.16.0", MACOSX_DEPLOYMENT_TARGET = "11.0" }
+archs = ["x86_64", "arm64"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

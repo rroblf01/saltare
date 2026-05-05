@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+wheelhouse/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Zig build artifacts
+zig-cache/
+zig-out/
+.zig-cache/
+
+# CMake / scikit-build-core
+_skbuild/
+CMakeCache.txt
+CMakeFiles/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
