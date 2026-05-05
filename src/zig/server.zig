@@ -36,7 +36,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.7.0";
+const SERVER_HEADER = "saltare/0.8.0";
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
@@ -101,7 +101,15 @@ const Connection = struct {
     parsed: ?http.Request,
     headers_storage: [http.max_headers]http.Header,
     body_offset: usize,
+    /// For Content-Length requests: the declared body size.
+    /// For chunked requests: set after decoding finishes to the decoded length.
     body_len: usize,
+
+    // Chunked-decoder state. Used only when `parsed.?.is_chunked` is true.
+    // Both offsets are relative to `body_offset` (i.e., into `data[body_offset..]`).
+    chunk_state: http.ChunkState,
+    chunk_consumed: usize,
+    chunk_decoded: usize,
 
     // Allocated by bridge.dispatch (or sendStatus); freed in `destroy` or
     // when transitioning back to .reading on keep-alive.
@@ -130,6 +138,9 @@ const Connection = struct {
             .headers_storage = undefined,
             .body_offset = 0,
             .body_len = 0,
+            .chunk_state = http.ChunkState.init(),
+            .chunk_consumed = 0,
+            .chunk_decoded = 0,
             .write_buf = &.{},
             .write_pos = 0,
             .keep_alive = false,
@@ -284,10 +295,16 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
             if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
                 conn.parsed = req;
                 conn.body_offset = req.body_offset;
-                conn.body_len = req.content_length orelse 0;
-                if (conn.body_offset + conn.body_len > data.len) {
-                    sendStatus(loop, conn, 413, "Content Too Large");
-                    return;
+                if (req.is_chunked) {
+                    conn.chunk_state = http.ChunkState.init();
+                    conn.chunk_consumed = 0;
+                    conn.chunk_decoded = 0;
+                } else {
+                    conn.body_len = req.content_length orelse 0;
+                    if (conn.body_offset + conn.body_len > data.len) {
+                        sendStatus(loop, conn, 413, "Content Too Large");
+                        return;
+                    }
                 }
             } else |err| switch (err) {
                 error.Incomplete => continue,
@@ -299,11 +316,37 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
             }
         }
 
-        if (conn.read_total >= conn.body_offset + conn.body_len) {
-            dispatch(loop, conn);
-            return;
+        // Body phase. Two paths: chunked Transfer-Encoding decodes in place,
+        // Content-Length just waits for `body_len` more bytes.
+        if (conn.parsed.?.is_chunked) {
+            const body_buf = data[conn.body_offset..];
+            const body_buf_len = conn.read_total - conn.body_offset;
+            switch (http.decodeChunkedInPlace(
+                body_buf,
+                body_buf_len,
+                &conn.chunk_state,
+                &conn.chunk_consumed,
+                &conn.chunk_decoded,
+            )) {
+                .needs_more => continue,
+                .done => {
+                    conn.body_len = conn.chunk_decoded;
+                    dispatch(loop, conn);
+                    return;
+                },
+                .invalid => {
+                    std.log.warn("chunked decode failed", .{});
+                    sendStatus(loop, conn, 400, "Bad Request");
+                    return;
+                },
+            }
+        } else {
+            if (conn.read_total >= conn.body_offset + conn.body_len) {
+                dispatch(loop, conn);
+                return;
+            }
+            // else: loop and read more
         }
-        // else: loop and read more
     }
 }
 
@@ -359,7 +402,13 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
 /// — the connection is truly idle and shouldn't tie up 16 KiB until the
 /// peer sends more bytes.
 fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
-    const consumed_end = conn.body_offset + conn.body_len;
+    // For chunked requests we consumed up to `chunk_consumed` raw bytes of
+    // chunked encoding (not `body_len`, which is the *decoded* length and
+    // is always shorter).
+    const consumed_end = if (conn.parsed != null and conn.parsed.?.is_chunked)
+        conn.body_offset + conn.chunk_consumed
+    else
+        conn.body_offset + conn.body_len;
     const leftover = conn.read_total - consumed_end;
 
     if (leftover > 0) {
@@ -381,6 +430,9 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
     conn.parsed = null;
     conn.body_offset = 0;
     conn.body_len = 0;
+    conn.chunk_state = http.ChunkState.init();
+    conn.chunk_consumed = 0;
+    conn.chunk_decoded = 0;
 
     if (conn.write_buf.len > 0) {
         conn.allocator.free(conn.write_buf);
@@ -406,15 +458,38 @@ fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
     if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
         conn.parsed = req;
         conn.body_offset = req.body_offset;
-        conn.body_len = req.content_length orelse 0;
-        if (conn.body_offset + conn.body_len > data.len) {
-            sendStatus(loop, conn, 413, "Content Too Large");
-            return;
+        if (req.is_chunked) {
+            conn.chunk_state = http.ChunkState.init();
+            conn.chunk_consumed = 0;
+            conn.chunk_decoded = 0;
+            // Try to decode whatever bytes we already have past the head.
+            const body_buf = data[conn.body_offset..];
+            const body_buf_len = conn.read_total - conn.body_offset;
+            switch (http.decodeChunkedInPlace(
+                body_buf,
+                body_buf_len,
+                &conn.chunk_state,
+                &conn.chunk_consumed,
+                &conn.chunk_decoded,
+            )) {
+                .needs_more => {}, // wait for more bytes
+                .done => {
+                    conn.body_len = conn.chunk_decoded;
+                    dispatch(loop, conn);
+                },
+                .invalid => sendStatus(loop, conn, 400, "Bad Request"),
+            }
+        } else {
+            conn.body_len = req.content_length orelse 0;
+            if (conn.body_offset + conn.body_len > data.len) {
+                sendStatus(loop, conn, 413, "Content Too Large");
+                return;
+            }
+            if (conn.read_total >= conn.body_offset + conn.body_len) {
+                dispatch(loop, conn);
+            }
+            // else: need more body bytes; wait for next read event.
         }
-        if (conn.read_total >= conn.body_offset + conn.body_len) {
-            dispatch(loop, conn);
-        }
-        // else: need more body bytes; wait for next read event.
     } else |err| switch (err) {
         error.Incomplete => {}, // wait for more
         else => {

@@ -41,8 +41,12 @@ pub const Request = struct {
     headers: []const Header,
     /// Index in the read buffer where the body starts (just past \r\n\r\n).
     body_offset: usize,
-    /// Parsed Content-Length, if present. `null` means no body framing.
+    /// Parsed Content-Length, if present. Ignored when `is_chunked` is true
+    /// (RFC 7230 says Transfer-Encoding wins over Content-Length).
     content_length: ?usize,
+    /// True when Transfer-Encoding includes "chunked" (case-insensitive,
+    /// any token in a comma-separated list).
+    is_chunked: bool,
 
     /// Whether the connection should be kept alive after this request.
     /// RFC 7230 §6.3:
@@ -107,6 +111,7 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
     // Headers
     var header_count: usize = 0;
     var content_length: ?usize = null;
+    var is_chunked: bool = false;
     var pos: usize = if (line_end < head.len) line_end + 2 else head.len;
 
     while (pos < head.len) {
@@ -135,6 +140,8 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
 
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidContentLength;
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            if (transferEncodingIsChunked(value)) is_chunked = true;
         }
 
         pos = eol + 2;
@@ -146,8 +153,119 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
         .version_minor = version_minor,
         .headers = headers_out[0..header_count],
         .body_offset = body_offset,
-        .content_length = content_length,
+        // RFC 7230 §3.3.3: if both Content-Length and Transfer-Encoding are
+        // present, Transfer-Encoding wins; we surface that by clearing CL.
+        .content_length = if (is_chunked) null else content_length,
+        .is_chunked = is_chunked,
     };
+}
+
+/// True if the Transfer-Encoding header value lists "chunked" as a token.
+/// Allows `chunked`, `gzip, chunked`, etc. — saltare won't decompress, just
+/// dechunk; a value that's chunked + gzip will deliver gzipped bytes to the
+/// app, which must know how to decompress.
+fn transferEncodingIsChunked(value: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(trimmed, "chunked")) return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Chunked Transfer-Encoding decoder (request bodies).
+//
+// In-place decoder: reads raw chunked bytes from a contiguous buffer and
+// rewrites the decoded bytes onto the same buffer. Because chunked encoding
+// always adds overhead (size lines + CRLFs) the decoded prefix is always at
+// or behind the raw cursor, so a forward copy is safe.
+//
+// State is caller-owned so decoding can resume across multiple read calls
+// without buffering the whole request first.
+
+pub const ChunkState = struct {
+    phase: Phase,
+    chunk_remaining: usize,
+
+    pub const Phase = enum { size, data, data_term, end_crlf, done };
+
+    pub fn init() ChunkState {
+        return .{ .phase = .size, .chunk_remaining = 0 };
+    }
+};
+
+pub const ChunkResult = enum { needs_more, done, invalid };
+
+/// Decode chunked bytes in-place. Reads raw bytes from
+/// `body_buf[consumed.*..body_buf_len]` and writes decoded bytes to
+/// `body_buf[..decoded.*]`. Trailers (headers between the 0-chunk and the
+/// final CRLF) are not supported in v0.8: a 0-chunk followed by anything
+/// other than `\r\n` returns `.invalid`.
+pub fn decodeChunkedInPlace(
+    body_buf: []u8,
+    body_buf_len: usize,
+    state: *ChunkState,
+    consumed: *usize,
+    decoded: *usize,
+) ChunkResult {
+    while (true) {
+        switch (state.phase) {
+            .done => return .done,
+            .size => {
+                const available = body_buf[consumed.*..body_buf_len];
+                const eol = std.mem.indexOf(u8, available, "\r\n") orelse return .needs_more;
+                const size_str = available[0..eol];
+                if (size_str.len == 0) return .invalid;
+
+                // Strip optional chunk extensions ("size;ext=value").
+                const semi = std.mem.indexOfScalar(u8, size_str, ';') orelse size_str.len;
+                const hex = std.mem.trim(u8, size_str[0..semi], " \t");
+                if (hex.len == 0) return .invalid;
+                const size = std.fmt.parseInt(usize, hex, 16) catch return .invalid;
+
+                state.chunk_remaining = size;
+                consumed.* += eol + 2;
+                state.phase = if (size == 0) .end_crlf else .data;
+            },
+            .data => {
+                if (state.chunk_remaining == 0) {
+                    state.phase = .data_term;
+                    continue;
+                }
+                const available = body_buf_len - consumed.*;
+                if (available == 0) return .needs_more;
+                const take = @min(state.chunk_remaining, available);
+
+                // Forward copy: decoded.* <= consumed.* always.
+                var i: usize = 0;
+                while (i < take) : (i += 1) {
+                    body_buf[decoded.* + i] = body_buf[consumed.* + i];
+                }
+                consumed.* += take;
+                decoded.* += take;
+                state.chunk_remaining -= take;
+                if (state.chunk_remaining == 0) state.phase = .data_term;
+            },
+            .data_term => {
+                if (body_buf_len - consumed.* < 2) return .needs_more;
+                if (body_buf[consumed.*] != '\r' or body_buf[consumed.* + 1] != '\n') {
+                    return .invalid;
+                }
+                consumed.* += 2;
+                state.phase = .size;
+            },
+            .end_crlf => {
+                if (body_buf_len - consumed.* < 2) return .needs_more;
+                if (body_buf[consumed.*] != '\r' or body_buf[consumed.* + 1] != '\n') {
+                    return .invalid;
+                }
+                consumed.* += 2;
+                state.phase = .done;
+                return .done;
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -250,4 +368,67 @@ test "wantsKeepAlive: token list with close" {
     var headers: [max_headers]Header = undefined;
     const req = try parse(buf, &headers);
     try testing.expect(!req.wantsKeepAlive());
+}
+
+test "parse: detects Transfer-Encoding: chunked" {
+    const buf = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n";
+    var headers: [max_headers]Header = undefined;
+    const req = try parse(buf, &headers);
+    try testing.expect(req.is_chunked);
+    try testing.expectEqual(@as(?usize, null), req.content_length);
+}
+
+test "parse: chunked overrides Content-Length" {
+    const buf = "POST / HTTP/1.1\r\nContent-Length: 99\r\nTransfer-Encoding: chunked\r\n\r\n";
+    var headers: [max_headers]Header = undefined;
+    const req = try parse(buf, &headers);
+    try testing.expect(req.is_chunked);
+    try testing.expectEqual(@as(?usize, null), req.content_length);
+}
+
+test "decodeChunkedInPlace: simple two-chunk body" {
+    var buf = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".*;
+    var state = ChunkState.init();
+    var consumed: usize = 0;
+    var decoded: usize = 0;
+    const result = decodeChunkedInPlace(&buf, buf.len, &state, &consumed, &decoded);
+    try testing.expectEqual(ChunkResult.done, result);
+    try testing.expectEqualStrings("hello world", buf[0..decoded]);
+}
+
+test "decodeChunkedInPlace: empty body (just 0-chunk)" {
+    var buf = "0\r\n\r\n".*;
+    var state = ChunkState.init();
+    var consumed: usize = 0;
+    var decoded: usize = 0;
+    const result = decodeChunkedInPlace(&buf, buf.len, &state, &consumed, &decoded);
+    try testing.expectEqual(ChunkResult.done, result);
+    try testing.expectEqual(@as(usize, 0), decoded);
+}
+
+test "decodeChunkedInPlace: resumable across reads" {
+    var buf: [64]u8 = undefined;
+    @memcpy(buf[0..14], "5\r\nhello\r\n6\r\n ");
+    var state = ChunkState.init();
+    var consumed: usize = 0;
+    var decoded: usize = 0;
+
+    // Only the first 14 bytes are available; we should be told to wait.
+    var result = decodeChunkedInPlace(&buf, 14, &state, &consumed, &decoded);
+    try testing.expectEqual(ChunkResult.needs_more, result);
+
+    // Append the rest and resume.
+    @memcpy(buf[14..27], "world\r\n0\r\n\r\n");
+    result = decodeChunkedInPlace(&buf, 26, &state, &consumed, &decoded);
+    try testing.expectEqual(ChunkResult.done, result);
+    try testing.expectEqualStrings("hello world", buf[0..decoded]);
+}
+
+test "decodeChunkedInPlace: rejects invalid hex" {
+    var buf = "zz\r\n\r\n".*;
+    var state = ChunkState.init();
+    var consumed: usize = 0;
+    var decoded: usize = 0;
+    const result = decodeChunkedInPlace(&buf, buf.len, &state, &consumed, &decoded);
+    try testing.expectEqual(ChunkResult.invalid, result);
 }

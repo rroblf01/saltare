@@ -45,28 +45,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.7.0:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.8.0:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.98 MiB |      43.98 MiB | 43.98 MiB |    1000 | 2595 |
-| uvicorn | 43.80 MiB |      43.84 MiB | 43.84 MiB |    1000 | 2925 |
+| saltare | 43.96 MiB |      43.96 MiB | 43.96 MiB |    1000 | 2606 |
+| uvicorn | 43.88 MiB |      43.91 MiB | 43.91 MiB |    1000 | 2931 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 40.64 MiB |      40.70 MiB | 40.70 MiB |    2000 | 3866 |
-| uvicorn | 43.81 MiB |      44.29 MiB | 44.29 MiB |    2000 | 3995 |
+| saltare | 40.54 MiB |      40.60 MiB | 40.60 MiB |    2000 | 3886 |
+| uvicorn | 43.82 MiB |      44.27 MiB | 44.27 MiB |    2000 | 3981 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 40.47 MiB |      41.42 MiB | 41.42 MiB |     500 | 3553      |
-| uvicorn | 43.88 MiB |      49.18 MiB | 49.18 MiB |     500 | 2612      |
+| saltare | 40.46 MiB |      41.42 MiB | 41.42 MiB |     500 | 3572      |
+| uvicorn | 43.82 MiB |      49.12 MiB | 49.12 MiB |     500 | 2974      |
 
 **Read this honestly:**
 
@@ -86,7 +86,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.5.0** — HTTP/1.1 keep-alive. Persistent connections reset their state machine in place (read buffer compacted, write buffer freed, epoll switched back to read interest). Pipelined requests handled inline without an extra epoll round-trip.
 - [x] **v0.6.0** — Pooled read buffers. Idle keep-alive connections release their 16 KiB read buffer back to a shared pool; the next read event re-acquires one. RSS now scales with **in-flight requests**, not with **open connections**. Result: ~5× less per-connection memory than uvicorn at idle.
 - [x] **v0.7.0** — ASGI lifespan protocol. The dispatcher creates a long-lived asyncio Task that drives the app through `lifespan.startup` before the I/O loop accepts connections, and through `lifespan.shutdown` after it stops. Apps using `FastAPI(lifespan=...)` now get their startup/shutdown hooks executed. Apps that raise on lifespan scope (no support) are tolerated.
-- [ ] **v0.8.0** — Chunked Transfer-Encoding (request and response).
+- [x] **v0.8.0** — Chunked Transfer-Encoding for *request* bodies. Decoder runs in place over the read buffer; resumable across kernel reads. Streaming *response* bodies (true chunked output) still buffer in Python and emit Content-Length — that lands when the dispatcher gets a callback path back into Zig.
 - [ ] **v0.9.0** — TLS (via BoringSSL or stdlib).
 - [ ] **v0.10.0** — WebSockets.
 - [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`).
