@@ -47,7 +47,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.4.0"
+_SERVER_HEADER = b"saltare/0.6.0"
 
 
 def dispatch(
@@ -59,6 +59,7 @@ def dispatch(
     body: bytes,
     server_host: str,
     server_port: int,
+    keep_alive: int,
 ) -> bytes:
     """Run the ASGI app once. Returns the full HTTP/1.1 response as bytes."""
     loop = _ensure_loop()
@@ -66,7 +67,7 @@ def dispatch(
     try:
         path = unquote_to_bytes(raw_path).decode("utf-8")
     except UnicodeDecodeError:
-        return _build_wire(400, [], b"path is not valid UTF-8\n")
+        return _build_wire(400, [], b"path is not valid UTF-8\n", keep_alive=False)
 
     # ASGI requires lowercased header names.
     headers = [(name.lower(), value) for name, value in raw_headers]
@@ -107,10 +108,12 @@ def dispatch(
         loop.run_until_complete(app(scope, receive, send))
     except Exception:
         traceback.print_exc(file=sys.stderr)
+        # Errors close the connection — parser/state is no longer trustworthy.
         return _build_wire(
             500,
             [(b"content-type", b"text/plain; charset=utf-8")],
             b"Internal Server Error\n",
+            keep_alive=False,
         )
 
     status = 500
@@ -126,21 +129,26 @@ def dispatch(
             if chunk:
                 body_chunks.append(chunk)
 
-    return _build_wire(status, out_headers, b"".join(body_chunks))
+    return _build_wire(status, out_headers, b"".join(body_chunks), keep_alive=bool(keep_alive))
 
 
 def _build_wire(
     status: int,
     headers: list[tuple[bytes, bytes]],
     body: bytes,
+    *,
+    keep_alive: bool,
 ) -> bytes:
     reason = _REASONS.get(status, "OK")
     parts: list[bytes] = [f"HTTP/1.1 {status} {reason}\r\n".encode("ascii")]
     parts.append(b"server: " + _SERVER_HEADER + b"\r\n")
-    parts.append(b"connection: close\r\n")
+    parts.append(b"connection: keep-alive\r\n" if keep_alive else b"connection: close\r\n")
 
     has_content_length = False
     for name, value in headers:
+        # Strip any Connection header from the app — saltare owns that decision.
+        if name.lower() == b"connection":
+            continue
         if name.lower() == b"content-length":
             has_content_length = True
         parts.append(name + b": " + value + b"\r\n")

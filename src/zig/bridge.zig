@@ -70,11 +70,16 @@ pub fn shutdown() void {
 /// Run one ASGI dispatch and return the wire response as a freshly allocated
 /// buffer. Returns `null` on failure (Python exception was printed to stderr).
 /// Caller (server.zig) must NOT hold the GIL — we re-acquire it here.
-pub fn dispatch(req: http.Request, body: []const u8, allocator: std.mem.Allocator) ?[]u8 {
+pub fn dispatch(
+    req: http.Request,
+    body: []const u8,
+    keep_alive: bool,
+    allocator: std.mem.Allocator,
+) ?[]u8 {
     const gstate = py.PyGILState_Ensure();
     defer py.PyGILState_Release(gstate);
 
-    const result = callDispatch(req, body) orelse {
+    const result = callDispatch(req, body, keep_alive) orelse {
         py.PyErr_Print();
         return null;
     };
@@ -93,7 +98,7 @@ pub fn dispatch(req: http.Request, body: []const u8, allocator: std.mem.Allocato
     return buf;
 }
 
-fn callDispatch(req: http.Request, body: []const u8) ?*py.PyObject {
+fn callDispatch(req: http.Request, body: []const u8, keep_alive: bool) ?*py.PyObject {
     // Split the request-target into raw_path and query_string at the first '?'.
     const q_idx = std.mem.indexOfScalar(u8, req.target, '?');
     const raw_path = if (q_idx) |i| req.target[0..i] else req.target;
@@ -102,10 +107,10 @@ fn callDispatch(req: http.Request, body: []const u8) ?*py.PyObject {
     const headers_obj = buildHeadersList(req.headers) orelse return null;
     defer py.Py_DecRef(headers_obj);
 
-    // Args: (app, method, raw_path, query_string, headers, body, host, port)
+    // Args: (app, method, raw_path, query_string, headers, body, host, port, keep_alive)
     return py.PyObject_CallFunction(
         g_dispatch.?,
-        "Os#y#y#Oy#Oi",
+        "Os#y#y#Oy#Oii",
         g_app.?,
         @as([*c]const u8, @ptrCast(req.method.ptr)),
         @as(py.Py_ssize_t, @intCast(req.method.len)),
@@ -118,6 +123,7 @@ fn callDispatch(req: http.Request, body: []const u8) ?*py.PyObject {
         @as(py.Py_ssize_t, @intCast(body.len)),
         g_server_host.?,
         g_server_port,
+        @as(c_int, if (keep_alive) 1 else 0),
     );
 }
 

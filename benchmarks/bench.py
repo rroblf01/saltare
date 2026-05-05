@@ -1,26 +1,29 @@
 """Measure RSS for saltare and uvicorn under identical load.
 
-Two workloads:
+Three workloads:
 
-  sequential:   1 client, N requests in a row. Measures the steady-state RAM
-                cost when there's never more than one connection alive.
-                Comparable across versions of saltare; mostly bounded below
-                by Python + FastAPI's irreducible RSS floor.
+  sequential:     1 client, N requests in a row. Measures the steady-state
+                  RAM cost when there's never more than one connection alive.
 
-  concurrent:   C clients × M requests each, fired in C OS threads. Each
-                client opens its own TCP connection. Measures peak RSS while
-                up to C connections are alive at once. This is where the Zig
-                per-connection structs (~hundreds of bytes) beat asyncio's
-                Transport/Protocol/Task allocations (~KB each).
+  concurrent:     C clients × M requests each, fired in C OS threads. Each
+                  client opens its own TCP connection. Measures peak RSS
+                  while up to C connections are alive AND active at once.
 
-We poll /proc/<pid>/status every 10 ms during the load to capture VmRSS /
-VmHWM peaks rather than just the post-load reading.
+  idle-keepalive: Open N connections, send one request on each, then leave
+                  them all idle (open but quiet). Measures the per-connection
+                  cost of *holding* a keep-alive connection. This is where
+                  saltare's pooled read buffers vs uvicorn's Transport
+                  allocations show the biggest contrast.
+
+We poll /proc/<pid>/status every 10 ms to capture peaks rather than relying
+on the post-load reading.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -155,6 +158,67 @@ def run_sequential(name: str, module: str, port: int, n_requests: int) -> Result
         _terminate(proc)
 
 
+def _drain_response(sock: socket.socket) -> None:
+    """Read one full HTTP/1.1 response from a raw socket. Saltare and uvicorn
+    both emit Content-Length, so we don't need to handle chunked here."""
+    sock.settimeout(2.0)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    cl = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            cl = int(line.split(b":", 1)[1].strip())
+            break
+    while len(rest) < cl:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return
+        rest += chunk
+
+
+def run_idle_keepalive(name: str, module: str, port: int, n_idle: int) -> Result:
+    proc = _spawn(module, port)
+    try:
+        wait_ready(port)
+        time.sleep(0.5)
+        idle = read_status(proc.pid)
+
+        sockets: list[socket.socket] = []
+        try:
+            t0 = time.monotonic()
+            for _ in range(n_idle):
+                s = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+                # HTTP/1.1 with no Connection header → keep-alive.
+                s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                _drain_response(s)
+                sockets.append(s)
+            elapsed = time.monotonic() - t0
+
+            # Let the server fully transition to "all keep-alive idle".
+            time.sleep(0.5)
+
+            with _PeakSampler(proc.pid) as sampler:
+                # Observe RSS for a full second while everything is idle.
+                time.sleep(1.0)
+                snapshot = read_status(proc.pid)
+        finally:
+            for s in sockets:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+        peak = max(sampler.peak_rss_kib, snapshot.vm_rss_kib, idle.vm_rss_kib)
+        return Result(name, "idle-keepalive", idle, snapshot, peak, n_idle, elapsed)
+    finally:
+        _terminate(proc)
+
+
 def run_concurrent(
     name: str,
     module: str,
@@ -247,10 +311,13 @@ def main() -> None:
                         help="parallel clients in the concurrent workload")
     parser.add_argument("--per-client", type=int, default=20,
                         help="requests per client in the concurrent workload")
+    parser.add_argument("--idle-connections", type=int, default=500,
+                        help="connections held open in the idle-keepalive workload")
     args = parser.parse_args()
 
-    print(f"\nsequential: {args.requests} requests / 1 client")
-    print(f"concurrent: {args.concurrency} clients × {args.per_client} requests\n")
+    print(f"\nsequential:     {args.requests} requests / 1 client")
+    print(f"concurrent:     {args.concurrency} clients × {args.per_client} requests")
+    print(f"idle-keepalive: {args.idle_connections} keep-alive connections held open\n")
 
     results: list[Result] = []
     for name, module in (("saltare", "benchmarks.run_saltare"),
@@ -264,6 +331,12 @@ def main() -> None:
             name, module, port=18002,
             concurrency=args.concurrency,
             requests_per_client=args.per_client,
+        ))
+    for name, module in (("saltare", "benchmarks.run_saltare"),
+                         ("uvicorn", "benchmarks.run_uvicorn")):
+        results.append(run_idle_keepalive(
+            name, module, port=18003,
+            n_idle=args.idle_connections,
         ))
 
     render(results)

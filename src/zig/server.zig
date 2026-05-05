@@ -1,21 +1,21 @@
-// Saltare network core (v0.4).
+// Saltare network core (v0.6).
 //
-// Single-threaded non-blocking event loop on top of epoll. Connections
-// progress through a small state machine (reading -> writing -> close).
-// I/O happens with the GIL released; the bridge re-acquires the GIL only
-// for the synchronous ASGI dispatch step. Multiple connections can be
-// in different states simultaneously — the dispatch is the serialization
-// point (same constraint as any GIL-bound Python server).
+// Single-threaded non-blocking event loop on top of epoll, with HTTP/1.1
+// keep-alive and a shared pool for read buffers. RSS scales with the number
+// of *in-flight* requests rather than the number of *open keep-alive
+// connections*: idle connections release their 16 KiB buffer back to the
+// pool and reclaim one on the next read event.
 //
 // Out of scope (planned for later):
-//   - keep-alive, chunked Transfer-Encoding, streaming bodies (v0.5)
-//   - TLS (v0.6), WebSockets (v0.7), multi-worker (v1.0)
+//   - lifespan, chunked Transfer-Encoding, streaming bodies (v0.5.x)
+//   - TLS (v0.7), WebSockets (v0.8), multi-worker (v1.0)
 //   - kqueue backend for macOS — see eventloop.zig's compileError
 
 const std = @import("std");
 const http = @import("http.zig");
 const bridge = @import("bridge.zig");
 const eventloop = @import("eventloop.zig");
+const pool_mod = @import("pool.zig");
 
 const c = @cImport({
     @cInclude("sys/socket.h");
@@ -36,10 +36,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.4.0";
-
-// Per-connection read buffer. Holds head + body. Bigger requests get 413/431.
-const READ_BUFFER_SIZE = 16 * 1024;
+const SERVER_HEADER = "saltare/0.6.0";
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
@@ -93,7 +90,11 @@ const ConnState = enum { reading, writing };
 const Connection = struct {
     fd: c_int,
     state: ConnState,
-    read_buf: [READ_BUFFER_SIZE]u8,
+
+    /// Borrowed from the pool while a request is in flight, returned to the
+    /// pool when the connection goes idle (between keep-alive requests).
+    /// Null means "no request in progress, no buffer reserved".
+    read_buf: ?*pool_mod.Buffer,
     read_total: usize,
 
     // Filled in once the head is fully parsed.
@@ -102,18 +103,28 @@ const Connection = struct {
     body_offset: usize,
     body_len: usize,
 
-    // Allocated by bridge.dispatch (or sendStatus); freed in `destroy`.
+    // Allocated by bridge.dispatch (or sendStatus); freed in `destroy` or
+    // when transitioning back to .reading on keep-alive.
     write_buf: []u8,
     write_pos: usize,
 
-    allocator: std.mem.Allocator,
+    /// Set by `dispatch` based on the request's Connection header / version.
+    /// Drives whether `doWrite` resets for the next request or closes.
+    keep_alive: bool,
 
-    fn create(allocator: std.mem.Allocator, fd: c_int) !*Connection {
+    allocator: std.mem.Allocator,
+    pool: *pool_mod.Pool,
+
+    fn create(
+        allocator: std.mem.Allocator,
+        pool: *pool_mod.Pool,
+        fd: c_int,
+    ) !*Connection {
         const conn = try allocator.create(Connection);
         conn.* = .{
             .fd = fd,
             .state = .reading,
-            .read_buf = undefined,
+            .read_buf = null,
             .read_total = 0,
             .parsed = null,
             .headers_storage = undefined,
@@ -121,15 +132,31 @@ const Connection = struct {
             .body_len = 0,
             .write_buf = &.{},
             .write_pos = 0,
+            .keep_alive = false,
             .allocator = allocator,
+            .pool = pool,
         };
         return conn;
     }
 
     fn destroy(self: *Connection) void {
+        if (self.read_buf) |b| self.pool.release(b);
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
         _ = c.close(self.fd);
         self.allocator.destroy(self);
+    }
+
+    fn ensureBuffer(self: *Connection) !void {
+        if (self.read_buf == null) {
+            self.read_buf = try self.pool.acquire();
+        }
+    }
+
+    fn releaseBuffer(self: *Connection) void {
+        if (self.read_buf) |b| {
+            self.pool.release(b);
+            self.read_buf = null;
+        }
     }
 };
 
@@ -169,6 +196,8 @@ pub fn run(host: []const u8, port: u16) !void {
     try loop.add(listen_fd, @ptrCast(&listener_marker), true, false);
 
     const allocator = std.heap.c_allocator;
+    var rb_pool = pool_mod.Pool.init(allocator);
+    defer rb_pool.deinit();
 
     std.log.info("saltare listening on {s}:{d}", .{ host, port });
 
@@ -177,7 +206,7 @@ pub fn run(host: []const u8, port: u16) !void {
         for (events) |ev| {
             if (g_should_stop.load(.seq_cst)) break;
             if (isListenerEvent(ev.data)) {
-                acceptAll(&loop, listen_fd, allocator);
+                acceptAll(&loop, listen_fd, allocator, &rb_pool);
             } else if (ev.data) |raw| {
                 const conn: *Connection = @ptrCast(@alignCast(raw));
                 handleConnEvent(&loop, conn, ev);
@@ -188,12 +217,17 @@ pub fn run(host: []const u8, port: u16) !void {
     _ = c.close(listen_fd);
 }
 
-fn acceptAll(loop: *eventloop.Loop, listen_fd: c_int, allocator: std.mem.Allocator) void {
+fn acceptAll(
+    loop: *eventloop.Loop,
+    listen_fd: c_int,
+    allocator: std.mem.Allocator,
+    p: *pool_mod.Pool,
+) void {
     while (true) {
         const client = accept4(listen_fd, null, null, c.SOCK_NONBLOCK | c.SOCK_CLOEXEC);
         if (client < 0) return; // EAGAIN: drained the backlog
 
-        const conn = Connection.create(allocator, client) catch {
+        const conn = Connection.create(allocator, p, client) catch {
             _ = c.close(client);
             continue;
         };
@@ -218,8 +252,15 @@ fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event
 }
 
 fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
+    // Lazy: only claim a buffer from the pool when we actually need to read.
+    conn.ensureBuffer() catch {
+        sendStatus(loop, conn, 503, "Service Unavailable");
+        return;
+    };
+    const data = &conn.read_buf.?.data;
+
     while (true) {
-        const remaining = conn.read_buf[conn.read_total..];
+        const remaining = data[conn.read_total..];
         if (remaining.len == 0) {
             sendStatus(loop, conn, 431, "Request Header Fields Too Large");
             return;
@@ -233,18 +274,18 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
             return;
         }
         if (n < 0) {
-            // Almost always EAGAIN under non-blocking I/O. If it's a real
-            // error, the next epoll cycle delivers EPOLLERR/EPOLLHUP.
+            // Almost always EAGAIN under non-blocking I/O. Real errors will
+            // surface via EPOLLERR/EPOLLHUP on the next epoll cycle.
             return;
         }
         conn.read_total += @intCast(n);
 
         if (conn.parsed == null) {
-            if (http.parse(conn.read_buf[0..conn.read_total], &conn.headers_storage)) |req| {
+            if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
                 conn.parsed = req;
                 conn.body_offset = req.body_offset;
                 conn.body_len = req.content_length orelse 0;
-                if (conn.body_offset + conn.body_len > conn.read_buf.len) {
+                if (conn.body_offset + conn.body_len > data.len) {
                     sendStatus(loop, conn, 413, "Content Too Large");
                     return;
                 }
@@ -268,9 +309,11 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
 
 fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     const req = conn.parsed.?;
-    const body = conn.read_buf[conn.body_offset .. conn.body_offset + conn.body_len];
+    const data = &conn.read_buf.?.data;
+    const body = data[conn.body_offset .. conn.body_offset + conn.body_len];
+    const keep_alive = req.wantsKeepAlive();
 
-    const response = bridge.dispatch(req, body, conn.allocator) orelse {
+    const response = bridge.dispatch(req, body, keep_alive, conn.allocator) orelse {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
     };
@@ -278,6 +321,7 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_buf = response;
     conn.write_pos = 0;
     conn.state = .writing;
+    conn.keep_alive = keep_alive;
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
         loop.remove(conn.fd);
@@ -285,8 +329,6 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         return;
     };
 
-    // Try to drain immediately — small responses usually finish in one shot
-    // and we close without waiting for an EPOLLOUT round-trip.
     doWrite(loop, conn);
 }
 
@@ -302,9 +344,84 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
         }
         conn.write_pos += @intCast(n);
     }
-    // Done writing — close.
-    loop.remove(conn.fd);
-    conn.destroy();
+
+    if (conn.keep_alive) {
+        keepAliveReset(loop, conn);
+    } else {
+        loop.remove(conn.fd);
+        conn.destroy();
+    }
+}
+
+/// Reset connection state for the next keep-alive request. If pipelined
+/// bytes are sitting in the buffer past the consumed body, keep the buffer
+/// and compact them to the front. Otherwise release the buffer to the pool
+/// — the connection is truly idle and shouldn't tie up 16 KiB until the
+/// peer sends more bytes.
+fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
+    const consumed_end = conn.body_offset + conn.body_len;
+    const leftover = conn.read_total - consumed_end;
+
+    if (leftover > 0) {
+        const data = &conn.read_buf.?.data;
+        // Forward in-place copy: dest_start (0) < src_start (consumed_end),
+        // so a left-to-right loop handles overlap correctly.
+        var i: usize = 0;
+        while (i < leftover) : (i += 1) {
+            data[i] = data[consumed_end + i];
+        }
+        conn.read_total = leftover;
+    } else {
+        // Idle: hand the buffer back so RSS isn't held hostage by an idle
+        // keep-alive connection.
+        conn.releaseBuffer();
+        conn.read_total = 0;
+    }
+
+    conn.parsed = null;
+    conn.body_offset = 0;
+    conn.body_len = 0;
+
+    if (conn.write_buf.len > 0) {
+        conn.allocator.free(conn.write_buf);
+        conn.write_buf = &.{};
+    }
+    conn.write_pos = 0;
+    conn.state = .reading;
+    conn.keep_alive = false;
+
+    loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+
+    if (leftover > 0) {
+        tryParsePipelined(loop, conn);
+    }
+}
+
+fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
+    const data = &conn.read_buf.?.data;
+    if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
+        conn.parsed = req;
+        conn.body_offset = req.body_offset;
+        conn.body_len = req.content_length orelse 0;
+        if (conn.body_offset + conn.body_len > data.len) {
+            sendStatus(loop, conn, 413, "Content Too Large");
+            return;
+        }
+        if (conn.read_total >= conn.body_offset + conn.body_len) {
+            dispatch(loop, conn);
+        }
+        // else: need more body bytes; wait for next read event.
+    } else |err| switch (err) {
+        error.Incomplete => {}, // wait for more
+        else => {
+            std.log.warn("pipelined parse failed: {s}", .{@errorName(err)});
+            sendStatus(loop, conn, 400, "Bad Request");
+        },
+    }
 }
 
 fn sendStatus(loop: *eventloop.Loop, conn: *Connection, code: u16, reason: []const u8) void {
@@ -323,7 +440,6 @@ fn sendStatus(loop: *eventloop.Loop, conn: *Connection, code: u16, reason: []con
         return;
     };
 
-    // Heap-copy so write_buf has the same lifetime as the connection.
     const heap = conn.allocator.alloc(u8, formatted.len) catch {
         loop.remove(conn.fd);
         conn.destroy();
@@ -335,6 +451,8 @@ fn sendStatus(loop: *eventloop.Loop, conn: *Connection, code: u16, reason: []con
     conn.write_buf = heap;
     conn.write_pos = 0;
     conn.state = .writing;
+    // Errors always close — parser/state may be stale, can't safely keep-alive.
+    conn.keep_alive = false;
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
         loop.remove(conn.fd);

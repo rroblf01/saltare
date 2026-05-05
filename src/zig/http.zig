@@ -43,7 +43,38 @@ pub const Request = struct {
     body_offset: usize,
     /// Parsed Content-Length, if present. `null` means no body framing.
     content_length: ?usize,
+
+    /// Whether the connection should be kept alive after this request.
+    /// RFC 7230 §6.3:
+    ///   - HTTP/1.1: persistent unless `Connection: close` is present.
+    ///   - HTTP/1.0: close unless `Connection: keep-alive` is present.
+    pub fn wantsKeepAlive(self: Request) bool {
+        var conn_value: ?[]const u8 = null;
+        for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "connection")) {
+                conn_value = h.value;
+                break;
+            }
+        }
+
+        return switch (self.version_minor) {
+            1 => if (conn_value) |v| !connectionTokenPresent(v, "close") else true,
+            0 => if (conn_value) |v| connectionTokenPresent(v, "keep-alive") else false,
+            else => false,
+        };
+    }
 };
+
+/// Treat a Connection header value as a comma-separated token list and
+/// return true if `needle` appears (ASCII case-insensitive, OWS-trimmed).
+fn connectionTokenPresent(value: []const u8, needle: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    while (iter.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(trimmed, needle)) return true;
+    }
+    return false;
+}
 
 pub const max_headers = 64;
 
@@ -184,4 +215,39 @@ test "rejects header without colon" {
     const buf = "GET / HTTP/1.1\r\nNoColonHere\r\n\r\n";
     var headers: [max_headers]Header = undefined;
     try testing.expectError(error.BadHeader, parse(buf, &headers));
+}
+
+test "wantsKeepAlive: HTTP/1.1 default is keep-alive" {
+    const buf = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    var headers: [max_headers]Header = undefined;
+    const req = try parse(buf, &headers);
+    try testing.expect(req.wantsKeepAlive());
+}
+
+test "wantsKeepAlive: HTTP/1.1 with Connection: close" {
+    const buf = "GET / HTTP/1.1\r\nConnection: close\r\n\r\n";
+    var headers: [max_headers]Header = undefined;
+    const req = try parse(buf, &headers);
+    try testing.expect(!req.wantsKeepAlive());
+}
+
+test "wantsKeepAlive: HTTP/1.0 default is close" {
+    const buf = "GET / HTTP/1.0\r\nHost: x\r\n\r\n";
+    var headers: [max_headers]Header = undefined;
+    const req = try parse(buf, &headers);
+    try testing.expect(!req.wantsKeepAlive());
+}
+
+test "wantsKeepAlive: HTTP/1.0 with Connection: Keep-Alive" {
+    const buf = "GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n";
+    var headers: [max_headers]Header = undefined;
+    const req = try parse(buf, &headers);
+    try testing.expect(req.wantsKeepAlive());
+}
+
+test "wantsKeepAlive: token list with close" {
+    const buf = "GET / HTTP/1.1\r\nConnection: keep-alive, close\r\n\r\n";
+    var headers: [max_headers]Header = undefined;
+    const req = try parse(buf, &headers);
+    try testing.expect(!req.wantsKeepAlive());
 }
