@@ -30,7 +30,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.6.0");
+    return py.PyUnicode_FromString("0.7.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -55,11 +55,20 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         return null;
     }
 
+    // ASGI lifespan startup. If the app explicitly fails (e.g. raises
+    // lifespan.startup.failed), refuse to serve.
+    if (!bridge.lifespanStartup()) {
+        bridge.shutdown();
+        py.PyErr_SetString(py.PyExc_RuntimeError, "saltare: lifespan startup failed");
+        return null;
+    }
+
     // Release the GIL: the I/O loop is pure Zig and only re-acquires the
-    // GIL once per request, inside bridge.handleRequest.
+    // GIL once per request, inside bridge.dispatch.
     const tstate = py.PyEval_SaveThread();
     server.run(host, @intCast(port)) catch |err| {
         py.PyEval_RestoreThread(tstate);
+        bridge.lifespanShutdown();
         bridge.shutdown();
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrintZ(
@@ -72,6 +81,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     };
     py.PyEval_RestoreThread(tstate);
 
+    // Drive the lifespan shutdown event before tearing down the bridge —
+    // we still need g_lifespan_shutdown alive for the call.
+    bridge.lifespanShutdown();
     bridge.shutdown();
 
     if (py.PyErr_CheckSignals() != 0) return null;

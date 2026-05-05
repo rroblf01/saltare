@@ -23,6 +23,8 @@ pub const py = @cImport({
 
 var g_app: ?*py.PyObject = null;
 var g_dispatch: ?*py.PyObject = null;
+var g_lifespan_startup: ?*py.PyObject = null;
+var g_lifespan_shutdown: ?*py.PyObject = null;
 var g_server_host: ?*py.PyObject = null;
 var g_server_port: c_int = 0;
 
@@ -40,6 +42,8 @@ pub fn init(app: *py.PyObject, server_host: []const u8, server_port: c_int) bool
     defer py.Py_DecRef(mod);
 
     g_dispatch = py.PyObject_GetAttrString(mod, "dispatch") orelse return false;
+    g_lifespan_startup = py.PyObject_GetAttrString(mod, "lifespan_startup") orelse return false;
+    g_lifespan_shutdown = py.PyObject_GetAttrString(mod, "lifespan_shutdown") orelse return false;
 
     g_server_host = py.PyUnicode_FromStringAndSize(
         @as([*c]const u8, @ptrCast(server_host.ptr)),
@@ -57,6 +61,14 @@ pub fn shutdown() void {
         py.Py_DecRef(d);
         g_dispatch = null;
     }
+    if (g_lifespan_startup) |s| {
+        py.Py_DecRef(s);
+        g_lifespan_startup = null;
+    }
+    if (g_lifespan_shutdown) |s| {
+        py.Py_DecRef(s);
+        g_lifespan_shutdown = null;
+    }
     if (g_app) |a| {
         py.Py_DecRef(a);
         g_app = null;
@@ -65,6 +77,28 @@ pub fn shutdown() void {
         py.Py_DecRef(h);
         g_server_host = null;
     }
+}
+
+/// Drive the ASGI app's lifespan startup. Caller (module.zig) holds the GIL.
+/// Returns true on success or if the app doesn't support lifespan; false on
+/// explicit startup failure or timeout. The Python helper handles all the
+/// asyncio orchestration.
+pub fn lifespanStartup() bool {
+    const result = py.PyObject_CallOneArg(g_lifespan_startup.?, g_app.?) orelse {
+        py.PyErr_Print();
+        return false;
+    };
+    defer py.Py_DecRef(result);
+    return py.PyObject_IsTrue(result) == 1;
+}
+
+/// Drive the ASGI app's lifespan shutdown. Best-effort. Caller holds the GIL.
+pub fn lifespanShutdown() void {
+    const result = py.PyObject_CallNoArgs(g_lifespan_shutdown.?) orelse {
+        py.PyErr_Print();
+        return;
+    };
+    py.Py_DecRef(result);
 }
 
 /// Run one ASGI dispatch and return the wire response as a freshly allocated

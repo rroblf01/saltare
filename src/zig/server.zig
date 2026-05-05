@@ -36,7 +36,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.6.0";
+const SERVER_HEADER = "saltare/0.7.0";
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);

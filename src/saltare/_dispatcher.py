@@ -27,12 +27,172 @@ from urllib.parse import unquote_to_bytes
 
 _loop: asyncio.AbstractEventLoop | None = None
 
+# Lifespan state. The task is created in `lifespan_startup` and stays parked
+# on its receive() between server start and shutdown. Globals because there
+# is at most one server per process and the bridge calls these as plain
+# top-level functions.
+_lifespan_task: asyncio.Task | None = None
+_lifespan_receive_queue: asyncio.Queue | None = None
+_lifespan_send_queue: asyncio.Queue | None = None
+
 
 def _ensure_loop() -> asyncio.AbstractEventLoop:
     global _loop
     if _loop is None:
         _loop = asyncio.new_event_loop()
     return _loop
+
+
+_LIFESPAN_TIMEOUT = 10.0
+
+
+async def _drive_lifespan_event(
+    task: asyncio.Task,
+    send_queue: asyncio.Queue,
+    timeout: float = _LIFESPAN_TIMEOUT,
+) -> tuple[str, Any]:
+    """Wait for either a message from the app via send_queue, or for the
+    lifespan task to finish. Returns a (kind, value) tuple where kind is one
+    of: 'message', 'returned', 'exception', 'cancelled', 'timeout'."""
+    receive_task = asyncio.create_task(send_queue.get())
+    try:
+        done, _pending = await asyncio.wait(
+            {receive_task, task},
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=timeout,
+        )
+    finally:
+        if not receive_task.done():
+            receive_task.cancel()
+
+    if receive_task in done:
+        return ("message", receive_task.result())
+
+    if task in done:
+        if task.cancelled():
+            return ("cancelled", None)
+        try:
+            task.result()
+            return ("returned", None)
+        except BaseException as exc:
+            return ("exception", exc)
+
+    return ("timeout", None)
+
+
+def lifespan_startup(app: Any) -> bool:
+    """Drive the app's lifespan startup. Returns True on success or if the
+    app doesn't support lifespan; False on explicit startup failure or
+    timeout. Called by the Zig bridge once, with the GIL held, before the
+    I/O loop accepts any connection.
+    """
+    global _lifespan_task, _lifespan_receive_queue, _lifespan_send_queue
+
+    loop = _ensure_loop()
+
+    # If a previous serve() left a stale task around (test reuse), cancel it.
+    if _lifespan_task is not None and not _lifespan_task.done():
+        _lifespan_task.cancel()
+        try:
+            loop.run_until_complete(_lifespan_task)
+        except BaseException:
+            pass
+
+    _lifespan_receive_queue = asyncio.Queue()
+    _lifespan_send_queue = asyncio.Queue()
+
+    rq, sq = _lifespan_receive_queue, _lifespan_send_queue
+
+    async def lifespan_receive() -> dict[str, Any]:
+        return await rq.get()
+
+    async def lifespan_send(message: dict[str, Any]) -> None:
+        await sq.put(message)
+
+    scope: dict[str, Any] = {
+        "type": "lifespan",
+        "asgi": {"version": "3.0", "spec_version": "2.0"},
+    }
+
+    _lifespan_task = loop.create_task(app(scope, lifespan_receive, lifespan_send))
+    rq.put_nowait({"type": "lifespan.startup"})
+
+    kind, value = loop.run_until_complete(
+        _drive_lifespan_event(_lifespan_task, sq)
+    )
+
+    if kind == "message":
+        msg_type = value.get("type") if isinstance(value, dict) else None
+        if msg_type == "lifespan.startup.complete":
+            return True
+        if msg_type == "lifespan.startup.failed":
+            sys.stderr.write(
+                f"saltare: lifespan.startup.failed: "
+                f"{value.get('message', '') if isinstance(value, dict) else ''}\n"
+            )
+            return False
+        sys.stderr.write(f"saltare: unexpected lifespan startup message: {value}\n")
+        return True
+
+    if kind == "exception":
+        # Per ASGI convention, an exception before any send() typically means
+        # the app doesn't support lifespan. We log it and continue serving.
+        sys.stderr.write(
+            f"saltare: lifespan task raised during startup "
+            f"({type(value).__name__}: {value}). Treating as 'no lifespan support'.\n"
+        )
+        return True
+
+    if kind == "returned":
+        # App finished its lifespan handler without sending startup.complete.
+        # Tolerated: minimal apps sometimes just return.
+        return True
+
+    if kind == "timeout":
+        sys.stderr.write(f"saltare: lifespan startup timed out ({_LIFESPAN_TIMEOUT}s)\n")
+        return False
+
+    return True
+
+
+def lifespan_shutdown() -> None:
+    """Drive the app's lifespan shutdown. Best-effort: errors are logged and
+    the server proceeds to exit either way. Called by the Zig bridge once,
+    with the GIL held, after the I/O loop has stopped accepting connections.
+    """
+    global _lifespan_task, _lifespan_receive_queue, _lifespan_send_queue
+
+    if (
+        _lifespan_task is None
+        or _lifespan_receive_queue is None
+        or _lifespan_send_queue is None
+    ):
+        return
+
+    loop = _ensure_loop()
+
+    if _lifespan_task.done():
+        # App's lifespan handler already finished during startup; nothing left.
+        return
+
+    _lifespan_receive_queue.put_nowait({"type": "lifespan.shutdown"})
+
+    kind, value = loop.run_until_complete(
+        _drive_lifespan_event(_lifespan_task, _lifespan_send_queue)
+    )
+
+    if kind == "exception":
+        sys.stderr.write(
+            f"saltare: lifespan shutdown raised ({type(value).__name__}: {value})\n"
+        )
+    elif kind == "timeout":
+        sys.stderr.write(f"saltare: lifespan shutdown timed out ({_LIFESPAN_TIMEOUT}s)\n")
+        if not _lifespan_task.done():
+            _lifespan_task.cancel()
+            try:
+                loop.run_until_complete(_lifespan_task)
+            except BaseException:
+                pass
 
 
 _REASONS: dict[int, str] = {
@@ -47,7 +207,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.6.0"
+_SERVER_HEADER = b"saltare/0.7.0"
 
 
 def dispatch(

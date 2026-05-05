@@ -45,28 +45,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.6.0:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.7.0:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.87 MiB |      43.87 MiB | 43.88 MiB |    1000 | 2599 |
-| uvicorn | 44.00 MiB |      44.04 MiB | 44.04 MiB |    1000 | 2889 |
+| saltare | 43.98 MiB |      43.98 MiB | 43.98 MiB |    1000 | 2595 |
+| uvicorn | 43.80 MiB |      43.84 MiB | 43.84 MiB |    1000 | 2925 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 40.49 MiB |      40.55 MiB | 40.55 MiB |    2000 | 3840 |
-| uvicorn | 44.04 MiB |      44.48 MiB | 44.48 MiB |    2000 | 3945 |
+| saltare | 40.64 MiB |      40.70 MiB | 40.70 MiB |    2000 | 3866 |
+| uvicorn | 43.81 MiB |      44.29 MiB | 44.29 MiB |    2000 | 3995 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 40.30 MiB |      41.25 MiB | 41.25 MiB |     500 | 3545      |
-| uvicorn | 43.78 MiB |      49.09 MiB | 49.09 MiB |     500 | 2636      |
+| saltare | 40.47 MiB |      41.42 MiB | 41.42 MiB |     500 | 3553      |
+| uvicorn | 43.88 MiB |      49.18 MiB | 49.18 MiB |     500 | 2612      |
 
 **Read this honestly:**
 
@@ -85,9 +85,10 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.4.0** — Non-blocking event loop (epoll on Linux). Per-connection state machine in Zig with heap-allocated structs. Multiple connections progress in parallel; ASGI dispatch is the GIL serialization point. macOS (kqueue) raises `@compileError` until v0.4.x.
 - [x] **v0.5.0** — HTTP/1.1 keep-alive. Persistent connections reset their state machine in place (read buffer compacted, write buffer freed, epoll switched back to read interest). Pipelined requests handled inline without an extra epoll round-trip.
 - [x] **v0.6.0** — Pooled read buffers. Idle keep-alive connections release their 16 KiB read buffer back to a shared pool; the next read event re-acquires one. RSS now scales with **in-flight requests**, not with **open connections**. Result: ~5× less per-connection memory than uvicorn at idle.
-- [ ] **v0.7.0** — Lifespan protocol + chunked Transfer-Encoding (deferred from v0.5.x).
-- [ ] **v0.8.0** — TLS (via BoringSSL or stdlib).
-- [ ] **v0.9.0** — WebSockets.
+- [x] **v0.7.0** — ASGI lifespan protocol. The dispatcher creates a long-lived asyncio Task that drives the app through `lifespan.startup` before the I/O loop accepts connections, and through `lifespan.shutdown` after it stops. Apps using `FastAPI(lifespan=...)` now get their startup/shutdown hooks executed. Apps that raise on lifespan scope (no support) are tolerated.
+- [ ] **v0.8.0** — Chunked Transfer-Encoding (request and response).
+- [ ] **v0.9.0** — TLS (via BoringSSL or stdlib).
+- [ ] **v0.10.0** — WebSockets.
 - [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`).
 
 ## Install (once published)
@@ -114,7 +115,7 @@ def root():
 saltare main:app --host 0.0.0.0 --port 8000
 ```
 
-As of v0.3 the `app` is dispatched on every request. Lifespan / startup hooks are not invoked yet, so apps that rely on them (e.g. `@app.on_event("startup")`) will still run their routes but won't have run setup code.
+Both per-request HTTP dispatch and ASGI lifespan startup/shutdown are wired up: `FastAPI(lifespan=...)` and the older `@app.on_event("startup")` work as expected.
 
 ## Building from source
 
