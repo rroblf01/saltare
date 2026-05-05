@@ -19,7 +19,7 @@
 # syntax=docker/dockerfile:1.7
 
 ARG MANYLINUX_TAG=manylinux_2_28_x86_64
-ARG PYTHON_TAG=cp312-cp312
+ARG PYTHON_TAG=cp314-cp314
 ARG ZIG_VERSION=0.16.0
 
 # ---------------------------------------------------------------------------

@@ -5,10 +5,11 @@
 //   - g_dispatch:     saltare._dispatcher.dispatch
 //   - g_server_host:  pre-built str so we don't reallocate per request
 //
-// The I/O loop in server.zig runs with the GIL released. Once per request,
-// `handleRequest` re-acquires the GIL via PyGILState_Ensure, calls into
-// Python to produce the wire response, writes it to the socket, then
-// releases the GIL again.
+// In v0.4 the I/O loop runs non-blocking on a single thread with the GIL
+// released. Once per request, `dispatch` re-acquires the GIL via
+// PyGILState_Ensure, calls into Python to produce the wire response,
+// copies the resulting bytes into a Zig-owned buffer, and returns it.
+// The server.zig event loop then writes those bytes non-blocking.
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -20,22 +21,10 @@ pub const py = @cImport({
     @cInclude("Python.h");
 });
 
-const c = @cImport({
-    @cInclude("sys/socket.h");
-    @cInclude("unistd.h");
-});
-
 var g_app: ?*py.PyObject = null;
 var g_dispatch: ?*py.PyObject = null;
 var g_server_host: ?*py.PyObject = null;
 var g_server_port: c_int = 0;
-
-const FALLBACK_500 =
-    "HTTP/1.1 500 Internal Server Error\r\n" ++
-    "server: saltare/0.3.0\r\n" ++
-    "connection: close\r\n" ++
-    "content-length: 0\r\n" ++
-    "\r\n";
 
 /// Caller (module.zig) must hold the GIL.
 /// Acquires the references we need to dispatch requests.
@@ -78,16 +67,16 @@ pub fn shutdown() void {
     }
 }
 
-/// Run one ASGI dispatch and write the wire response to `client`.
-/// Caller (server.zig) does NOT hold the GIL — we re-acquire it here.
-pub fn handleRequest(client: c_int, req: http.Request, body: []const u8) void {
+/// Run one ASGI dispatch and return the wire response as a freshly allocated
+/// buffer. Returns `null` on failure (Python exception was printed to stderr).
+/// Caller (server.zig) must NOT hold the GIL — we re-acquire it here.
+pub fn dispatch(req: http.Request, body: []const u8, allocator: std.mem.Allocator) ?[]u8 {
     const gstate = py.PyGILState_Ensure();
     defer py.PyGILState_Release(gstate);
 
     const result = callDispatch(req, body) orelse {
         py.PyErr_Print();
-        writeAll(client, FALLBACK_500);
-        return;
+        return null;
     };
     defer py.Py_DecRef(result);
 
@@ -95,11 +84,13 @@ pub fn handleRequest(client: c_int, req: http.Request, body: []const u8) void {
     var resp_len: py.Py_ssize_t = 0;
     if (py.PyBytes_AsStringAndSize(result, @ptrCast(&resp_ptr), &resp_len) != 0) {
         py.PyErr_Clear();
-        writeAll(client, FALLBACK_500);
-        return;
+        return null;
     }
 
-    writeAll(client, resp_ptr[0..@intCast(resp_len)]);
+    const len: usize = @intCast(resp_len);
+    const buf = allocator.alloc(u8, len) catch return null;
+    @memcpy(buf, resp_ptr[0..len]);
+    return buf;
 }
 
 fn callDispatch(req: http.Request, body: []const u8) ?*py.PyObject {
@@ -160,14 +151,4 @@ fn buildHeadersList(headers: []const http.Header) ?*py.PyObject {
         _ = py.PyList_SetItem(list, @intCast(i), tuple);
     }
     return list;
-}
-
-fn writeAll(client: c_int, data: []const u8) void {
-    var written: usize = 0;
-    while (written < data.len) {
-        const remaining = data[written..];
-        const n = c.write(client, @ptrCast(remaining.ptr), remaining.len);
-        if (n <= 0) return;
-        written += @intCast(n);
-    }
 }

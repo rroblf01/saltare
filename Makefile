@@ -7,7 +7,7 @@ else
     DEFAULT_MANYLINUX = manylinux_2_28_x86_64
 endif
 
-PYTHON_TAG    ?= cp312-cp312
+PYTHON_TAG    ?= cp314-cp314
 MANYLINUX_TAG ?= $(DEFAULT_MANYLINUX)
 ZIG_VERSION   ?= 0.16.0
 

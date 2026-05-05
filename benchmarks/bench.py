@@ -1,16 +1,20 @@
 """Measure RSS for saltare and uvicorn under identical load.
 
-Both servers run the same FastAPI app from `benchmarks.app`. For each:
-  1. Spawn the server as a subprocess.
-  2. Wait until it accepts connections.
-  3. Read VmRSS / VmHWM from /proc/<pid>/status (idle baseline).
-  4. Fire N sequential GET / requests with httpx (default keep-alive client).
-  5. Read VmRSS / VmHWM again (post-load).
-  6. Terminate the subprocess.
+Two workloads:
 
-Sequential by design: in v0.3 saltare is single-threaded blocking, so a
-concurrent benchmark would mostly measure queueing delay. Concurrent
-load tests become meaningful starting at v0.4 (epoll/kqueue).
+  sequential:   1 client, N requests in a row. Measures the steady-state RAM
+                cost when there's never more than one connection alive.
+                Comparable across versions of saltare; mostly bounded below
+                by Python + FastAPI's irreducible RSS floor.
+
+  concurrent:   C clients × M requests each, fired in C OS threads. Each
+                client opens its own TCP connection. Measures peak RSS while
+                up to C connections are alive at once. This is where the Zig
+                per-connection structs (~hundreds of bytes) beat asyncio's
+                Transport/Protocol/Task allocations (~KB each).
+
+We poll /proc/<pid>/status every 10 ms during the load to capture VmRSS /
+VmHWM peaks rather than just the post-load reading.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -34,14 +39,17 @@ class Sample:
 
 def read_status(pid: int) -> Sample:
     rss = hwm = size = 0
-    with open(f"/proc/{pid}/status") as f:
-        for line in f:
-            if line.startswith("VmRSS:"):
-                rss = int(line.split()[1])
-            elif line.startswith("VmHWM:"):
-                hwm = int(line.split()[1])
-            elif line.startswith("VmSize:"):
-                size = int(line.split()[1])
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1])
+                elif line.startswith("VmHWM:"):
+                    hwm = int(line.split()[1])
+                elif line.startswith("VmSize:"):
+                    size = int(line.split()[1])
+    except FileNotFoundError:
+        pass
     return Sample(rss, hwm, size)
 
 
@@ -67,45 +75,128 @@ def wait_ready(port: int, timeout: float = 5.0) -> None:
 @dataclass
 class Result:
     name: str
+    workload: str
     idle: Sample
     after_load: Sample
+    peak_rss_kib: int
     requests_completed: int
     elapsed_seconds: float
 
 
-def run_benchmark(name: str, module: str, port: int, n_requests: int) -> Result:
+def _spawn(module: str, port: int) -> subprocess.Popen:
     env = {**os.environ, "BENCH_PORT": str(port), "PYTHONUNBUFFERED": "1"}
-    proc = subprocess.Popen(
+    return subprocess.Popen(
         [sys.executable, "-m", module],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    proc.terminate()
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+class _PeakSampler:
+    """Polls /proc/PID/status while the load runs and records peak VmRSS."""
+
+    def __init__(self, pid: int, interval: float = 0.01) -> None:
+        self.pid = pid
+        self.interval = interval
+        self.peak_rss_kib = 0
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> "_PeakSampler":
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            s = read_status(self.pid)
+            if s.vm_rss_kib > self.peak_rss_kib:
+                self.peak_rss_kib = s.vm_rss_kib
+            time.sleep(self.interval)
+
+
+def run_sequential(name: str, module: str, port: int, n_requests: int) -> Result:
+    proc = _spawn(module, port)
     try:
         wait_ready(port)
-        # Settle a moment so startup transients don't skew the idle reading.
         time.sleep(0.5)
         idle = read_status(proc.pid)
 
         completed = 0
-        t0 = time.monotonic()
-        with httpx.Client(timeout=5.0) as client:
-            for _ in range(n_requests):
-                r = client.get(f"http://127.0.0.1:{port}/")
-                if r.status_code == 200:
-                    completed += 1
-        elapsed = time.monotonic() - t0
+        with _PeakSampler(proc.pid) as sampler:
+            t0 = time.monotonic()
+            with httpx.Client(timeout=5.0) as client:
+                for _ in range(n_requests):
+                    r = client.get(f"http://127.0.0.1:{port}/")
+                    if r.status_code == 200:
+                        completed += 1
+            elapsed = time.monotonic() - t0
 
         time.sleep(0.3)
         after = read_status(proc.pid)
-        return Result(name, idle, after, completed, elapsed)
+        peak = max(sampler.peak_rss_kib, after.vm_rss_kib, idle.vm_rss_kib)
+        return Result(name, "sequential", idle, after, peak, completed, elapsed)
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        _terminate(proc)
+
+
+def run_concurrent(
+    name: str,
+    module: str,
+    port: int,
+    concurrency: int,
+    requests_per_client: int,
+) -> Result:
+    proc = _spawn(module, port)
+    try:
+        wait_ready(port)
+        time.sleep(0.5)
+        idle = read_status(proc.pid)
+
+        completed = 0
+        completed_lock = threading.Lock()
+
+        def hit() -> None:
+            local_completed = 0
+            with httpx.Client(timeout=10.0) as client:
+                for _ in range(requests_per_client):
+                    r = client.get(f"http://127.0.0.1:{port}/")
+                    if r.status_code == 200:
+                        local_completed += 1
+            with completed_lock:
+                nonlocal completed
+                completed += local_completed
+
+        with _PeakSampler(proc.pid) as sampler:
+            threads = [threading.Thread(target=hit) for _ in range(concurrency)]
+            t0 = time.monotonic()
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            elapsed = time.monotonic() - t0
+
+        time.sleep(0.3)
+        after = read_status(proc.pid)
+        peak = max(sampler.peak_rss_kib, after.vm_rss_kib, idle.vm_rss_kib)
+        return Result(name, "concurrent", idle, after, peak, completed, elapsed)
+    finally:
+        _terminate(proc)
 
 
 def fmt_mib(kib: int) -> str:
@@ -114,56 +205,66 @@ def fmt_mib(kib: int) -> str:
 
 def render(results: list[Result]) -> None:
     print()
-    print("# RAM benchmark — same FastAPI app, same Python interpreter, same load")
-    print()
-    print("| server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps   |")
-    print("|---------|-----------|----------------|-----------|---------|-------|")
+    grouped: dict[str, list[Result]] = {}
     for r in results:
-        rps = r.requests_completed / r.elapsed_seconds if r.elapsed_seconds else 0.0
-        print(
-            f"| {r.name:<7s} | "
-            f"{fmt_mib(r.idle.vm_rss_kib):>9s} | "
-            f"{fmt_mib(r.after_load.vm_rss_kib):>14s} | "
-            f"{fmt_mib(r.after_load.vm_hwm_kib):>9s} | "
-            f"{r.requests_completed:>7d} | "
-            f"{rps:>5.0f} |"
-        )
-    print()
+        grouped.setdefault(r.workload, []).append(r)
 
-    if len(results) >= 2:
-        a, b = results[0], results[1]
-        if b.after_load.vm_rss_kib:
-            ratio = a.after_load.vm_rss_kib / b.after_load.vm_rss_kib
-            delta_kib = b.after_load.vm_rss_kib - a.after_load.vm_rss_kib
+    for workload, items in grouped.items():
+        print(f"## workload: {workload}")
+        print()
+        print("| server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps   |")
+        print("|---------|-----------|----------------|-----------|---------|-------|")
+        for r in items:
+            rps = r.requests_completed / r.elapsed_seconds if r.elapsed_seconds else 0.0
             print(
-                f"# {a.name} uses {ratio:.2f}x the RSS of {b.name} after load "
-                f"(delta: {delta_kib / 1024:+.2f} MiB; "
-                f"negative means {a.name} is leaner)"
+                f"| {r.name:<7s} | "
+                f"{fmt_mib(r.idle.vm_rss_kib):>9s} | "
+                f"{fmt_mib(r.after_load.vm_rss_kib):>14s} | "
+                f"{fmt_mib(r.peak_rss_kib):>9s} | "
+                f"{r.requests_completed:>7d} | "
+                f"{rps:>5.0f} |"
             )
-            print()
+        print()
+
+        if len(items) >= 2:
+            a, b = items[0], items[1]
+            if b.peak_rss_kib:
+                ratio = a.peak_rss_kib / b.peak_rss_kib
+                delta_kib = b.peak_rss_kib - a.peak_rss_kib
+                print(
+                    f"  {a.name}/{b.name} peak ratio: {ratio:.2f}x "
+                    f"(delta: {delta_kib / 1024:+.2f} MiB; "
+                    f"negative means {a.name} is leaner)"
+                )
+                print()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--requests", type=int, default=1000)
+    parser.add_argument("--requests", type=int, default=1000,
+                        help="sequential request count")
+    parser.add_argument("--concurrency", type=int, default=100,
+                        help="parallel clients in the concurrent workload")
+    parser.add_argument("--per-client", type=int, default=20,
+                        help="requests per client in the concurrent workload")
     args = parser.parse_args()
 
-    print(f"\nN = {args.requests} sequential GET / requests per server\n")
+    print(f"\nsequential: {args.requests} requests / 1 client")
+    print(f"concurrent: {args.concurrency} clients × {args.per_client} requests\n")
 
-    results = [
-        run_benchmark(
-            "saltare",
-            module="benchmarks.run_saltare",
-            port=18001,
-            n_requests=args.requests,
-        ),
-        run_benchmark(
-            "uvicorn",
-            module="benchmarks.run_uvicorn",
-            port=18002,
-            n_requests=args.requests,
-        ),
-    ]
+    results: list[Result] = []
+    for name, module in (("saltare", "benchmarks.run_saltare"),
+                         ("uvicorn", "benchmarks.run_uvicorn")):
+        results.append(run_sequential(
+            name, module, port=18001, n_requests=args.requests,
+        ))
+    for name, module in (("saltare", "benchmarks.run_saltare"),
+                         ("uvicorn", "benchmarks.run_uvicorn")):
+        results.append(run_concurrent(
+            name, module, port=18002,
+            concurrency=args.concurrency,
+            requests_per_client=args.per_client,
+        ))
 
     render(results)
 

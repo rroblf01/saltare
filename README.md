@@ -43,27 +43,41 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 ## Benchmarks
 
-Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, fires N=1000 sequential GET requests with `httpx`, and takes a second reading.
+Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results from a single run on Apple Silicon (manylinux_2_28_aarch64, CPython 3.12, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras):
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.4.0:
+
+### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 36.20 MiB |      36.22 MiB | 36.22 MiB |    1000 | 2518 |
-| uvicorn | 38.78 MiB |      38.82 MiB | 38.82 MiB |    1000 | 2946 |
+| saltare | 43.93 MiB |      43.93 MiB | 43.94 MiB |    1000 | 2423 |
+| uvicorn | 44.11 MiB |      44.14 MiB | 44.14 MiB |    1000 | 2871 |
+
+### Concurrent — 100 clients × 20 requests (2000 total)
+
+| server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
+|---------|-----------|----------------|-----------|---------|------|
+| saltare | 40.57 MiB |      40.77 MiB | 40.78 MiB |    2000 | 3233 |
+| uvicorn | 44.04 MiB |      44.48 MiB | 44.48 MiB |    2000 | 3984 |
 
 **Read this honestly:**
 
-- saltare is ~2.6 MiB (≈7%) leaner today. Most of the 36–38 MiB is Python + FastAPI itself — the irreducible floor neither server can shrink.
-- uvicorn is faster on this workload (~17%) because `httpx` reuses one TCP connection thanks to uvicorn's keep-alive support; saltare in v0.3 always sends `Connection: close`, paying the TCP three-way handshake on every request. Keep-alive lands in v0.5.
-- This is the **floor** of saltare's RAM advantage. The benchmark only ever has one connection alive at a time. The architectural win — Zig structs (~hundreds of bytes) for per-connection state vs uvicorn's Transport/Protocol/Task allocations (~KB each) — only materialises when many connections exist concurrently. v0.4 (non-blocking event loop) makes that measurable; expect the gap to widen there.
+- Under concurrent load, **saltare's peak RSS is 3.7 MiB below uvicorn's** (40.78 vs 44.48 MiB). The gap holds across the whole burst — it's not a transient.
+- Both servers grow only a little during the load (saltare +0.21 MiB, uvicorn +0.44 MiB). The 4 MiB difference is primarily in the **idle baseline**: uvicorn pulls in more Python (its asyncio integration layer, `h11`, signal handling, lifespan plumbing) before the first request arrives.
+- uvicorn is faster on throughput by ~20–23%. Two reasons:
+  - saltare in v0.4 still sends `Connection: close` on every response. `httpx` would happily keep-alive but the server forces a fresh TCP handshake. Keep-alive support lands in v0.5 and should close most of that gap.
+  - uvicorn uses `httptools` (a tuned C parser); saltare uses its own Zig parser. Both are fast, the C one is more battle-tested.
+- The ~40 MiB floor is Python + FastAPI itself. No userland server can shrink that without changing what the user app loads. Python 3.14 raises this floor a few MiB versus 3.12 because 3.14 imports more stdlib eagerly.
+
+**Where saltare's architectural win shows up most:** long-lived connections (planned for v0.7 — WebSockets) and very high concurrency (10k+ open sockets). The current v0.4 benchmark runs short-lived requests; per-connection allocations are barely visible because connections live for milliseconds. Expect the gap to widen as the project moves up the roadmap.
 
 ## Roadmap
 
 - [x] **v0.1.0** — Build pipeline. `saltare._core` extension built with Zig via `scikit-build-core`. Listening socket + accept loop in Zig. Single fixed HTTP response. Local Docker build + cibuildwheel CI.
 - [x] **v0.2.0** — HTTP/1.1 request parser in Zig (request line, headers, `Content-Length` framing). Server echoes method + target back so the parser is observable end-to-end. Zero allocations per request.
 - [x] **v0.3.0** — ASGI dispatcher. Persistent `asyncio` loop reused across requests; per-request `loop.run_until_complete`. Zig calls into Python via the C API only at dispatch time. FastAPI runs end-to-end (path params, JSON bodies, 404). No lifespan, no keep-alive, no streaming yet.
-- [ ] **v0.4.0** — Non-blocking event loop (epoll / kqueue) with concurrent connections.
+- [x] **v0.4.0** — Non-blocking event loop (epoll on Linux). Per-connection state machine in Zig with heap-allocated structs. Multiple connections progress in parallel; ASGI dispatch is the GIL serialization point. macOS (kqueue) raises `@compileError` until v0.4.x.
 - [ ] **v0.5.0** — Lifespan protocol, keep-alive, chunked transfer.
 - [ ] **v0.6.0** — TLS (via BoringSSL or stdlib).
 - [ ] **v0.7.0** — WebSockets.
