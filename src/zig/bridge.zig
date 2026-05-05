@@ -21,14 +21,22 @@ pub const py = @cImport({
     @cInclude("Python.h");
 });
 
-var g_app: ?*py.PyObject = null;
-var g_dispatch: ?*py.PyObject = null;
-var g_lifespan_startup: ?*py.PyObject = null;
-var g_lifespan_shutdown: ?*py.PyObject = null;
-var g_server_host: ?*py.PyObject = null;
-var g_server_port: c_int = 0;
+// Per-thread bridge state. Keeping these threadlocal avoids
+// cross-contamination when multiple `serve()` calls run in different
+// daemon threads (most visible in tests): `bridge.init` would otherwise
+// DECREF references that another running daemon is still using and
+// trigger use-after-free segfaults during cleanup.
+threadlocal var g_app: ?*py.PyObject = null;
+threadlocal var g_dispatch: ?*py.PyObject = null;
+threadlocal var g_lifespan_startup: ?*py.PyObject = null;
+threadlocal var g_lifespan_shutdown: ?*py.PyObject = null;
+threadlocal var g_ws_open: ?*py.PyObject = null;
+threadlocal var g_ws_event: ?*py.PyObject = null;
+threadlocal var g_ws_disconnect: ?*py.PyObject = null;
+threadlocal var g_server_host: ?*py.PyObject = null;
+threadlocal var g_server_port: c_int = 0;
 /// "http" or "https" — built once at init so dispatch doesn't reallocate.
-var g_scheme: ?*py.PyObject = null;
+threadlocal var g_scheme: ?*py.PyObject = null;
 
 /// Caller (module.zig) must hold the GIL.
 /// Acquires the references we need to dispatch requests.
@@ -51,6 +59,9 @@ pub fn init(
     g_dispatch = py.PyObject_GetAttrString(mod, "dispatch") orelse return false;
     g_lifespan_startup = py.PyObject_GetAttrString(mod, "lifespan_startup") orelse return false;
     g_lifespan_shutdown = py.PyObject_GetAttrString(mod, "lifespan_shutdown") orelse return false;
+    g_ws_open = py.PyObject_GetAttrString(mod, "ws_open") orelse return false;
+    g_ws_event = py.PyObject_GetAttrString(mod, "ws_event") orelse return false;
+    g_ws_disconnect = py.PyObject_GetAttrString(mod, "ws_disconnect") orelse return false;
 
     g_server_host = py.PyUnicode_FromStringAndSize(
         @as([*c]const u8, @ptrCast(server_host.ptr)),
@@ -82,6 +93,18 @@ pub fn shutdown() void {
     if (g_lifespan_shutdown) |s| {
         py.Py_DecRef(s);
         g_lifespan_shutdown = null;
+    }
+    if (g_ws_open) |o| {
+        py.Py_DecRef(o);
+        g_ws_open = null;
+    }
+    if (g_ws_event) |e| {
+        py.Py_DecRef(e);
+        g_ws_event = null;
+    }
+    if (g_ws_disconnect) |d| {
+        py.Py_DecRef(d);
+        g_ws_disconnect = null;
     }
     if (g_app) |a| {
         py.Py_DecRef(a);
@@ -178,6 +201,152 @@ fn callDispatch(req: http.Request, body: []const u8, keep_alive: bool) ?*py.PyOb
         @as(c_int, if (keep_alive) 1 else 0),
         g_scheme.?,
     );
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket dispatch helpers. Mirror the (handle, accepted, frames, done)
+// return shape of the Python ws_open / ws_event / ws_disconnect functions.
+// `frames` is a single Python `bytes` containing zero or more already-encoded
+// server-side WS frames concatenated.
+
+pub const WsOpen = struct {
+    handle: c_long,
+    accepted: bool,
+    /// Owned by `allocator` once returned; caller must free.
+    frames: []u8,
+    done: bool,
+};
+
+pub const WsTick = struct {
+    /// Owned by `allocator`; caller must free.
+    frames: []u8,
+    done: bool,
+};
+
+/// Caller (server.zig) does NOT hold the GIL. We re-acquire here.
+pub fn wsOpen(req: http.Request, allocator: std.mem.Allocator) ?WsOpen {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const q_idx = std.mem.indexOfScalar(u8, req.target, '?');
+    const raw_path = if (q_idx) |i| req.target[0..i] else req.target;
+    const query = if (q_idx) |i| req.target[i + 1 ..] else "";
+
+    const headers_obj = buildHeadersList(req.headers) orelse return null;
+    defer py.Py_DecRef(headers_obj);
+
+    const result = py.PyObject_CallFunction(
+        g_ws_open.?,
+        "Os#y#y#OOiO",
+        g_app.?,
+        @as([*c]const u8, @ptrCast(req.method.ptr)),
+        @as(py.Py_ssize_t, @intCast(req.method.len)),
+        @as([*c]const u8, @ptrCast(raw_path.ptr)),
+        @as(py.Py_ssize_t, @intCast(raw_path.len)),
+        @as([*c]const u8, @ptrCast(query.ptr)),
+        @as(py.Py_ssize_t, @intCast(query.len)),
+        headers_obj,
+        g_server_host.?,
+        g_server_port,
+        g_scheme.?,
+    ) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractWsOpen(result, allocator);
+}
+
+/// Push one WebSocket text/binary frame into the running coroutine and pump
+/// the Python loop. Returns the encoded frames the app produced, plus a
+/// `done` flag if the coroutine has finished. `opcode` is 0x1 (text) or 0x2.
+pub fn wsEvent(handle: c_long, opcode: u8, payload: []const u8, allocator: std.mem.Allocator) ?WsTick {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(
+        g_ws_event.?,
+        "liy#",
+        handle,
+        @as(c_int, @intCast(opcode)),
+        @as([*c]const u8, @ptrCast(payload.ptr)),
+        @as(py.Py_ssize_t, @intCast(payload.len)),
+    ) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractWsTick(result, allocator);
+}
+
+/// Tell Python the connection is gone (clean close, peer reset, etc.). Drains
+/// any final frames the coroutine produces during teardown.
+pub fn wsDisconnect(handle: c_long, code: u16, allocator: std.mem.Allocator) []u8 {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(
+        g_ws_disconnect.?,
+        "li",
+        handle,
+        @as(c_int, code),
+    ) orelse {
+        py.PyErr_Clear();
+        return &.{};
+    };
+    defer py.Py_DecRef(result);
+
+    return copyBytes(result, allocator) orelse &.{};
+}
+
+fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
+    if (py.PyTuple_Size(result) != 4) return null;
+
+    const handle_obj = py.PyTuple_GetItem(result, 0);
+    const accepted_obj = py.PyTuple_GetItem(result, 1);
+    const frames_obj = py.PyTuple_GetItem(result, 2);
+    const done_obj = py.PyTuple_GetItem(result, 3);
+    if (handle_obj == null or accepted_obj == null or frames_obj == null or done_obj == null) {
+        return null;
+    }
+
+    const handle = py.PyLong_AsLong(handle_obj);
+    const accepted = py.PyObject_IsTrue(accepted_obj) == 1;
+    const done = py.PyObject_IsTrue(done_obj) == 1;
+    const frames = copyBytes(frames_obj.?, allocator) orelse return null;
+
+    return .{ .handle = handle, .accepted = accepted, .frames = frames, .done = done };
+}
+
+fn extractWsTick(result: *py.PyObject, allocator: std.mem.Allocator) ?WsTick {
+    if (py.PyTuple_Size(result) != 2) return null;
+
+    const frames_obj = py.PyTuple_GetItem(result, 0);
+    const done_obj = py.PyTuple_GetItem(result, 1);
+    if (frames_obj == null or done_obj == null) return null;
+
+    const done = py.PyObject_IsTrue(done_obj) == 1;
+    const frames = copyBytes(frames_obj.?, allocator) orelse return null;
+
+    return .{ .frames = frames, .done = done };
+}
+
+fn copyBytes(obj: *py.PyObject, allocator: std.mem.Allocator) ?[]u8 {
+    var ptr: [*c]u8 = undefined;
+    var len: py.Py_ssize_t = 0;
+    if (py.PyBytes_AsStringAndSize(obj, @ptrCast(&ptr), &len) != 0) {
+        py.PyErr_Clear();
+        return null;
+    }
+    const n: usize = @intCast(len);
+    // Empty result: return a static empty slice. Callers know not to free
+    // zero-length results (no allocation was made).
+    if (n == 0) return &[_]u8{};
+    const buf = allocator.alloc(u8, n) catch return null;
+    @memcpy(buf, ptr[0..n]);
+    return buf;
 }
 
 fn buildHeadersList(headers: []const http.Header) ?*py.PyObject {

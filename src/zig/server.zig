@@ -17,6 +17,7 @@ const bridge = @import("bridge.zig");
 const eventloop = @import("eventloop.zig");
 const pool_mod = @import("pool.zig");
 const tls = @import("tls.zig");
+const ws = @import("ws.zig");
 
 const c = @cImport({
     @cInclude("sys/socket.h");
@@ -37,7 +38,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.9.0";
+const SERVER_HEADER = "saltare/0.10.0";
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
@@ -98,6 +99,8 @@ const ConnState = enum {
     writing,
 };
 
+const Protocol = enum { http, websocket };
+
 const Connection = struct {
     fd: c_int,
     state: ConnState,
@@ -137,6 +140,13 @@ const Connection = struct {
     /// Set when accept() handed us a TLS-bound fd. Null for plaintext.
     ssl: ?*tls.Ssl,
 
+    /// Started as `.http`. Switches to `.websocket` after a successful
+    /// upgrade handshake; from then on we parse WS frames instead of HTTP.
+    protocol: Protocol,
+    /// Opaque handle returned by Python's `ws_open` for the upgraded
+    /// connection. 0 while protocol == .http.
+    ws_handle: c_long,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -161,13 +171,17 @@ const Connection = struct {
             .allocator = allocator,
             .pool = pool,
             .ssl = null,
+            .protocol = .http,
+            .ws_handle = 0,
         };
         return conn;
     }
 
     fn destroy(self: *Connection) void {
-        // Tear down TLS first so the close_notify alert goes out before
-        // we close the underlying fd.
+        // NOTE: WebSocket teardown (notifying Python) must be done by
+        // `wsTeardown` BEFORE calling destroy. We don't acquire the GIL
+        // here — destroy is called from many paths (including non-WS)
+        // and forcing a GIL acquisition was a footgun in tests.
         if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b);
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
@@ -286,8 +300,12 @@ fn acceptAll(
 
 fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event) void {
     if (ev.closed) {
-        loop.remove(conn.fd);
-        conn.destroy();
+        if (conn.protocol == .websocket) {
+            wsTeardown(loop, conn);
+        } else {
+            loop.remove(conn.fd);
+            conn.destroy();
+        }
         return;
     }
     // For TLS, OpenSSL's renegotiation can flip what kind of event it wants
@@ -392,11 +410,24 @@ fn epollWantWrite(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
-    // Lazy: only claim a buffer from the pool when we actually need to read.
     conn.ensureBuffer() catch {
+        // For WS we don't have a clean status path — just close.
+        if (conn.protocol == .websocket) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
         sendStatus(loop, conn, 503, "Service Unavailable");
         return;
     };
+
+    switch (conn.protocol) {
+        .http => doReadHttp(loop, conn),
+        .websocket => doReadWs(loop, conn),
+    }
+}
+
+fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
     const data = &conn.read_buf.?.data;
 
     while (true) {
@@ -486,6 +517,11 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
 
 fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     const req = conn.parsed.?;
+
+    if (req.isWebSocketUpgrade()) {
+        return startWebSocket(loop, conn);
+    }
+
     const data = &conn.read_buf.?.data;
     const body = data[conn.body_offset .. conn.body_offset + conn.body_len];
     const keep_alive = req.wantsKeepAlive();
@@ -499,6 +535,88 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_pos = 0;
     conn.state = .writing;
     conn.keep_alive = keep_alive;
+
+    loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+
+    doWrite(loop, conn);
+}
+
+/// Validate the WebSocket upgrade request, ask the Python ws_open to start
+/// the coroutine, and (if accepted) build the 101 Switching Protocols
+/// response. After writing, the connection enters `.websocket` mode.
+fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
+    const req = conn.parsed.?;
+
+    const opened = bridge.wsOpen(req, conn.allocator) orelse {
+        sendStatus(loop, conn, 500, "Internal Server Error");
+        return;
+    };
+
+    if (!opened.accepted) {
+        // App rejected by closing without accepting.
+        if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+        sendStatus(loop, conn, 403, "Forbidden");
+        return;
+    }
+
+    const client_key = req.header("sec-websocket-key") orelse {
+        if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+        // Already accepted by Python — make sure it's torn down.
+        const final = bridge.wsDisconnect(opened.handle, 1002, conn.allocator);
+        if (final.len > 0) conn.allocator.free(final);
+        sendStatus(loop, conn, 400, "Bad Request");
+        return;
+    };
+    const trimmed_key = std.mem.trim(u8, client_key, " \t");
+
+    var accept_buf: [28]u8 = undefined;
+    const accept = ws.computeAccept(trimmed_key, &accept_buf);
+
+    var resp_buf: [512]u8 = undefined;
+    const resp = std.fmt.bufPrint(
+        &resp_buf,
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "\r\n",
+        .{accept},
+    ) catch {
+        if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+
+    // Concatenate 101 + any frames the app emitted between accept and the
+    // first await receive() (e.g. an immediate `websocket.send`).
+    const total = resp.len + opened.frames.len;
+    const heap = conn.allocator.alloc(u8, total) catch {
+        if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    @memcpy(heap[0..resp.len], resp);
+    if (opened.frames.len > 0) {
+        @memcpy(heap[resp.len..], opened.frames);
+        conn.allocator.free(opened.frames);
+    }
+
+    if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+    conn.write_buf = heap;
+    conn.write_pos = 0;
+    conn.state = .writing;
+    conn.protocol = .websocket;
+    conn.ws_handle = opened.handle;
+    // If the app already finished (called close right after accept), close
+    // after we drain the frames; otherwise stay alive.
+    conn.keep_alive = !opened.done;
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
         loop.remove(conn.fd);
@@ -531,12 +649,259 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
         }
     }
 
+    if (conn.protocol == .websocket) {
+        wsAfterWrite(loop, conn);
+        return;
+    }
+
     if (conn.keep_alive) {
         keepAliveReset(loop, conn);
     } else {
         loop.remove(conn.fd);
         conn.destroy();
     }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket frame handling. After a successful upgrade the connection lives
+// in `protocol == .websocket`; doRead routes here. Frames are unmasked in
+// place, dispatched to the Python coroutine via bridge.wsEvent, and any
+// response frames are queued on `write_buf` for doWrite to drain.
+
+fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
+    const data = &conn.read_buf.?.data;
+
+    while (true) {
+        // Try to parse a frame from what's already buffered.
+        const buf_view = data[0..conn.read_total];
+        const parsed = ws.parseHeader(buf_view);
+
+        switch (parsed) {
+            .invalid => {
+                wsTeardown(loop, conn);
+                return;
+            },
+            .ok => |hdr| {
+                if (!hdr.fin or !hdr.masked) {
+                    // Continuation frames and unmasked client frames are
+                    // out of scope for v0.10 — close with protocol error.
+                    wsTeardown(loop, conn);
+                    return;
+                }
+                const total = hdr.header_len + hdr.payload_len;
+                if (total > data.len) {
+                    // Frame bigger than our buffer.
+                    wsTeardown(loop, conn);
+                    return;
+                }
+                if (conn.read_total >= total) {
+                    const payload = data[hdr.header_len..total];
+                    ws.unmask(payload, hdr.mask_key);
+                    handleWsFrame(loop, conn, hdr, payload);
+                    if (conn.protocol != .websocket) return;
+
+                    // Compact: shift any bytes past this frame to the start.
+                    const leftover = conn.read_total - total;
+                    if (leftover > 0) {
+                        var i: usize = 0;
+                        while (i < leftover) : (i += 1) {
+                            data[i] = data[total + i];
+                        }
+                    }
+                    conn.read_total = leftover;
+
+                    // If handling produced output, flushOutbound will have
+                    // flipped state to .writing — bail out and let epoll
+                    // wake us up when the socket is writable.
+                    if (conn.state == .writing) return;
+                    continue;
+                }
+                // Need more bytes — fall through to read.
+            },
+            .needs_more => {},
+        }
+
+        const remaining = data[conn.read_total..];
+        if (remaining.len == 0) {
+            // No room left and still no complete frame.
+            wsTeardown(loop, conn);
+            return;
+        }
+        const r = connRead(conn, remaining);
+        switch (r.status) {
+            .ok => conn.read_total += r.n,
+            .would_block, .want_read => {
+                if (conn.ssl != null) epollWantRead(loop, conn);
+                return;
+            },
+            .want_write => {
+                epollWantWrite(loop, conn);
+                return;
+            },
+            .closed, .fatal => {
+                wsTeardown(loop, conn);
+                return;
+            },
+        }
+    }
+}
+
+fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, payload: []u8) void {
+    switch (hdr.opcode) {
+        .text => wsDeliverToApp(loop, conn, 0x1, payload),
+        .binary => wsDeliverToApp(loop, conn, 0x2, payload),
+        .close => {
+            // Echo close + tear down.
+            sendCloseFrame(conn, 1000) catch {};
+            conn.keep_alive = false;
+            flushOutbound(loop, conn);
+        },
+        .ping => {
+            // Auto-pong with the same payload (v0.10 doesn't surface pings
+            // to the application).
+            sendControlFrame(conn, .pong, payload) catch {};
+            flushOutbound(loop, conn);
+        },
+        .pong => {}, // Unsolicited pongs are ignored.
+        else => wsTeardown(loop, conn),
+    }
+}
+
+fn wsDeliverToApp(loop: *eventloop.Loop, conn: *Connection, opcode: u8, payload: []const u8) void {
+    const tick = bridge.wsEvent(conn.ws_handle, opcode, payload, conn.allocator) orelse {
+        wsTeardown(loop, conn);
+        return;
+    };
+
+    queueFrames(conn, tick.frames);
+    if (tick.done) conn.keep_alive = false;
+
+    flushOutbound(loop, conn);
+}
+
+/// Append `frames` (transferred ownership) onto the connection's write
+/// buffer. If write_buf is currently being drained, we concatenate; if not,
+/// we replace.
+fn queueFrames(conn: *Connection, frames: []u8) void {
+    // Convention: empty slice means "no allocation made" (see copyBytes).
+    if (frames.len == 0) return;
+    if (conn.write_buf.len == conn.write_pos) {
+        if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+        conn.write_buf = frames;
+        conn.write_pos = 0;
+        return;
+    }
+
+    const remaining_old = conn.write_buf[conn.write_pos..];
+    const combined = conn.allocator.alloc(u8, remaining_old.len + frames.len) catch {
+        conn.allocator.free(frames);
+        return;
+    };
+    @memcpy(combined[0..remaining_old.len], remaining_old);
+    @memcpy(combined[remaining_old.len..], frames);
+    conn.allocator.free(conn.write_buf);
+    conn.allocator.free(frames);
+    conn.write_buf = combined;
+    conn.write_pos = 0;
+}
+
+fn flushOutbound(loop: *eventloop.Loop, conn: *Connection) void {
+    if (conn.write_buf.len > conn.write_pos) {
+        if (conn.state != .writing) {
+            conn.state = .writing;
+            loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                wsTeardown(loop, conn);
+                return;
+            };
+        }
+        doWrite(loop, conn);
+        return;
+    }
+
+    if (!conn.keep_alive) {
+        wsTeardown(loop, conn);
+    }
+}
+
+fn sendCloseFrame(conn: *Connection, code: u16) !void {
+    const payload = [_]u8{ @intCast((code >> 8) & 0xFF), @intCast(code & 0xFF) };
+    const frame_size = ws.frameSize(payload.len);
+    const buf = try conn.allocator.alloc(u8, frame_size);
+    _ = try ws.writeFrame(buf, .close, &payload);
+    queueFrames(conn, buf);
+}
+
+fn sendControlFrame(conn: *Connection, opcode: ws.Opcode, payload: []const u8) !void {
+    const frame_size = ws.frameSize(payload.len);
+    const buf = try conn.allocator.alloc(u8, frame_size);
+    _ = try ws.writeFrame(buf, opcode, payload);
+    queueFrames(conn, buf);
+}
+
+fn wsAfterWrite(loop: *eventloop.Loop, conn: *Connection) void {
+    if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+    conn.write_buf = &.{};
+    conn.write_pos = 0;
+
+    // First call after the handshake we still hold the parsed HTTP request
+    // (so startWebSocket could read its headers). Compact past the upgrade
+    // head and reset the HTTP request slots. Subsequent calls happen from
+    // inside doReadWs's loop — that loop will compact the consumed frame
+    // itself and keep going, so we MUST NOT recurse into doReadWs from
+    // here on the non-first path or we'll re-process the same frame.
+    const first_call = conn.parsed != null;
+    if (first_call) {
+        const data = &conn.read_buf.?.data;
+        const consumed_end = conn.body_offset + conn.body_len;
+        const leftover = conn.read_total - consumed_end;
+        if (leftover > 0) {
+            var i: usize = 0;
+            while (i < leftover) : (i += 1) {
+                data[i] = data[consumed_end + i];
+            }
+        }
+        conn.read_total = leftover;
+        conn.parsed = null;
+        conn.body_offset = 0;
+        conn.body_len = 0;
+    }
+
+    if (!conn.keep_alive) {
+        wsTeardown(loop, conn);
+        return;
+    }
+
+    conn.state = .reading;
+    loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+        wsTeardown(loop, conn);
+        return;
+    };
+
+    // Only on the first call may we have bytes the outer code hasn't seen
+    // (frames piggybacked on the upgrade request). On later calls the
+    // outer doReadWs loop is already in charge of draining the buffer.
+    if (first_call and conn.read_total > 0) {
+        doReadWs(loop, conn);
+        return;
+    }
+
+    // For TLS: OpenSSL may have already decrypted the next frame; only
+    // surface this on the first call for the same reason.
+    if (first_call) {
+        if (conn.ssl) |s| {
+            if (tls.pending(s) > 0) doReadWs(loop, conn);
+        }
+    }
+}
+
+fn wsTeardown(loop: *eventloop.Loop, conn: *Connection) void {
+    if (conn.ws_handle != 0) {
+        const final = bridge.wsDisconnect(conn.ws_handle, 1006, conn.allocator);
+        if (final.len > 0) conn.allocator.free(final);
+        conn.ws_handle = 0;
+    }
+    loop.remove(conn.fd);
+    conn.destroy();
 }
 
 /// Reset connection state for the next keep-alive request. If pipelined

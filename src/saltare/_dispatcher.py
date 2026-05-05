@@ -21,26 +21,32 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import traceback
 from typing import Any
 from urllib.parse import unquote_to_bytes
 
-_loop: asyncio.AbstractEventLoop | None = None
+# Per-thread state. In production there's exactly one `serve()` per process,
+# so this collapses to a single namespace. In tests we run several saltare
+# daemons concurrently (one per test) and they MUST NOT share an asyncio
+# loop or task tables — that mixed up done-Task callbacks and ws handles
+# across servers and produced segfaults during cleanup.
+_state = threading.local()
 
-# Lifespan state. The task is created in `lifespan_startup` and stays parked
-# on its receive() between server start and shutdown. Globals because there
-# is at most one server per process and the bridge calls these as plain
-# top-level functions.
-_lifespan_task: asyncio.Task | None = None
-_lifespan_receive_queue: asyncio.Queue | None = None
-_lifespan_send_queue: asyncio.Queue | None = None
+
+def _ensure_state() -> threading.local:
+    if not hasattr(_state, "loop"):
+        _state.loop = asyncio.new_event_loop()
+        _state.ws_states = {}
+        _state.next_ws_handle = 1
+        _state.lifespan_task = None
+        _state.lifespan_receive_queue = None
+        _state.lifespan_send_queue = None
+    return _state
 
 
 def _ensure_loop() -> asyncio.AbstractEventLoop:
-    global _loop
-    if _loop is None:
-        _loop = asyncio.new_event_loop()
-    return _loop
+    return _ensure_state().loop
 
 
 _LIFESPAN_TIMEOUT = 10.0
@@ -86,22 +92,22 @@ def lifespan_startup(app: Any) -> bool:
     timeout. Called by the Zig bridge once, with the GIL held, before the
     I/O loop accepts any connection.
     """
-    global _lifespan_task, _lifespan_receive_queue, _lifespan_send_queue
+    state = _ensure_state()
+    loop = state.loop
 
-    loop = _ensure_loop()
-
-    # If a previous serve() left a stale task around (test reuse), cancel it.
-    if _lifespan_task is not None and not _lifespan_task.done():
-        _lifespan_task.cancel()
+    # If a previous serve() left a stale task around (rare; mostly a tests
+    # concern), cancel it.
+    if state.lifespan_task is not None and not state.lifespan_task.done():
+        state.lifespan_task.cancel()
         try:
-            loop.run_until_complete(_lifespan_task)
+            loop.run_until_complete(state.lifespan_task)
         except BaseException:
             pass
 
-    _lifespan_receive_queue = asyncio.Queue()
-    _lifespan_send_queue = asyncio.Queue()
+    state.lifespan_receive_queue = asyncio.Queue()
+    state.lifespan_send_queue = asyncio.Queue()
 
-    rq, sq = _lifespan_receive_queue, _lifespan_send_queue
+    rq, sq = state.lifespan_receive_queue, state.lifespan_send_queue
 
     async def lifespan_receive() -> dict[str, Any]:
         return await rq.get()
@@ -114,11 +120,11 @@ def lifespan_startup(app: Any) -> bool:
         "asgi": {"version": "3.0", "spec_version": "2.0"},
     }
 
-    _lifespan_task = loop.create_task(app(scope, lifespan_receive, lifespan_send))
+    state.lifespan_task = loop.create_task(app(scope, lifespan_receive, lifespan_send))
     rq.put_nowait({"type": "lifespan.startup"})
 
     kind, value = loop.run_until_complete(
-        _drive_lifespan_event(_lifespan_task, sq)
+        _drive_lifespan_event(state.lifespan_task, sq)
     )
 
     if kind == "message":
@@ -160,25 +166,23 @@ def lifespan_shutdown() -> None:
     the server proceeds to exit either way. Called by the Zig bridge once,
     with the GIL held, after the I/O loop has stopped accepting connections.
     """
-    global _lifespan_task, _lifespan_receive_queue, _lifespan_send_queue
-
+    state = _ensure_state()
     if (
-        _lifespan_task is None
-        or _lifespan_receive_queue is None
-        or _lifespan_send_queue is None
+        state.lifespan_task is None
+        or state.lifespan_receive_queue is None
+        or state.lifespan_send_queue is None
     ):
         return
 
-    loop = _ensure_loop()
+    loop = state.loop
 
-    if _lifespan_task.done():
-        # App's lifespan handler already finished during startup; nothing left.
+    if state.lifespan_task.done():
         return
 
-    _lifespan_receive_queue.put_nowait({"type": "lifespan.shutdown"})
+    state.lifespan_receive_queue.put_nowait({"type": "lifespan.shutdown"})
 
     kind, value = loop.run_until_complete(
-        _drive_lifespan_event(_lifespan_task, _lifespan_send_queue)
+        _drive_lifespan_event(state.lifespan_task, state.lifespan_send_queue)
     )
 
     if kind == "exception":
@@ -187,10 +191,10 @@ def lifespan_shutdown() -> None:
         )
     elif kind == "timeout":
         sys.stderr.write(f"saltare: lifespan shutdown timed out ({_LIFESPAN_TIMEOUT}s)\n")
-        if not _lifespan_task.done():
-            _lifespan_task.cancel()
+        if not state.lifespan_task.done():
+            state.lifespan_task.cancel()
             try:
-                loop.run_until_complete(_lifespan_task)
+                loop.run_until_complete(state.lifespan_task)
             except BaseException:
                 pass
 
@@ -207,7 +211,210 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.9.0"
+_SERVER_HEADER = b"saltare/0.10.0"
+
+
+# ---------------------------------------------------------------------------
+# WebSocket support.
+#
+# Each upgraded connection has a `_WsState` carrying:
+#   - the app coroutine, scheduled as an asyncio.Task on the persistent loop
+#   - a receive queue (events server pushes for the app to consume)
+#   - an outbound buffer (encoded server-side WS frames the I/O loop drains)
+#
+# The Zig bridge calls `ws_open` once on upgrade, then `ws_event` per inbound
+# frame, then `ws_disconnect` on close. Each call pushes an event into the
+# receive queue and pumps the asyncio loop just long enough for the coro to
+# reach its next `await receive()` — no run_until_complete (the coroutine
+# never completes until close).
+
+
+def _build_server_frame(opcode: int, payload: bytes) -> bytes:
+    """RFC 6455 server-side frame (no masking). FIN=1, single fragment."""
+    out = bytearray()
+    out.append(0x80 | (opcode & 0x0F))
+    n = len(payload)
+    if n < 126:
+        out.append(n)
+    elif n < 65536:
+        out.append(126)
+        out += n.to_bytes(2, "big")
+    else:
+        out.append(127)
+        out += n.to_bytes(8, "big")
+    out += payload
+    return bytes(out)
+
+
+class _WsState:
+    __slots__ = ("recv_queue", "outgoing", "accepted", "closed", "task")
+
+    def __init__(self, app: Any, scope: dict[str, Any]) -> None:
+        self.recv_queue: asyncio.Queue = asyncio.Queue()
+        self.outgoing: list[bytes] = []
+        self.accepted: bool = False
+        self.closed: bool = False
+
+        async def receive() -> dict[str, Any]:
+            return await self.recv_queue.get()
+
+        async def send(message: dict[str, Any]) -> None:
+            mtype = message.get("type")
+            if mtype == "websocket.accept":
+                self.accepted = True
+            elif mtype == "websocket.send":
+                if message.get("text") is not None:
+                    self.outgoing.append(
+                        _build_server_frame(0x1, message["text"].encode("utf-8"))
+                    )
+                elif message.get("bytes") is not None:
+                    self.outgoing.append(_build_server_frame(0x2, message["bytes"]))
+            elif mtype == "websocket.close":
+                code = int(message.get("code", 1000))
+                reason = message.get("reason", "") or ""
+                payload = code.to_bytes(2, "big") + reason.encode("utf-8")
+                self.outgoing.append(_build_server_frame(0x8, payload))
+                self.closed = True
+
+        loop = _ensure_loop()
+        self.task: asyncio.Task = loop.create_task(app(scope, receive, send))
+
+    def push(self, event: dict[str, Any]) -> None:
+        self.recv_queue.put_nowait(event)
+
+    def drain(self) -> bytes:
+        if not self.outgoing:
+            return b""
+        out = b"".join(self.outgoing)
+        self.outgoing.clear()
+        return out
+
+
+def _pump_once() -> None:
+    """Process one batch of ready callbacks on the loop. We use the
+    `_run_once` private method directly: it's the cheapest way to advance
+    coroutines parked on a Future that we've just resolved (via Queue.put)
+    without the overhead of wrapping a marker coroutine in a Task."""
+    loop = _ensure_loop()
+    # Each WS event we process needs the loop to "see" itself as the
+    # currently running loop, otherwise asyncio.get_running_loop() inside
+    # any framework code (FastAPI, Starlette) raises.
+    asyncio.events._set_running_loop(loop)
+    try:
+        loop._run_once()
+    finally:
+        asyncio.events._set_running_loop(None)
+
+
+def ws_open(
+    app: Any,
+    method: str,
+    raw_path: bytes,
+    query_string: bytes,
+    raw_headers: list[tuple[bytes, bytes]],
+    server_host: str,
+    server_port: int,
+    scheme: str,
+) -> tuple[int, bool, bytes, bool]:
+    """Start a WebSocket coroutine, push the websocket.connect event, and
+    pump the loop. Returns (handle, accepted, frames, done):
+       handle:   opaque int the bridge keeps for subsequent ws_event calls.
+       accepted: True if the app called websocket.accept.
+       frames:   already-encoded server frames to write (close, early sends).
+       done:     True if the coroutine finished (clean close).
+    """
+    global _next_ws_handle
+
+    try:
+        path = unquote_to_bytes(raw_path).decode("utf-8")
+    except UnicodeDecodeError:
+        return (0, False, b"", True)
+
+    headers = [(name.lower(), value) for name, value in raw_headers]
+
+    scope: dict[str, Any] = {
+        "type": "websocket",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "scheme": "wss" if scheme == "https" else "ws",
+        "path": path,
+        "raw_path": raw_path,
+        "query_string": query_string,
+        "headers": headers,
+        "server": (server_host, server_port),
+        "client": None,
+        "root_path": "",
+        "subprotocols": [],
+        "method": method,
+    }
+
+    tstate = _ensure_state()
+    handle = tstate.next_ws_handle
+    tstate.next_ws_handle += 1
+
+    ws_state = _WsState(app, scope)
+    tstate.ws_states[handle] = ws_state
+    ws_state.push({"type": "websocket.connect"})
+
+    try:
+        _pump_once()
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+
+    return (handle, ws_state.accepted, ws_state.drain(), ws_state.task.done())
+
+
+def ws_event(handle: int, opcode: int, payload: bytes) -> tuple[bytes, bool]:
+    """Deliver a WebSocket frame to the running coroutine. `opcode` is 1
+    (text) or 2 (binary). Returns (frames_to_send, done)."""
+    tstate = _ensure_state()
+    ws_state = tstate.ws_states.get(handle)
+    if ws_state is None or ws_state.task.done():
+        return (b"", True)
+
+    if opcode == 0x1:
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return (b"", True)
+        ws_state.push({"type": "websocket.receive", "text": text})
+    elif opcode == 0x2:
+        ws_state.push({"type": "websocket.receive", "bytes": payload})
+    else:
+        return (b"", True)
+
+    try:
+        _pump_once()
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+
+    return (ws_state.drain(), ws_state.task.done())
+
+
+def ws_disconnect(handle: int, code: int) -> bytes:
+    """Tell the coroutine the connection has been (or is being) torn down,
+    drain any final frames, and clean up the state. After this call the
+    handle is gone; further ws_event calls return done=True immediately."""
+    tstate = _ensure_state()
+    ws_state = tstate.ws_states.pop(handle, None)
+    if ws_state is None:
+        return b""
+
+    if not ws_state.task.done():
+        ws_state.push({"type": "websocket.disconnect", "code": code})
+        try:
+            _pump_once()
+        except BaseException:
+            traceback.print_exc(file=sys.stderr)
+
+    if not ws_state.task.done():
+        ws_state.task.cancel()
+        try:
+            _pump_once()
+        except BaseException:
+            pass
+
+    return ws_state.drain()
 
 
 def dispatch(

@@ -48,6 +48,39 @@ pub const Request = struct {
     /// any token in a comma-separated list).
     is_chunked: bool,
 
+    /// Returns the value of a header by name (case-insensitive), or null if
+    /// not present. If the header appears more than once only the first
+    /// occurrence is returned.
+    pub fn header(self: Request, name: []const u8) ?[]const u8 {
+        for (self.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        }
+        return null;
+    }
+
+    /// True if the request is a valid RFC 6455 WebSocket upgrade attempt:
+    /// HTTP/1.1 GET with the four required handshake headers (Upgrade,
+    /// Connection, Sec-WebSocket-Key, Sec-WebSocket-Version: 13). Saltare
+    /// only speaks WS version 13.
+    pub fn isWebSocketUpgrade(self: Request) bool {
+        if (self.version_minor != 1) return false;
+        if (!std.ascii.eqlIgnoreCase(self.method, "GET")) return false;
+
+        const upgrade = self.header("upgrade") orelse return false;
+        if (!connectionTokenPresent(upgrade, "websocket")) return false;
+
+        const conn = self.header("connection") orelse return false;
+        if (!connectionTokenPresent(conn, "upgrade")) return false;
+
+        if (self.header("sec-websocket-key") == null) return false;
+
+        const ver = self.header("sec-websocket-version") orelse return false;
+        const ver_trimmed = std.mem.trim(u8, ver, " \t");
+        if (!std.mem.eql(u8, ver_trimmed, "13")) return false;
+
+        return true;
+    }
+
     /// Whether the connection should be kept alive after this request.
     /// RFC 7230 §6.3:
     ///   - HTTP/1.1: persistent unless `Connection: close` is present.
