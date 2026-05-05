@@ -87,7 +87,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.6.0** — Pooled read buffers. Idle keep-alive connections release their 16 KiB read buffer back to a shared pool; the next read event re-acquires one. RSS now scales with **in-flight requests**, not with **open connections**. Result: ~5× less per-connection memory than uvicorn at idle.
 - [x] **v0.7.0** — ASGI lifespan protocol. The dispatcher creates a long-lived asyncio Task that drives the app through `lifespan.startup` before the I/O loop accepts connections, and through `lifespan.shutdown` after it stops. Apps using `FastAPI(lifespan=...)` now get their startup/shutdown hooks executed. Apps that raise on lifespan scope (no support) are tolerated.
 - [x] **v0.8.0** — Chunked Transfer-Encoding for *request* bodies. Decoder runs in place over the read buffer; resumable across kernel reads. Streaming *response* bodies (true chunked output) still buffer in Python and emit Content-Length — that lands when the dispatcher gets a callback path back into Zig.
-- [ ] **v0.9.0** — TLS (via BoringSSL or stdlib).
+- [x] **v0.9.0** — TLS termination via OpenSSL. Pass `ssl_certfile=` and `ssl_keyfile=` to `saltare.run()` to serve HTTPS. The connection state machine gains a `handshaking` phase; `doRead`/`doWrite` route through SSL_read/SSL_write and translate WANT_READ/WANT_WRITE into epoll interest changes. SSL_pending drained between keep-alive cycles. `auditwheel` bundles libssl/libcrypto into the wheel — self-contained, no host OpenSSL dependency. Single-cert/single-key, server-only (no mTLS, no SNI, no ALPN).
 - [ ] **v0.10.0** — WebSockets.
 - [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`).
 
@@ -113,6 +113,17 @@ def root():
 
 ```bash
 saltare main:app --host 0.0.0.0 --port 8000
+```
+
+For HTTPS, pass a certificate and private key (PEM, both required together):
+
+```python
+import saltare
+from main import app
+
+saltare.run(app, host="0.0.0.0", port=443,
+            ssl_certfile="/etc/letsencrypt/live/example.com/fullchain.pem",
+            ssl_keyfile="/etc/letsencrypt/live/example.com/privkey.pem")
 ```
 
 Both per-request HTTP dispatch and ASGI lifespan startup/shutdown are wired up: `FastAPI(lifespan=...)` and the older `@app.on_event("startup")` work as expected.

@@ -27,10 +27,17 @@ var g_lifespan_startup: ?*py.PyObject = null;
 var g_lifespan_shutdown: ?*py.PyObject = null;
 var g_server_host: ?*py.PyObject = null;
 var g_server_port: c_int = 0;
+/// "http" or "https" — built once at init so dispatch doesn't reallocate.
+var g_scheme: ?*py.PyObject = null;
 
 /// Caller (module.zig) must hold the GIL.
 /// Acquires the references we need to dispatch requests.
-pub fn init(app: *py.PyObject, server_host: []const u8, server_port: c_int) bool {
+pub fn init(
+    app: *py.PyObject,
+    server_host: []const u8,
+    server_port: c_int,
+    is_tls: bool,
+) bool {
     // Idempotent: if a previous serve() call left state behind (test reuse),
     // drop it before installing the new app.
     shutdown();
@@ -50,6 +57,13 @@ pub fn init(app: *py.PyObject, server_host: []const u8, server_port: c_int) bool
         @as(py.Py_ssize_t, @intCast(server_host.len)),
     );
     if (g_server_host == null) return false;
+
+    const scheme = if (is_tls) "https" else "http";
+    g_scheme = py.PyUnicode_FromStringAndSize(
+        @as([*c]const u8, @ptrCast(scheme.ptr)),
+        @as(py.Py_ssize_t, @intCast(scheme.len)),
+    );
+    if (g_scheme == null) return false;
 
     g_server_port = server_port;
     return true;
@@ -76,6 +90,10 @@ pub fn shutdown() void {
     if (g_server_host) |h| {
         py.Py_DecRef(h);
         g_server_host = null;
+    }
+    if (g_scheme) |s| {
+        py.Py_DecRef(s);
+        g_scheme = null;
     }
 }
 
@@ -141,10 +159,10 @@ fn callDispatch(req: http.Request, body: []const u8, keep_alive: bool) ?*py.PyOb
     const headers_obj = buildHeadersList(req.headers) orelse return null;
     defer py.Py_DecRef(headers_obj);
 
-    // Args: (app, method, raw_path, query_string, headers, body, host, port, keep_alive)
+    // Args: (app, method, raw_path, query, headers, body, host, port, keep_alive, scheme)
     return py.PyObject_CallFunction(
         g_dispatch.?,
-        "Os#y#y#Oy#Oii",
+        "Os#y#y#Oy#OiiO",
         g_app.?,
         @as([*c]const u8, @ptrCast(req.method.ptr)),
         @as(py.Py_ssize_t, @intCast(req.method.len)),
@@ -158,6 +176,7 @@ fn callDispatch(req: http.Request, body: []const u8, keep_alive: bool) ?*py.PyOb
         g_server_host.?,
         g_server_port,
         @as(c_int, if (keep_alive) 1 else 0),
+        g_scheme.?,
     );
 }
 

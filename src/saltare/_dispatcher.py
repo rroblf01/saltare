@@ -207,7 +207,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.8.0"
+_SERVER_HEADER = b"saltare/0.9.0"
 
 
 def dispatch(
@@ -220,6 +220,7 @@ def dispatch(
     server_host: str,
     server_port: int,
     keep_alive: int,
+    scheme: str,
 ) -> bytes:
     """Run the ASGI app once. Returns the full HTTP/1.1 response as bytes."""
     loop = _ensure_loop()
@@ -237,7 +238,7 @@ def dispatch(
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
         "method": method,
-        "scheme": "http",
+        "scheme": scheme,
         "path": path,
         "raw_path": raw_path,
         "query_string": query_string,

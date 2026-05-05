@@ -32,6 +32,11 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     root_module.addIncludePath(.{ .cwd_relative = py_include });
+    // OpenSSL for the v0.9 TLS path. We link the system libraries: manylinux
+    // images ship a stable OpenSSL, and auditwheel will vendor libssl /
+    // libcrypto into the final wheel so users don't need them installed.
+    root_module.linkSystemLibrary("ssl", .{});
+    root_module.linkSystemLibrary("crypto", .{});
 
     const lib = b.addLibrary(.{
         .name = "saltare_core",

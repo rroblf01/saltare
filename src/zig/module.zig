@@ -12,6 +12,7 @@ const std = @import("std");
 
 const server = @import("server.zig");
 const bridge = @import("bridge.zig");
+const tls = @import("tls.zig");
 
 // Reuse bridge.zig's @cImport translation unit. Distinct @cImport blocks
 // produce distinct Zig types for the same C structs, which makes
@@ -30,15 +31,27 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.8.0");
+    return py.PyUnicode_FromString("0.9.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
     var app: ?*py.PyObject = null;
     var host_z: [*c]const u8 = null;
     var port: c_int = 0;
+    // `z` accepts None (passed as NULL) or str. The Python wrapper always
+    // passes 5 positional args; missing TLS files come through as None.
+    var ssl_cert_z: [*c]const u8 = null;
+    var ssl_key_z: [*c]const u8 = null;
 
-    if (py.PyArg_ParseTuple(args, "Osi", &app, &host_z, &port) == 0) {
+    if (py.PyArg_ParseTuple(
+        args,
+        "Osizz",
+        &app,
+        &host_z,
+        &port,
+        &ssl_cert_z,
+        &ssl_key_z,
+    ) == 0) {
         return null;
     }
 
@@ -47,26 +60,47 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         return null;
     }
 
-    const host = std.mem.span(host_z);
-
-    if (!bridge.init(app.?, host, port)) {
-        // Either ImportError on saltare._dispatcher or a reference allocation
-        // failure. In both cases an exception is already set.
+    const both_set = ssl_cert_z != null and ssl_key_z != null;
+    const either_set = ssl_cert_z != null or ssl_key_z != null;
+    if (either_set and !both_set) {
+        py.PyErr_SetString(
+            py.PyExc_ValueError,
+            "ssl_certfile and ssl_keyfile must be set together",
+        );
         return null;
     }
 
-    // ASGI lifespan startup. If the app explicitly fails (e.g. raises
-    // lifespan.startup.failed), refuse to serve.
+    const host = std.mem.span(host_z);
+
+    // Stand up the TLS context up front: a bad cert/key should fail at
+    // serve() time with a clear Python exception, not at first connection.
+    var tls_ctx: ?*tls.Ctx = null;
+    if (both_set) {
+        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z) catch |err| {
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(
+                &msg_buf,
+                "saltare TLS init failed: {s}",
+                .{@errorName(err)},
+            ) catch "saltare TLS init failed";
+            py.PyErr_SetString(py.PyExc_RuntimeError, msg.ptr);
+            return null;
+        };
+    }
+    defer if (tls_ctx) |ctx| tls.freeContext(ctx);
+
+    if (!bridge.init(app.?, host, port, both_set)) {
+        return null;
+    }
+
     if (!bridge.lifespanStartup()) {
         bridge.shutdown();
         py.PyErr_SetString(py.PyExc_RuntimeError, "saltare: lifespan startup failed");
         return null;
     }
 
-    // Release the GIL: the I/O loop is pure Zig and only re-acquires the
-    // GIL once per request, inside bridge.dispatch.
     const tstate = py.PyEval_SaveThread();
-    server.run(host, @intCast(port)) catch |err| {
+    server.run(host, @intCast(port), tls_ctx) catch |err| {
         py.PyEval_RestoreThread(tstate);
         bridge.lifespanShutdown();
         bridge.shutdown();
@@ -81,8 +115,6 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     };
     py.PyEval_RestoreThread(tstate);
 
-    // Drive the lifespan shutdown event before tearing down the bridge —
-    // we still need g_lifespan_shutdown alive for the call.
     bridge.lifespanShutdown();
     bridge.shutdown();
 

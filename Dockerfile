@@ -36,6 +36,9 @@ RUN bash /tmp/install-zig.sh && rm /tmp/install-zig.sh
 FROM zig-toolchain AS build-env
 ARG PYTHON_TAG
 ENV PATH=/opt/python/${PYTHON_TAG}/bin:/usr/local/bin:${PATH}
+# OpenSSL headers for the v0.9 TLS link. Manylinux images ship the runtime
+# already; the -devel package adds the headers our @cImport needs.
+RUN dnf install -y openssl-devel && dnf clean all
 RUN pip install --upgrade pip build
 
 # ---------------------------------------------------------------------------

@@ -15,11 +15,13 @@ def run(
     app: Any,
     host: str = "127.0.0.1",
     port: int = 8000,
+    ssl_certfile: str | None = None,
+    ssl_keyfile: str | None = None,
 ) -> None:
     """Run an ASGI application under saltare.
 
-    Blocks until SIGINT or SIGTERM. The accept loop and HTTP/1.1 parsing
-    run in Zig with the GIL released; the GIL is re-acquired only for the
-    per-request ASGI dispatch into Python.
+    Blocks until SIGINT or SIGTERM. Pass `ssl_certfile` and `ssl_keyfile`
+    (both PEM) to serve HTTPS instead of plain HTTP. Lifespan startup runs
+    before the I/O loop accepts connections.
     """
-    _core.serve(app, host, int(port))
+    _core.serve(app, host, int(port), ssl_certfile, ssl_keyfile)

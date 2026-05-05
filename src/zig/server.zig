@@ -16,6 +16,7 @@ const http = @import("http.zig");
 const bridge = @import("bridge.zig");
 const eventloop = @import("eventloop.zig");
 const pool_mod = @import("pool.zig");
+const tls = @import("tls.zig");
 
 const c = @cImport({
     @cInclude("sys/socket.h");
@@ -36,11 +37,16 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.8.0";
+const SERVER_HEADER = "saltare/0.9.0";
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
 var g_should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Set by `run` when TLS is enabled. Lives only for the duration of one
+/// `serve()` call. Each accepted connection wraps its fd with a fresh SSL
+/// derived from this context.
+var g_tls_ctx: ?*tls.Ctx = null;
 
 // Sentinel pointer used as `event.data.ptr` for the listening socket so the
 // event loop can tell it apart from connection events without a hashmap.
@@ -85,7 +91,12 @@ fn parseIpv4(host: []const u8, port: u16) !c.struct_sockaddr_in {
     return addr;
 }
 
-const ConnState = enum { reading, writing };
+const ConnState = enum {
+    /// TLS handshake in progress. Plaintext connections start in `.reading`.
+    handshaking,
+    reading,
+    writing,
+};
 
 const Connection = struct {
     fd: c_int,
@@ -123,6 +134,9 @@ const Connection = struct {
     allocator: std.mem.Allocator,
     pool: *pool_mod.Pool,
 
+    /// Set when accept() handed us a TLS-bound fd. Null for plaintext.
+    ssl: ?*tls.Ssl,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -146,11 +160,15 @@ const Connection = struct {
             .keep_alive = false,
             .allocator = allocator,
             .pool = pool,
+            .ssl = null,
         };
         return conn;
     }
 
     fn destroy(self: *Connection) void {
+        // Tear down TLS first so the close_notify alert goes out before
+        // we close the underlying fd.
+        if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b);
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
         _ = c.close(self.fd);
@@ -171,7 +189,10 @@ const Connection = struct {
     }
 };
 
-pub fn run(host: []const u8, port: u16) !void {
+pub fn run(host: []const u8, port: u16, tls_ctx: ?*tls.Ctx) !void {
+    g_tls_ctx = tls_ctx;
+    defer g_tls_ctx = null;
+
     const addr = try parseIpv4(host, port);
 
     const listen_fd = c.socket(
@@ -243,6 +264,19 @@ fn acceptAll(
             continue;
         };
 
+        // For TLS: attach a fresh SSL session to the new fd and start the
+        // handshake on the next event. SSL_accept will signal WANT_READ on
+        // an empty socket, which is exactly what we need.
+        if (g_tls_ctx) |ctx| {
+            if (tls.newSsl(ctx, client)) |ssl| {
+                conn.ssl = ssl;
+                conn.state = .handshaking;
+            } else {
+                conn.destroy();
+                continue;
+            }
+        }
+
         loop.add(client, @ptrCast(conn), true, false) catch {
             conn.destroy();
             continue;
@@ -256,10 +290,105 @@ fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event
         conn.destroy();
         return;
     }
+    // For TLS, OpenSSL's renegotiation can flip what kind of event it wants
+    // (read vs write) mid-stream. We always advance based on `state`, not on
+    // which event woke us — the connRead / connWrite helpers map back to
+    // EPOLL interest after each call.
     switch (conn.state) {
-        .reading => if (ev.readable) doRead(loop, conn),
-        .writing => if (ev.writable) doWrite(loop, conn),
+        .handshaking => doHandshake(loop, conn),
+        .reading => if (ev.readable or ev.writable) doRead(loop, conn),
+        .writing => if (ev.readable or ev.writable) doWrite(loop, conn),
     }
+}
+
+fn doHandshake(loop: *eventloop.Loop, conn: *Connection) void {
+    const ssl = conn.ssl.?;
+    switch (tls.handshake(ssl)) {
+        .ok => {
+            conn.state = .reading;
+            loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+            };
+        },
+        .want_read => {
+            loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+            };
+        },
+        .want_write => {
+            loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+            };
+        },
+        .closed, .fatal => {
+            loop.remove(conn.fd);
+            conn.destroy();
+        },
+    }
+}
+
+/// Plaintext or TLS read. Returns one of:
+///   - .ok with `n` bytes appended to `buf`
+///   - .would_block / .want_read: caller should keep epoll on read
+///   - .want_write: caller should switch epoll to write (TLS renegotiation)
+///   - .closed / .fatal: caller should close the connection
+const IoStatus = enum { ok, would_block, want_read, want_write, closed, fatal };
+
+fn connRead(conn: *Connection, buf: []u8) struct { status: IoStatus, n: usize } {
+    if (conn.ssl) |ssl| {
+        const r = tls.read(ssl, buf);
+        return .{
+            .status = switch (r.status) {
+                .ok => .ok,
+                .want_read => .want_read,
+                .want_write => .want_write,
+                .closed => .closed,
+                .fatal => .fatal,
+            },
+            .n = r.n,
+        };
+    }
+    const cret = c.read(conn.fd, @ptrCast(buf.ptr), buf.len);
+    if (cret == 0) return .{ .status = .closed, .n = 0 };
+    if (cret < 0) return .{ .status = .would_block, .n = 0 };
+    return .{ .status = .ok, .n = @intCast(cret) };
+}
+
+fn connWrite(conn: *Connection, buf: []const u8) struct { status: IoStatus, n: usize } {
+    if (conn.ssl) |ssl| {
+        const r = tls.write(ssl, buf);
+        return .{
+            .status = switch (r.status) {
+                .ok => .ok,
+                .want_read => .want_read,
+                .want_write => .want_write,
+                .closed => .closed,
+                .fatal => .fatal,
+            },
+            .n = r.n,
+        };
+    }
+    const cret = c.write(conn.fd, @ptrCast(buf.ptr), buf.len);
+    if (cret == 0) return .{ .status = .closed, .n = 0 };
+    if (cret < 0) return .{ .status = .would_block, .n = 0 };
+    return .{ .status = .ok, .n = @intCast(cret) };
+}
+
+fn epollWantRead(loop: *eventloop.Loop, conn: *Connection) void {
+    loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+    };
+}
+
+fn epollWantWrite(loop: *eventloop.Loop, conn: *Connection) void {
+    loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+    };
 }
 
 fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
@@ -277,19 +406,24 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
             return;
         }
 
-        const n = c.read(conn.fd, @ptrCast(remaining.ptr), remaining.len);
-        if (n == 0) {
-            // Peer closed before sending a complete request.
-            loop.remove(conn.fd);
-            conn.destroy();
-            return;
+        const r = connRead(conn, remaining);
+        switch (r.status) {
+            .ok => {},
+            .would_block, .want_read => {
+                if (conn.ssl != null) epollWantRead(loop, conn);
+                return;
+            },
+            .want_write => {
+                epollWantWrite(loop, conn);
+                return;
+            },
+            .closed, .fatal => {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            },
         }
-        if (n < 0) {
-            // Almost always EAGAIN under non-blocking I/O. Real errors will
-            // surface via EPOLLERR/EPOLLHUP on the next epoll cycle.
-            return;
-        }
-        conn.read_total += @intCast(n);
+        conn.read_total += r.n;
 
         if (conn.parsed == null) {
             if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
@@ -378,14 +512,23 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
 fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
     while (conn.write_pos < conn.write_buf.len) {
         const remaining = conn.write_buf[conn.write_pos..];
-        const n = c.write(conn.fd, @ptrCast(remaining.ptr), remaining.len);
-        if (n < 0) return; // EAGAIN: wait for next EPOLLOUT
-        if (n == 0) {
-            loop.remove(conn.fd);
-            conn.destroy();
-            return;
+        const r = connWrite(conn, remaining);
+        switch (r.status) {
+            .ok => conn.write_pos += r.n,
+            .would_block, .want_write => {
+                if (conn.ssl != null) epollWantWrite(loop, conn);
+                return;
+            },
+            .want_read => {
+                epollWantRead(loop, conn);
+                return;
+            },
+            .closed, .fatal => {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            },
         }
-        conn.write_pos += @intCast(n);
     }
 
     if (conn.keep_alive) {
@@ -450,6 +593,16 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
 
     if (leftover > 0) {
         tryParsePipelined(loop, conn);
+        return;
+    }
+
+    // For TLS: even with no plaintext leftover, OpenSSL may have already
+    // received and decrypted the next request into its own buffer. epoll
+    // won't tell us about that — drain explicitly.
+    if (conn.ssl) |ssl| {
+        if (tls.pending(ssl) > 0) {
+            doRead(loop, conn);
+        }
     }
 }
 
