@@ -44,7 +44,7 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 ## Roadmap
 
 - [x] **v0.1.0** — Build pipeline. `saltare._core` extension built with Zig via `scikit-build-core`. Listening socket + accept loop in Zig. Single fixed HTTP response. Local Docker build + cibuildwheel CI.
-- [ ] **v0.2.0** — HTTP/1.1 request parser in Zig (request line, headers, `Content-Length` body).
+- [x] **v0.2.0** — HTTP/1.1 request parser in Zig (request line, headers, `Content-Length` framing). Server echoes method + target back so the parser is observable end-to-end. Zero allocations per request.
 - [ ] **v0.3.0** — ASGI dispatcher: build the `scope` dict, drive coroutines, plumb `send`/`receive`. First milestone where `saltare main:app` runs a real FastAPI app.
 - [ ] **v0.4.0** — Non-blocking event loop (epoll / kqueue) with concurrent connections.
 - [ ] **v0.5.0** — Lifespan protocol, keep-alive, chunked transfer.

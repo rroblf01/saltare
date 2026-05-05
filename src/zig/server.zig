@@ -1,19 +1,18 @@
-// Saltare network core (v0 stub).
+// Saltare network core.
 //
-// Today: a single-threaded blocking accept loop that returns a fixed HTTP/1.1
-// response to every client. This exists to validate the build pipeline and
-// the Python <-> Zig boundary end-to-end.
+// v0.2: parses incoming HTTP/1.1 requests with `http.zig` and echoes the
+// method+target back so we can verify the parser end-to-end. Still a single
+// blocking accept loop.
 //
 // Why libc directly: Zig 0.16 reshuffled std.net / std.posix.socket out of
 // the stdlib in favour of the new std.Io abstraction. We keep the surface
 // stable (and easy to reason about) by talking to POSIX through libc via
-// @cImport. Future iterations replace `handleConnection` with:
-//   1. An HTTP/1.1 parser.
-//   2. ASGI scope construction.
-//   3. A non-blocking event loop (epoll on Linux, kqueue on macOS).
-//   4. The Python ASGI dispatcher.
+// @cImport. Future iterations:
+//   - v0.3: ASGI dispatcher driving a real Python app.
+//   - v0.4: non-blocking event loop (epoll on Linux, kqueue on macOS).
 
 const std = @import("std");
+const http = @import("http.zig");
 
 const c = @cImport({
     @cInclude("sys/socket.h");
@@ -22,18 +21,13 @@ const c = @cImport({
     @cInclude("signal.h");
 });
 
-const BODY: []const u8 = "Hello from saltare (Zig stub backend)\n";
+const SERVER_HEADER = "saltare/0.2.0";
 
-const RESPONSE = std.fmt.comptimePrint(
-    "HTTP/1.1 200 OK\r\n" ++
-        "Server: saltare/0.1.0\r\n" ++
-        "Content-Type: text/plain; charset=utf-8\r\n" ++
-        "Content-Length: {d}\r\n" ++
-        "Connection: close\r\n" ++
-        "\r\n" ++
-        "{s}",
-    .{ BODY.len, BODY },
-);
+// Caps for the v0.2 read path. Anything beyond these gets a 4xx response —
+// they're generous enough for typical FastAPI traffic and small enough to
+// keep the per-connection footprint tight.
+const READ_BUFFER_SIZE = 16 * 1024;
+const RESPONSE_BUFFER_SIZE = 4 * 1024;
 
 // Shared state with the signal handler. The handler must remain
 // async-signal-safe, so it only touches an atomic flag and issues a
@@ -111,7 +105,7 @@ pub fn run(host: []const u8, port: u16) !void {
 
     installSignalHandlers();
 
-    std.log.info("saltare stub listening on {s}:{d}", .{ host, port });
+    std.log.info("saltare listening on {s}:{d}", .{ host, port });
 
     while (!g_should_stop.load(.seq_cst)) {
         const client = c.accept(sock, null, null);
@@ -121,25 +115,94 @@ pub fn run(host: []const u8, port: u16) !void {
             continue; // EINTR or transient: retry
         }
 
-        handleConnection(client) catch |err| {
-            std.log.warn("connection failed: {s}", .{@errorName(err)});
-        };
+        handleConnection(client);
     }
 
     _ = c.close(sock);
 }
 
-fn handleConnection(client: c_int) !void {
+fn handleConnection(client: c_int) void {
     defer _ = c.close(client);
 
-    // v0 stub: drain whatever the client sent in one read and discard it.
-    // The real parser will live in `http.zig`.
-    var buf: [8192]u8 = undefined;
-    _ = c.read(client, @ptrCast(&buf), buf.len);
+    var read_buf: [READ_BUFFER_SIZE]u8 = undefined;
+    var headers_buf: [http.max_headers]http.Header = undefined;
+    var read_total: usize = 0;
 
+    // Loop until the parser succeeds, the buffer fills up, or the peer hangs
+    // up. The parser returns `error.Incomplete` until we have the full head.
+    const req = parse_loop: while (true) {
+        const remaining_buf = read_buf[read_total..];
+        if (remaining_buf.len == 0) {
+            // Head section larger than READ_BUFFER_SIZE — refuse it.
+            sendStatus(client, 431, "Request Header Fields Too Large");
+            return;
+        }
+        const n = c.read(client, @ptrCast(remaining_buf.ptr), remaining_buf.len);
+        if (n <= 0) return; // peer closed or read error: nothing to do
+        read_total += @intCast(n);
+
+        if (http.parse(read_buf[0..read_total], &headers_buf)) |parsed| {
+            break :parse_loop parsed;
+        } else |err| switch (err) {
+            error.Incomplete => continue,
+            else => {
+                std.log.warn("parse failed: {s}", .{@errorName(err)});
+                sendStatus(client, 400, "Bad Request");
+                return;
+            },
+        }
+    };
+
+    // For now, ignore any body bytes already in the buffer. v0.3 will read
+    // up to `req.content_length` more bytes if needed and forward them to
+    // the ASGI receive() callable.
+
+    sendEcho(client, req);
+}
+
+fn sendEcho(client: c_int, req: http.Request) void {
+    var body_buf: [1024]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        &body_buf,
+        "saltare parsed: {s} {s} HTTP/1.{d}\n",
+        .{ req.method, req.target, req.version_minor },
+    ) catch return;
+
+    var resp_buf: [RESPONSE_BUFFER_SIZE]u8 = undefined;
+    const resp = std.fmt.bufPrint(
+        &resp_buf,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "Content-Type: text/plain; charset=utf-8\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n" ++
+            "{s}",
+        .{ body.len, body },
+    ) catch return;
+
+    writeAll(client, resp);
+}
+
+fn sendStatus(client: c_int, code: u16, reason: []const u8) void {
+    var buf: [256]u8 = undefined;
+    const resp = std.fmt.bufPrint(
+        &buf,
+        "HTTP/1.1 {d} {s}\r\n" ++
+            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "Content-Length: 0\r\n" ++
+            "Connection: close\r\n" ++
+            "\r\n",
+        .{ code, reason },
+    ) catch return;
+
+    writeAll(client, resp);
+}
+
+fn writeAll(client: c_int, data: []const u8) void {
     var written: usize = 0;
-    while (written < RESPONSE.len) {
-        const remaining = RESPONSE[written..];
+    while (written < data.len) {
+        const remaining = data[written..];
         const n = c.write(client, @ptrCast(remaining.ptr), remaining.len);
         if (n <= 0) return;
         written += @intCast(n);

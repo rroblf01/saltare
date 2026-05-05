@@ -26,7 +26,7 @@ DOCKER_BUILD_ARGS = \
     --build-arg MANYLINUX_TAG=$(MANYLINUX_TAG) \
     --build-arg ZIG_VERSION=$(ZIG_VERSION)
 
-.PHONY: help build test build-local test-host install-zig clean
+.PHONY: help build test build-local install-zig clean
 
 help:
 	@echo "Targets (no Zig on host):"
@@ -35,7 +35,6 @@ help:
 	@echo ""
 	@echo "Targets (Zig on host):"
 	@echo "  build-local   pip install -e '.[dev]'"
-	@echo "  test-host     pytest -q against the host install"
 	@echo ""
 	@echo "Other:"
 	@echo "  install-zig   Download pinned Zig into /opt/zig"
@@ -59,9 +58,6 @@ test:
 
 build-local:
 	pip install -e ".[dev]"
-
-test-host:
-	pytest -q
 
 install-zig:
 	./scripts/install-zig.sh
