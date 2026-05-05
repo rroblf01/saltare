@@ -1,19 +1,25 @@
 // Python C-API entry point for the `saltare._core` extension.
 //
-// We deliberately keep this file thin: it owns the module/method table and
-// argument parsing, and delegates real work to sibling modules
-// (`server.zig` for the I/O loop, ...).
+// Surface:
+//   - version() -> str        Native core version (matches the wheel's).
+//   - serve(app, host, port)  Bind, accept, dispatch ASGI requests to `app`.
+//
+// This file owns argument parsing and the GIL save/restore around the I/O
+// loop. It delegates per-request work to bridge.zig (Python call) and to
+// server.zig (the accept loop and HTTP parsing).
 
 const std = @import("std");
-const builtin = @import("builtin");
-
-const py = @cImport({
-    @cInclude("Python.h");
-});
 
 const server = @import("server.zig");
+const bridge = @import("bridge.zig");
 
-// CPython's `Py_None` macro just takes the address of the global
+// Reuse bridge.zig's @cImport translation unit. Distinct @cImport blocks
+// produce distinct Zig types for the same C structs, which makes
+// `*py.PyObject` from one file fail to coerce to `*py.PyObject` from
+// another. Sharing the import keeps the type identity stable.
+const py = bridge.py;
+
+// CPython's `Py_None` macro is just the address of the global
 // `_Py_NoneStruct`. Declaring it `extern` lets us return Py_None without
 // fighting macro translation across Python versions.
 extern var _Py_NoneStruct: py.PyObject;
@@ -24,14 +30,15 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.2.0");
+    return py.PyUnicode_FromString("0.3.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var app: ?*py.PyObject = null;
     var host_z: [*c]const u8 = null;
     var port: c_int = 0;
 
-    if (py.PyArg_ParseTuple(args, "si", &host_z, &port) == 0) {
+    if (py.PyArg_ParseTuple(args, "Osi", &app, &host_z, &port) == 0) {
         return null;
     }
 
@@ -42,10 +49,18 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
 
     const host = std.mem.span(host_z);
 
-    // Release the GIL: the I/O loop is pure Zig and never touches Python state.
+    if (!bridge.init(app.?, host, port)) {
+        // Either ImportError on saltare._dispatcher or a reference allocation
+        // failure. In both cases an exception is already set.
+        return null;
+    }
+
+    // Release the GIL: the I/O loop is pure Zig and only re-acquires the
+    // GIL once per request, inside bridge.handleRequest.
     const tstate = py.PyEval_SaveThread();
     server.run(host, @intCast(port)) catch |err| {
         py.PyEval_RestoreThread(tstate);
+        bridge.shutdown();
         var msg_buf: [128]u8 = undefined;
         const msg = std.fmt.bufPrintZ(
             &msg_buf,
@@ -57,10 +72,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     };
     py.PyEval_RestoreThread(tstate);
 
-    // Allow the Python signal handler to fire any pending KeyboardInterrupt
-    // we caught with our own SIGINT trap.
-    if (py.PyErr_CheckSignals() != 0) return null;
+    bridge.shutdown();
 
+    if (py.PyErr_CheckSignals() != 0) return null;
     return pyReturnNone();
 }
 
@@ -75,7 +89,7 @@ var methods = [_]py.PyMethodDef{
         .ml_name = "serve",
         .ml_meth = @ptrCast(&saltareServe),
         .ml_flags = py.METH_VARARGS,
-        .ml_doc = "serve(host: str, port: int) -> None. Bind and serve until SIGINT/SIGTERM.",
+        .ml_doc = "serve(app, host: str, port: int) -> None. Bind and serve until SIGINT/SIGTERM.",
     },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };

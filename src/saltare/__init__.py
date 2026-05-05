@@ -18,10 +18,8 @@ def run(
 ) -> None:
     """Run an ASGI application under saltare.
 
-    NOTE (v0.1.0): the listening socket and accept loop are in Zig, but the
-    `app` callable is not yet routed through the ASGI bridge. Every request
-    receives a fixed stub response. The next milestone wires the HTTP/1.1
-    parser and ASGI dispatcher so FastAPI apps can run end-to-end.
+    Blocks until SIGINT or SIGTERM. The accept loop and HTTP/1.1 parsing
+    run in Zig with the GIL released; the GIL is re-acquired only for the
+    per-request ASGI dispatch into Python.
     """
-    _ = app  # ASGI dispatcher is not implemented yet
-    _core.serve(host, int(port))
+    _core.serve(app, host, int(port))

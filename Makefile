@@ -26,12 +26,13 @@ DOCKER_BUILD_ARGS = \
     --build-arg MANYLINUX_TAG=$(MANYLINUX_TAG) \
     --build-arg ZIG_VERSION=$(ZIG_VERSION)
 
-.PHONY: help build test build-local install-zig clean
+.PHONY: help build test bench build-local install-zig clean
 
 help:
 	@echo "Targets (no Zig on host):"
 	@echo "  build         Build a wheel via Docker -> dist/"
 	@echo "  test          Build wheel, install it in a clean image, run pytest"
+	@echo "  bench         Build wheel, install it + uvicorn, run RAM benchmark"
 	@echo ""
 	@echo "Targets (Zig on host):"
 	@echo "  build-local   pip install -e '.[dev]'"
@@ -55,6 +56,15 @@ test:
 		--target=tester \
 		$(DOCKER_BUILD_ARGS) \
 		.
+
+bench:
+	DOCKER_BUILDKIT=1 docker build \
+		--target=bench \
+		--tag=saltare-bench \
+		--load \
+		$(DOCKER_BUILD_ARGS) \
+		.
+	docker run --rm --platform=$(DOCKER_PLATFORM) saltare-bench
 
 build-local:
 	pip install -e ".[dev]"

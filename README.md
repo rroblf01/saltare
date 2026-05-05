@@ -41,11 +41,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
                                                  by Zig sockets
 ```
 
+## Benchmarks
+
+Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, fires N=1000 sequential GET requests with `httpx`, and takes a second reading.
+
+Results from a single run on Apple Silicon (manylinux_2_28_aarch64, CPython 3.12, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras):
+
+| server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
+|---------|-----------|----------------|-----------|---------|------|
+| saltare | 36.20 MiB |      36.22 MiB | 36.22 MiB |    1000 | 2518 |
+| uvicorn | 38.78 MiB |      38.82 MiB | 38.82 MiB |    1000 | 2946 |
+
+**Read this honestly:**
+
+- saltare is ~2.6 MiB (≈7%) leaner today. Most of the 36–38 MiB is Python + FastAPI itself — the irreducible floor neither server can shrink.
+- uvicorn is faster on this workload (~17%) because `httpx` reuses one TCP connection thanks to uvicorn's keep-alive support; saltare in v0.3 always sends `Connection: close`, paying the TCP three-way handshake on every request. Keep-alive lands in v0.5.
+- This is the **floor** of saltare's RAM advantage. The benchmark only ever has one connection alive at a time. The architectural win — Zig structs (~hundreds of bytes) for per-connection state vs uvicorn's Transport/Protocol/Task allocations (~KB each) — only materialises when many connections exist concurrently. v0.4 (non-blocking event loop) makes that measurable; expect the gap to widen there.
+
 ## Roadmap
 
 - [x] **v0.1.0** — Build pipeline. `saltare._core` extension built with Zig via `scikit-build-core`. Listening socket + accept loop in Zig. Single fixed HTTP response. Local Docker build + cibuildwheel CI.
 - [x] **v0.2.0** — HTTP/1.1 request parser in Zig (request line, headers, `Content-Length` framing). Server echoes method + target back so the parser is observable end-to-end. Zero allocations per request.
-- [ ] **v0.3.0** — ASGI dispatcher: build the `scope` dict, drive coroutines, plumb `send`/`receive`. First milestone where `saltare main:app` runs a real FastAPI app.
+- [x] **v0.3.0** — ASGI dispatcher. Persistent `asyncio` loop reused across requests; per-request `loop.run_until_complete`. Zig calls into Python via the C API only at dispatch time. FastAPI runs end-to-end (path params, JSON bodies, 404). No lifespan, no keep-alive, no streaming yet.
 - [ ] **v0.4.0** — Non-blocking event loop (epoll / kqueue) with concurrent connections.
 - [ ] **v0.5.0** — Lifespan protocol, keep-alive, chunked transfer.
 - [ ] **v0.6.0** — TLS (via BoringSSL or stdlib).
@@ -76,7 +93,7 @@ def root():
 saltare main:app --host 0.0.0.0 --port 8000
 ```
 
-> Until v0.3, `app` is loaded but ignored. You'll see the stub response regardless of route.
+As of v0.3 the `app` is dispatched on every request. Lifespan / startup hooks are not invoked yet, so apps that rely on them (e.g. `@app.on_event("startup")`) will still run their routes but won't have run setup code.
 
 ## Building from source
 

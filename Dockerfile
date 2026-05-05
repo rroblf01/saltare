@@ -42,7 +42,7 @@ RUN pip install --upgrade pip build
 # Stage 3: Test environment. Adds pytest+httpx once; the wheel install gets a
 # separate layer below so it can invalidate independently.
 FROM build-env AS test-env
-RUN pip install pytest httpx
+RUN pip install pytest httpx fastapi
 
 # ---------------------------------------------------------------------------
 # Stage 4: Build the wheel. Re-runs only when build inputs change. We copy
@@ -68,6 +68,18 @@ COPY tests ./tests
 RUN pytest -q tests
 
 # ---------------------------------------------------------------------------
-# Stage 6: Minimal export. `--output=dist` lets BuildKit copy /dist out.
+# Stage 6: RAM benchmark. Installs the saltare wheel + uvicorn (plain, no
+# [standard] extras for a fair comparison) into the test-env image and runs
+# `benchmarks.bench` to print a Markdown comparison table.
+FROM test-env AS bench
+COPY --from=builder /dist /dist
+RUN pip install --no-deps /dist/saltare-*.whl \
+ && pip install uvicorn
+WORKDIR /work
+COPY benchmarks /work/benchmarks
+CMD ["python", "-m", "benchmarks.bench"]
+
+# ---------------------------------------------------------------------------
+# Stage 7: Minimal export. `--output=dist` lets BuildKit copy /dist out.
 FROM scratch AS export
 COPY --from=builder /dist /

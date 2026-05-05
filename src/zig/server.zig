@@ -1,18 +1,19 @@
 // Saltare network core.
 //
-// v0.2: parses incoming HTTP/1.1 requests with `http.zig` and echoes the
-// method+target back so we can verify the parser end-to-end. Still a single
-// blocking accept loop.
+// v0.3: parses HTTP, reads body up to Content-Length, hands the request off
+// to bridge.zig which re-acquires the GIL and calls into Python's ASGI
+// dispatcher. Still single-threaded, blocking accept loop.
 //
 // Why libc directly: Zig 0.16 reshuffled std.net / std.posix.socket out of
 // the stdlib in favour of the new std.Io abstraction. We keep the surface
 // stable (and easy to reason about) by talking to POSIX through libc via
 // @cImport. Future iterations:
-//   - v0.3: ASGI dispatcher driving a real Python app.
 //   - v0.4: non-blocking event loop (epoll on Linux, kqueue on macOS).
+//   - v0.5: lifespan, keep-alive, chunked transfer.
 
 const std = @import("std");
 const http = @import("http.zig");
+const bridge = @import("bridge.zig");
 
 const c = @cImport({
     @cInclude("sys/socket.h");
@@ -21,13 +22,12 @@ const c = @cImport({
     @cInclude("signal.h");
 });
 
-const SERVER_HEADER = "saltare/0.2.0";
+const SERVER_HEADER = "saltare/0.3.0";
 
-// Caps for the v0.2 read path. Anything beyond these gets a 4xx response —
-// they're generous enough for typical FastAPI traffic and small enough to
-// keep the per-connection footprint tight.
+// Caps for the read path. The same buffer holds head and body; if a request
+// doesn't fit we return 413/431. Generous enough for typical FastAPI
+// traffic and small enough to keep the per-connection footprint tight.
 const READ_BUFFER_SIZE = 16 * 1024;
-const RESPONSE_BUFFER_SIZE = 4 * 1024;
 
 // Shared state with the signal handler. The handler must remain
 // async-signal-safe, so it only touches an atomic flag and issues a
@@ -110,11 +110,9 @@ pub fn run(host: []const u8, port: u16) !void {
     while (!g_should_stop.load(.seq_cst)) {
         const client = c.accept(sock, null, null);
         if (client < 0) {
-            // accept will fail with EINVAL/EBADF after our shutdown wakeup.
             if (g_should_stop.load(.seq_cst)) break;
-            continue; // EINTR or transient: retry
+            continue;
         }
-
         handleConnection(client);
     }
 
@@ -128,21 +126,19 @@ fn handleConnection(client: c_int) void {
     var headers_buf: [http.max_headers]http.Header = undefined;
     var read_total: usize = 0;
 
-    // Loop until the parser succeeds, the buffer fills up, or the peer hangs
-    // up. The parser returns `error.Incomplete` until we have the full head.
-    const req = parse_loop: while (true) {
+    // Phase 1: read until we have the full head section.
+    const req = blk: while (true) {
         const remaining_buf = read_buf[read_total..];
         if (remaining_buf.len == 0) {
-            // Head section larger than READ_BUFFER_SIZE — refuse it.
             sendStatus(client, 431, "Request Header Fields Too Large");
             return;
         }
         const n = c.read(client, @ptrCast(remaining_buf.ptr), remaining_buf.len);
-        if (n <= 0) return; // peer closed or read error: nothing to do
+        if (n <= 0) return;
         read_total += @intCast(n);
 
         if (http.parse(read_buf[0..read_total], &headers_buf)) |parsed| {
-            break :parse_loop parsed;
+            break :blk parsed;
         } else |err| switch (err) {
             error.Incomplete => continue,
             else => {
@@ -153,35 +149,25 @@ fn handleConnection(client: c_int) void {
         }
     };
 
-    // For now, ignore any body bytes already in the buffer. v0.3 will read
-    // up to `req.content_length` more bytes if needed and forward them to
-    // the ASGI receive() callable.
+    // Phase 2: read the body up to Content-Length. Anything bigger than what
+    // fits in the read buffer is rejected for now; v0.4 will buffer properly.
+    const cl = req.content_length orelse 0;
+    if (req.body_offset + cl > read_buf.len) {
+        sendStatus(client, 413, "Content Too Large");
+        return;
+    }
+    while (read_total < req.body_offset + cl) {
+        const remaining = read_buf[read_total..];
+        const n = c.read(client, @ptrCast(remaining.ptr), remaining.len);
+        if (n <= 0) {
+            sendStatus(client, 400, "Bad Request");
+            return;
+        }
+        read_total += @intCast(n);
+    }
+    const body = read_buf[req.body_offset .. req.body_offset + cl];
 
-    sendEcho(client, req);
-}
-
-fn sendEcho(client: c_int, req: http.Request) void {
-    var body_buf: [1024]u8 = undefined;
-    const body = std.fmt.bufPrint(
-        &body_buf,
-        "saltare parsed: {s} {s} HTTP/1.{d}\n",
-        .{ req.method, req.target, req.version_minor },
-    ) catch return;
-
-    var resp_buf: [RESPONSE_BUFFER_SIZE]u8 = undefined;
-    const resp = std.fmt.bufPrint(
-        &resp_buf,
-        "HTTP/1.1 200 OK\r\n" ++
-            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
-            "Content-Type: text/plain; charset=utf-8\r\n" ++
-            "Content-Length: {d}\r\n" ++
-            "Connection: close\r\n" ++
-            "\r\n" ++
-            "{s}",
-        .{ body.len, body },
-    ) catch return;
-
-    writeAll(client, resp);
+    bridge.handleRequest(client, req, body);
 }
 
 fn sendStatus(client: c_int, code: u16, reason: []const u8) void {
@@ -196,13 +182,9 @@ fn sendStatus(client: c_int, code: u16, reason: []const u8) void {
         .{ code, reason },
     ) catch return;
 
-    writeAll(client, resp);
-}
-
-fn writeAll(client: c_int, data: []const u8) void {
     var written: usize = 0;
-    while (written < data.len) {
-        const remaining = data[written..];
+    while (written < resp.len) {
+        const remaining = resp[written..];
         const n = c.write(client, @ptrCast(remaining.ptr), remaining.len);
         if (n <= 0) return;
         written += @intCast(n);
