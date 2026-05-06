@@ -1,5 +1,7 @@
 [build-system]
-requires = ["scikit-build-core>=0.10"]
+# 0.11 is the first release with stable PEP 639 ("license" as SPDX
+# expression) handling, which the [project] table below uses.
+requires = ["scikit-build-core>=0.11"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -8,12 +10,13 @@ version = "1.2.0"
 description = "Low-RAM ASGI HTTP server with a Zig backbone."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Ricardo Robles", email = "ricardo.r.f@hotmail.com" }
 ]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -21,7 +24,6 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
-    "Operating System :: MacOS",
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
 ]
 
@@ -37,7 +39,7 @@ dev = [
 ]
 
 [tool.scikit-build]
-minimum-version = "0.10"
+minimum-version = "0.11"
 cmake.version = ">=3.20"
 build-dir = "build/{wheel_tag}"
 wheel.packages = ["src/saltare"]
@@ -55,11 +57,11 @@ test-command = "pytest -q {project}/tests"
 before-all = "bash {project}/scripts/install-zig.sh"
 environment = { PATH = "/usr/local/bin:$PATH", ZIG_VERSION = "0.16.0" }
 archs = ["x86_64", "aarch64"]
-
-[tool.cibuildwheel.macos]
-before-all = "bash {project}/scripts/install-zig.sh"
-environment = { PATH = "/usr/local/bin:$PATH", ZIG_VERSION = "0.16.0", MACOSX_DEPLOYMENT_TARGET = "11.0" }
-archs = ["x86_64", "arm64"]
+# Match the local Docker pipeline (scripts/build-wheel.sh + Dockerfile use
+# manylinux_2_28). Also avoids the OpenSSL 1.0.2 in older manylinux2014
+# images that some saltare TLS APIs may not match.
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

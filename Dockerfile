@@ -53,7 +53,7 @@ RUN pip install pytest httpx fastapi websockets
 # layer.
 FROM build-env AS builder
 WORKDIR /io
-COPY pyproject.toml CMakeLists.txt build.zig build.zig.zon README.md ./
+COPY pyproject.toml CMakeLists.txt build.zig build.zig.zon README.md LICENSE ./
 COPY src ./src
 RUN python -m build --wheel --outdir /tmp/dirty-wheels \
  && auditwheel repair /tmp/dirty-wheels/saltare-*.whl -w /dist

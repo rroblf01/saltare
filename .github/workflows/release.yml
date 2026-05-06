@@ -1,5 +1,10 @@
 name: Build & release wheels
 
+# Production target is Linux x86_64 + aarch64. macOS builds are intentionally
+# excluded because saltare's event loop is Linux-only (see eventloop.zig's
+# `@compileError` on non-Linux targets); a kqueue port is not on the
+# roadmap. PRs run the same Linux matrix as the release workflow.
+
 on:
   push:
     tags:
@@ -23,15 +28,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,   arch: x86_64  }
+          - { os: ubuntu-latest,    arch: x86_64  }
           - { os: ubuntu-24.04-arm, arch: aarch64 }
-          - { os: macos-13,        arch: x86_64  }
-          - { os: macos-14,        arch: arm64   }
     steps:
       - uses: actions/checkout@v4
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.21
+        uses: pypa/cibuildwheel@v2.22
         env:
           CIBW_ARCHS: ${{ matrix.arch }}
 
