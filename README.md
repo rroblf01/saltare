@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: pre-alpha (v0.12.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, idle timeouts, and **streaming response bodies** are all in. Apps that emit `more_body=True` chunks now stream through the bridge instead of buffering in Python; auto-chunked encoding is added when no Content-Length is declared. Production-readiness gaps remaining for v1.0: resource caps (max body, max conns), graceful shutdown, observability, multi-worker.
+> **Status: pre-alpha (v0.12.1).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, idle timeouts, and streaming response bodies are all in. v0.12.1 pulls the per-request headers array into the read-buffer pool: idle keep-alive connections now cost **~390 B each** (down from ~2 KiB), pushing the per-connection RAM advantage over uvicorn from ~5× to **~28×**. A `malloc_trim(0)` after lifespan startup trims another ~2 MiB off the floor. Production-readiness gaps remaining for v1.0: resource caps (max body, max conns), graceful shutdown, observability, multi-worker.
 
 ---
 
@@ -48,39 +48,39 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.12.0:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.12.1:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.56 MiB |      45.70 MiB | 45.71 MiB |    1000 | 2286 |
-| uvicorn | 45.00 MiB |      45.04 MiB | 45.04 MiB |    1000 | 2878 |
+| saltare | 43.15 MiB |      43.29 MiB | 43.29 MiB |    1000 | 2271 |
+| uvicorn | 44.90 MiB |      44.94 MiB | 44.94 MiB |    1000 | 2923 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.74 MiB |      42.04 MiB | 42.05 MiB |    2000 | 3810 |
-| uvicorn | 44.99 MiB |      45.46 MiB | 45.46 MiB |    2000 | 3954 |
+| saltare | 41.87 MiB |      42.14 MiB | 42.16 MiB |    2000 | 3790 |
+| uvicorn | 44.83 MiB |      45.22 MiB | 45.22 MiB |    2000 | 3951 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 42.04 MiB |      43.13 MiB | 43.13 MiB |     500 | 2190      |
-| uvicorn | 44.99 MiB |      50.37 MiB | 50.37 MiB |     500 | 2772      |
+| saltare | 41.76 MiB |      41.95 MiB | 41.95 MiB |     500 | 2167      |
+| uvicorn | 44.97 MiB |      50.35 MiB | 50.35 MiB |     500 | 2905      |
 
 **Read this honestly:**
 
-- The **idle keep-alive workload is where saltare's architectural advantage becomes visible**: 500 idle connections cost saltare **+1.09 MiB** (~2 KiB/conn) vs uvicorn's **+5.38 MiB** (~11 KiB/conn). That's still a **~5× per-connection memory saving** for a realistic workload (clients that hold connections open between bursts of activity).
-- The reason: saltare's `pool.zig` returns the 16 KiB read buffer to a shared free list as soon as a keep-alive connection goes idle. uvicorn's asyncio Transport keeps its per-connection buffers and Protocol/Task state alive for the lifetime of the socket.
-- **Throughput parity (concurrent):** saltare 3810 rps vs uvicorn 3954 rps — within ~4%. The remaining gap is primarily `httptools` (uvicorn's tuned C parser) and uvicorn's tighter asyncio integration vs the bridge-driven dispatch.
-- **v0.12 streaming dispatch cost a few percent on sequential.** Every HTTP request now runs as a long-lived asyncio Task with a per-request `recv_queue` and `outgoing` list — that's the price of supporting `more_body=True` and auto-chunked output. Sequential RPS dropped from ~2599 (v0.11) to 2286 (v0.12); concurrent and idle-keepalive workloads were largely unaffected because they were already gated by other costs.
-- The new architecture pays off as soon as response sizes go up: a streaming endpoint that emits 10 MiB across 100 chunks now keeps RSS flat instead of buffering the whole 10 MiB in Python `bytes` before flushing — a saving the bench harness above doesn't measure (its FastAPI app returns ~30 bytes).
-- The ~42 MiB floor is Python + FastAPI itself. No userland server can shrink that without changing what the user app loads. Python 3.14 raises this floor a few MiB versus 3.12 because 3.14 imports more stdlib eagerly.
+- **The idle keep-alive workload is where saltare's architectural advantage shines**: 500 idle connections cost saltare **+0.19 MiB** (~390 B/conn) vs uvicorn's **+5.38 MiB** (~11 KiB/conn). That's a **~28× per-connection memory saving** for a realistic workload (clients that hold connections open between bursts of activity).
+- The reason: saltare's `pool.zig` bundles the 16 KiB read buffer *and* the per-request headers array into a single pool node, returned to a free list as soon as a keep-alive connection goes idle. uvicorn's asyncio Transport keeps its per-connection buffers and Protocol/Task state alive for the lifetime of the socket.
+- **The floor dropped ~2 MiB** between v0.12.0 and v0.12.1 thanks to a `malloc_trim(0)` call after lifespan startup — glibc returns the fragmented heap left over from the FastAPI/Pydantic import chain to the OS in one syscall. Sequential idle went from 45.56 MiB to 43.15 MiB.
+- **Throughput parity (concurrent):** saltare 3790 rps vs uvicorn 3951 rps — within ~4%. The remaining gap is primarily `httptools` (uvicorn's tuned C parser) and uvicorn's tighter asyncio integration vs the bridge-driven dispatch.
+- **Streaming dispatch (v0.12) cost a few percent on sequential** because every HTTP request now runs as a long-lived asyncio Task with a per-request `recv_queue` and `outgoing` list. Sequential RPS sits at 2271 (was 2599 pre-streaming); concurrent and idle-keepalive workloads were largely unaffected because they were already gated by other costs. The new architecture pays off as soon as response sizes go up: a streaming endpoint that emits 10 MiB across 100 chunks now keeps RSS flat instead of buffering the whole 10 MiB in Python `bytes` — a saving the bench harness above doesn't measure (its FastAPI app returns ~30 bytes).
+- The remaining ~42 MiB floor is Python + FastAPI itself. No userland server can shrink that without changing what the user app loads. Python 3.14 raises this floor a few MiB versus 3.12 because 3.14 imports more stdlib eagerly. Setting `MALLOC_ARENA_MAX=2` in the environment shaves another 5–15 MiB on multi-threaded glibc systems (see Production deployment).
 
-**Where saltare's architectural win shows up most:** long-lived idle connections (the WebSocket and keep-alive workloads above), very high concurrency (10k+ open sockets), and now **large streamed responses** (file downloads, SSE, JSON over MB).
+**Where saltare's architectural win shows up most:** long-lived idle connections (the WebSocket and keep-alive workloads above), very high concurrency (10k+ open sockets), and large streamed responses (file downloads, SSE, JSON over MB).
 
 ## Roadmap
 
@@ -96,6 +96,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.10.0** — WebSockets. RFC 6455 handshake, single-frame text/binary messages, ping auto-pong, close echo. Frames unmasked in place over the existing 16 KiB read buffer; outbound frames concatenated onto the same `write_buf` that HTTP responses use. Out of scope: continuation frames, message-level fragmentation, per-message deflate.
 - [x] **v0.11.0** — Per-connection idle timeouts via a hashed timer wheel (`src/zig/timer.zig`). Four configurable deadlines (`header_timeout`, `keep_alive_timeout`, `body_timeout`, `write_timeout`) with defaults of 5/5/30/30 seconds. Slowloris and slow-body attacks are now reaped instead of holding `Connection` structs indefinitely. Wheel uses 128 buckets of 1 second; nodes are intrusive in `Connection` (24 B / conn) so arming and cancelling are allocation-free O(1). WS connections are exempt — long-lived idle sockets are expected there; ping/pong-driven WS keepalive lands post-v0.11.
 - [x] **v0.12.0** — Streaming response bodies. Each HTTP request runs as a long-lived asyncio Task with its own `recv_queue` and `outgoing` list; the app's `send({type: "http.response.body", more_body: True/False})` calls flow chunk-by-chunk through the bridge into Zig's `write_buf` instead of being buffered into a single Python `bytes`. When the app does not declare a Content-Length, saltare adds `Transfer-Encoding: chunked` automatically. Concurrency uses a global "stalled list" of connections whose Task is parked on framework-internal awaits (e.g. FastAPI middleware chains): the main loop runs one global asyncio pump per iteration to advance every parked Task in lockstep, then drains each one — no per-connection multi-pumping, no level-triggered EPOLLOUT spin. Request bodies are still capped to the 16 KiB read buffer (request-side streaming lands in v0.12.x).
+- [x] **v0.12.1** — Per-connection RAM polish. The `[64]Header` array previously inlined into `Connection` (~2 KiB) is now bundled into the same `pool.zig` `Buffer` that holds the read data, so it's released atomically when the connection goes idle: idle keep-alive cost drops from ~2 KiB to ~390 B per connection, taking the per-conn advantage over uvicorn from ~5× to ~28×. A `malloc_trim(0)` call after `lifespan.startup` returns ~2 MiB of glibc heap fragmentation (left over from FastAPI/Pydantic imports) to the OS — the sequential-idle floor dropped from 45.56 MiB to 43.15 MiB. README gains a "Production deployment" section recommending `MALLOC_ARENA_MAX=2` for another 5–15 MiB.
 - [ ] **v0.13.0** — Caps configurable (max body, max concurrent connections, max keepalive_requests, max write buffer) + 413/431 + `Expect: 100-continue`.
 - [ ] **v0.14.0** — Graceful shutdown with in-flight drain on SIGTERM + robust ASGI exception isolation.
 - [ ] **v0.15.0** — Metrics endpoint + access log opt-in + proxy headers + Unix domain sockets.
@@ -170,6 +171,36 @@ saltare.run(
 ```
 
 The same flags are exposed on the CLI (`--header-timeout`, `--keep-alive-timeout`, `--body-timeout`, `--write-timeout`). Defaults match the values above. WebSocket connections are exempt — long-lived idle WS sockets are expected, and ping/pong-driven keepalive lands post-v0.11.
+
+## Production deployment
+
+A few environment knobs noticeably shrink saltare's RSS floor without touching its code. None of these are saltare-specific — they apply to any Python server on glibc — but the project's design makes their effect visible:
+
+```bash
+# Bound glibc's per-thread malloc arenas. saltare runs single-threaded per
+# worker; default arenas (~8 × n_cpus on 64-bit) inflate RSS gratuitously.
+# Typical saving: 5–15 MiB.
+export MALLOC_ARENA_MAX=2
+
+# Conservative listen backlog and fd limit if you're not behind a reverse
+# proxy that already rate-limits accept().
+ulimit -n 65535
+
+saltare main:app --host 0.0.0.0 --port 8000
+```
+
+For a systemd unit:
+
+```ini
+[Service]
+Environment="MALLOC_ARENA_MAX=2"
+LimitNOFILE=65535
+ExecStart=/usr/bin/saltare main:app --host 0.0.0.0 --port 8000
+```
+
+For Kubernetes, set the env var on the pod spec and configure the readiness probe to `GET /` (or any cheap endpoint your app exposes). saltare honours `SIGTERM` for a graceful shutdown after v0.14.
+
+Internally, saltare already calls `malloc_trim(0)` once after `lifespan.startup` to return the heap fragmentation left over from your imports. You don't need to do anything for that.
 
 ## Building from source
 

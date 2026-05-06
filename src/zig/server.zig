@@ -40,7 +40,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.12.0";
+const SERVER_HEADER = "saltare/0.12.1";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -164,9 +164,11 @@ const Connection = struct {
     read_buf: ?*pool_mod.Buffer,
     read_total: usize,
 
-    // Filled in once the head is fully parsed.
+    // Filled in once the head is fully parsed. `parsed.headers` slices into
+    // the active read_buf's `headers` array; both are owned by the pool
+    // buffer and freed together by `releaseBuffer`. `parsed` MUST be
+    // cleared before releasing the buffer.
     parsed: ?http.Request,
-    headers_storage: [http.max_headers]http.Header,
     body_offset: usize,
     /// For Content-Length requests: the declared body size.
     /// For chunked requests: set after decoding finishes to the decoded length.
@@ -235,7 +237,6 @@ const Connection = struct {
             .read_buf = null,
             .read_total = 0,
             .parsed = null,
-            .headers_storage = undefined,
             .body_offset = 0,
             .body_len = 0,
             .chunk_state = http.ChunkState.init(),
@@ -629,7 +630,7 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
         conn.read_total += r.n;
 
         if (conn.parsed == null) {
-            if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
+            if (http.parse(data[0..conn.read_total], &conn.read_buf.?.headers)) |req| {
                 conn.parsed = req;
                 conn.body_offset = req.body_offset;
                 if (req.is_chunked) {
@@ -1170,6 +1171,17 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
         conn.body_offset + conn.body_len;
     const leftover = conn.read_total - consumed_end;
 
+    // Clear the parsed-request slots BEFORE potentially releasing the read
+    // buffer (which since v0.12.1 also owns the headers slice the parsed
+    // request points into). After this point conn.parsed.headers must not
+    // be accessed.
+    conn.parsed = null;
+    conn.body_offset = 0;
+    conn.body_len = 0;
+    conn.chunk_state = http.ChunkState.init();
+    conn.chunk_consumed = 0;
+    conn.chunk_decoded = 0;
+
     if (leftover > 0) {
         const data = &conn.read_buf.?.data;
         // Forward in-place copy: dest_start (0) < src_start (consumed_end),
@@ -1181,17 +1193,11 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
         conn.read_total = leftover;
     } else {
         // Idle: hand the buffer back so RSS isn't held hostage by an idle
-        // keep-alive connection.
+        // keep-alive connection. This also frees the headers array bundled
+        // into the same Buffer (v0.12.1).
         conn.releaseBuffer();
         conn.read_total = 0;
     }
-
-    conn.parsed = null;
-    conn.body_offset = 0;
-    conn.body_len = 0;
-    conn.chunk_state = http.ChunkState.init();
-    conn.chunk_consumed = 0;
-    conn.chunk_decoded = 0;
 
     if (conn.write_buf.len > 0) {
         conn.allocator.free(conn.write_buf);
@@ -1237,7 +1243,7 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
 
 fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
     const data = &conn.read_buf.?.data;
-    if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
+    if (http.parse(data[0..conn.read_total], &conn.read_buf.?.headers)) |req| {
         conn.parsed = req;
         conn.body_offset = req.body_offset;
         // Pipelined parse succeeded — same transition as in doReadHttp.

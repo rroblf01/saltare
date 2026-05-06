@@ -9,10 +9,16 @@
 // server.zig (the accept loop and HTTP parsing).
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const server = @import("server.zig");
 const bridge = @import("bridge.zig");
 const tls = @import("tls.zig");
+
+// glibc-only. We guard the call site with `builtin.os.tag == .linux` so the
+// extern reference is dead-code-eliminated on macOS / non-glibc targets and
+// the symbol is never resolved at link time on those platforms.
+extern fn malloc_trim(pad: usize) c_int;
 
 // Reuse bridge.zig's @cImport translation unit. Distinct @cImport blocks
 // produce distinct Zig types for the same C structs, which makes
@@ -31,7 +37,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.12.0");
+    return py.PyUnicode_FromString("0.12.1");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -115,6 +121,16 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         bridge.shutdown();
         py.PyErr_SetString(py.PyExc_RuntimeError, "saltare: lifespan startup failed");
         return null;
+    }
+
+    // Importing FastAPI/Starlette/Pydantic and running lifespan startup
+    // leaves glibc's malloc heap fragmented — many short-lived allocations
+    // mixed with long-lived objects pin pages that have only a few live
+    // bytes. malloc_trim(0) returns those mostly-empty pages to the OS.
+    // Typically saves 1–3 MiB at the cost of a few microseconds, called
+    // exactly once per `serve()` invocation. No-op on non-glibc systems.
+    if (comptime builtin.os.tag == .linux) {
+        _ = malloc_trim(0);
     }
 
     const tstate = py.PyEval_SaveThread();
