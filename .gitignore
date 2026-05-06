@@ -24,3 +24,6 @@ CMakeFiles/
 .vscode/
 .idea/
 .DS_Store
+
+# IA
+.claude/

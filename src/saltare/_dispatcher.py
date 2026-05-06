@@ -226,7 +226,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/1.2.0"
+_SERVER_HEADER = b"saltare/1.2.2"
 
 # ASGI scope sub-dicts. These never change between requests, so caching them
 # at module level avoids one dict allocation (~200 B) per dispatch. ASGI
@@ -299,33 +299,49 @@ def _build_server_frame(opcode: int, payload: bytes) -> bytes:
 
 
 class _WsState:
-    __slots__ = ("recv_queue", "outgoing", "accepted", "closed", "task")
+    __slots__ = (
+        "recv_queue", "outgoing", "outgoing_bytes", "accepted", "closed", "task",
+    )
 
     def __init__(self, app: Any, scope: dict[str, Any]) -> None:
         self.recv_queue: asyncio.Queue = asyncio.Queue()
         self.outgoing: list[bytes] = []
+        # Running total of bytes queued in `outgoing` since the last drain.
+        # Bounds the worst-case RAM cost of a slow client + fast app.
+        self.outgoing_bytes: int = 0
         self.accepted: bool = False
         self.closed: bool = False
 
         async def receive() -> dict[str, Any]:
             return await self.recv_queue.get()
 
+        def _queue(frame: bytes) -> bool:
+            # Returns False once the cap is exceeded so callers can stop
+            # producing. The connection is marked closed; the next pump
+            # tears it down.
+            if self.outgoing_bytes + len(frame) > _WS_OUTGOING_MAX_BYTES:
+                self.closed = True
+                return False
+            self.outgoing.append(frame)
+            self.outgoing_bytes += len(frame)
+            return True
+
         async def send(message: dict[str, Any]) -> None:
             mtype = message.get("type")
             if mtype == "websocket.accept":
                 self.accepted = True
             elif mtype == "websocket.send":
+                if self.closed:
+                    return
                 if message.get("text") is not None:
-                    self.outgoing.append(
-                        _build_server_frame(0x1, message["text"].encode("utf-8"))
-                    )
+                    _queue(_build_server_frame(0x1, message["text"].encode("utf-8")))
                 elif message.get("bytes") is not None:
-                    self.outgoing.append(_build_server_frame(0x2, message["bytes"]))
+                    _queue(_build_server_frame(0x2, message["bytes"]))
             elif mtype == "websocket.close":
                 code = int(message.get("code", 1000))
                 reason = message.get("reason", "") or ""
                 payload = code.to_bytes(2, "big") + reason.encode("utf-8")
-                self.outgoing.append(_build_server_frame(0x8, payload))
+                _queue(_build_server_frame(0x8, payload))
                 self.closed = True
 
         loop = _ensure_loop()
@@ -339,6 +355,7 @@ class _WsState:
             return b""
         out = b"".join(self.outgoing)
         self.outgoing.clear()
+        self.outgoing_bytes = 0
         return out
 
 
@@ -535,8 +552,27 @@ def _encode_chunk(body: bytes) -> bytes:
 # step (~200 B of GC churn) per request and reuses the `outgoing` list
 # (one less `list` object created per request). Capped to keep idle pool
 # memory bounded — beyond `_HTTP_POOL_MAX` the GC reclaims naturally.
+#
+# v1.2.2: bumped 32 → 128. With max_concurrent_connections defaulting to
+# 1024, bursts above 32 reused to fall back to fresh `_HttpState`
+# allocations. 128 covers realistic concurrency curves while idle pool
+# RAM stays bounded (~128 × 600 B = 75 KiB).
 _http_state_pool: list["_HttpState"] = []
-_HTTP_POOL_MAX = 32
+_HTTP_POOL_MAX = 128
+
+# Soft backpressure threshold. After an `await send()` chain has appended
+# more than this many bytes to `outgoing`, the next send yields back to the
+# event loop (one `await asyncio.sleep(0)`). The Zig main loop pumps the
+# loop and harvests bytes via `http_dispatch_drain`, capping per-task
+# accumulated outgoing memory at ~one threshold's worth. Apps streaming
+# many small chunks at once (server-sent events, log tails) used to pin
+# arbitrary RAM here; now they don't.
+_HTTP_SEND_YIELD_BYTES = 64 * 1024
+
+# Hard cap on per-WS connection outgoing buffer. A slow consumer with a
+# fast producer used to grow `outgoing` without bound. Above the cap we
+# mark the connection closed; the bridge tears it down on the next pump.
+_WS_OUTGOING_MAX_BYTES = 1024 * 1024
 
 
 def _acquire_http_state(
@@ -572,6 +608,10 @@ class _HttpState:
         # the typical request that does receive() once and is done.
         "_recv_future",
         "outgoing",
+        # Running byte total of `outgoing` since the last drain. Drives the
+        # `_HTTP_SEND_YIELD_BYTES` backpressure check in `_send` so a busy
+        # streaming app yields back to the loop instead of pinning RAM.
+        "_outgoing_bytes",
         "task",
         "status",
         "out_headers",
@@ -600,6 +640,7 @@ class _HttpState:
         self._recv_future: asyncio.Future | None = None
         # Wire bytes produced by the app, drained by the I/O loop.
         self.outgoing: list[bytes] = []
+        self._outgoing_bytes: int = 0
         # Filled in when http.response.start arrives.
         self.status: int = 500
         self.out_headers: list[tuple[bytes, bytes]] = []
@@ -669,13 +710,26 @@ class _HttpState:
                 self.headers_sent = True
             if chunk:
                 if self.chunked:
-                    self.outgoing.append(_encode_chunk(chunk))
+                    framed = _encode_chunk(chunk)
+                    self.outgoing.append(framed)
+                    self._outgoing_bytes += len(framed)
                 else:
                     self.outgoing.append(chunk)
+                    self._outgoing_bytes += len(chunk)
             if not more:
                 if self.chunked:
                     self.outgoing.append(_CHUNKED_TERMINATOR)
+                    self._outgoing_bytes += len(_CHUNKED_TERMINATOR)
                 self.body_done = True
+            # Backpressure: if a streaming app has accumulated more than
+            # `_HTTP_SEND_YIELD_BYTES` since the last drain, hand control
+            # back to the event loop. The Zig main loop's stalled-pump
+            # path harvests via `http_dispatch_drain`, which clears
+            # `_outgoing_bytes` and lets us keep producing without
+            # pinning unbounded RAM. Skipped on the final chunk so a
+            # one-shot response never pays the yield cost.
+            if more and self._outgoing_bytes >= _HTTP_SEND_YIELD_BYTES:
+                await asyncio.sleep(0)
         # Ignored message types (http.response.trailers etc.) silently drop.
 
     def reset(
@@ -699,6 +753,7 @@ class _HttpState:
         # Reuse the existing list — `clear()` is in-place; no new list
         # allocation. Marginal but cumulative across requests.
         self.outgoing.clear()
+        self._outgoing_bytes = 0
         self.status = 500
         self.out_headers = []
         self.headers_sent = False
@@ -772,6 +827,7 @@ class _HttpState:
             return b""
         out = b"".join(self.outgoing)
         self.outgoing.clear()
+        self._outgoing_bytes = 0
         return out
 
 

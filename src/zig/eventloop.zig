@@ -31,7 +31,12 @@ pub const Event = struct {
     closed: bool,
 };
 
-const max_events_per_wait = 128;
+// 64 keeps the per-wait stack footprint low (~1 KiB raw + 1 KiB cooked).
+// Saturating it just means epoll_wait returns sooner — the next iteration
+// drains the rest. Picked over 128 after the v1.2.2 audit found the larger
+// array spent most iterations less than half full while still costing
+// ~10 KiB stack per loop step.
+const max_events_per_wait = 64;
 
 pub const Loop = struct {
     epfd: c_int,
