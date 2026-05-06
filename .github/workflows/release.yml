@@ -20,6 +20,9 @@ on:
       - "scripts/**"
       - ".github/workflows/release.yml"
 
+env:
+  ZIG_VERSION: "0.16.0"
+
 jobs:
   build_wheels:
     name: ${{ matrix.os }} (${{ matrix.arch }})
@@ -33,10 +36,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pre-install Zig on the runner (with caching) and mount it into
+      # the cibuildwheel container. Avoids `ziglang.org` reachability
+      # problems from inside the manylinux image — those caused
+      # 4–10 min hangs in `before_all` previously.
+      - name: Cache Zig toolchain
+        id: zig-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/zig
+          key: zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-${{ matrix.arch }}
+
+      - name: Install Zig on runner
+        if: steps.zig-cache.outputs.cache-hit != 'true'
+        env:
+          ZIG_INSTALL_DIR: ${{ runner.temp }}/zig
+          ZIG_SKIP_SYMLINK: "1"
+        run: bash scripts/install-zig.sh
+
       - name: Build wheels
         uses: pypa/cibuildwheel@v2.22
         env:
           CIBW_ARCHS: ${{ matrix.arch }}
+          # Mount the pre-installed Zig read-only and prepend it to PATH
+          # inside the container. install-zig.sh's fast path then sees
+          # `zig` already on PATH at the right version and exits early
+          # — no in-container download needed.
+          CIBW_CONTAINER_ENGINE: 'docker; create_args: --volume ${{ runner.temp }}/zig:/host-zig:ro'
+          CIBW_ENVIRONMENT_LINUX: 'PATH=/host-zig:/usr/local/bin:$PATH ZIG_VERSION=${{ env.ZIG_VERSION }}'
 
       - uses: actions/upload-artifact@v4
         with:
