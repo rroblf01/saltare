@@ -81,6 +81,12 @@ def main(argv: list[str] | None = None) -> None:
         help="largest request body (in bytes) the server will accept",
     )
     parser.add_argument(
+        "--shutdown-timeout",
+        type=int,
+        default=30,
+        help="seconds to wait for in-flight requests after SIGTERM/SIGINT",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -102,4 +108,5 @@ def main(argv: list[str] | None = None) -> None:
         max_concurrent_connections=args.max_concurrent_connections,
         max_keepalive_requests=args.max_keepalive_requests,
         max_request_body=args.max_request_body,
+        shutdown_timeout=args.shutdown_timeout,
     )

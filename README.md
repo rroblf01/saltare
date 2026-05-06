@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: pre-alpha (v0.13.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, and **resource caps** are all in. v0.13 adds `max_request_body`, `max_concurrent_connections`, `max_keepalive_requests`, plus `Expect: 100-continue` support — the architectural ~28× per-connection RAM advantage over uvicorn now holds under adversarial load too. Production-readiness gaps remaining for v1.0: graceful shutdown, observability, multi-worker.
+> **Status: pre-alpha (v0.14.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, resource caps, and **graceful shutdown** are all in. v0.14 wires SIGTERM/SIGINT to a drain phase (`shutdown_timeout` configurable, default 30 s): in-flight requests finish, then `lifespan.shutdown` runs, then the process exits 0 — k8s rolling deploys land cleanly. App exceptions during dispatch are caught and turned into 500 responses without taking the worker down. Production-readiness gaps remaining for v1.0: observability, multi-worker.
 
 ---
 
@@ -48,28 +48,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.13.0:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.14.0:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.46 MiB |      43.54 MiB | 43.54 MiB |    1000 | 2305 |
-| uvicorn | 44.90 MiB |      44.94 MiB | 44.94 MiB |    1000 | 2898 |
+| saltare | 43.31 MiB |      43.39 MiB | 43.39 MiB |    1000 | 2321 |
+| uvicorn | 44.88 MiB |      44.92 MiB | 44.92 MiB |    1000 | 2899 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.64 MiB |      41.96 MiB | 41.97 MiB |    2000 | 3878 |
-| uvicorn | 44.99 MiB |      45.41 MiB | 45.41 MiB |    2000 | 4024 |
+| saltare | 41.71 MiB |      41.98 MiB | 42.00 MiB |    2000 | 3832 |
+| uvicorn | 44.82 MiB |      45.29 MiB | 45.29 MiB |    2000 | 4029 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 41.87 MiB |      42.06 MiB | 42.06 MiB |     500 | 2304      |
-| uvicorn | 44.81 MiB |      50.19 MiB | 50.19 MiB |     500 | 2918      |
+| saltare | 41.57 MiB |      41.70 MiB | 41.70 MiB |     500 | 2055      |
+| uvicorn | 44.85 MiB |      50.23 MiB | 50.23 MiB |     500 | 3365      |
 
 **Read this honestly:**
 
@@ -98,7 +98,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.12.0** — Streaming response bodies. Each HTTP request runs as a long-lived asyncio Task with its own `recv_queue` and `outgoing` list; the app's `send({type: "http.response.body", more_body: True/False})` calls flow chunk-by-chunk through the bridge into Zig's `write_buf` instead of being buffered into a single Python `bytes`. When the app does not declare a Content-Length, saltare adds `Transfer-Encoding: chunked` automatically. Concurrency uses a global "stalled list" of connections whose Task is parked on framework-internal awaits (e.g. FastAPI middleware chains): the main loop runs one global asyncio pump per iteration to advance every parked Task in lockstep, then drains each one — no per-connection multi-pumping, no level-triggered EPOLLOUT spin. Request bodies are still capped to the 16 KiB read buffer (request-side streaming lands in v0.12.x).
 - [x] **v0.12.1** — Per-connection RAM polish. The `[64]Header` array previously inlined into `Connection` (~2 KiB) is now bundled into the same `pool.zig` `Buffer` that holds the read data, so it's released atomically when the connection goes idle: idle keep-alive cost drops from ~2 KiB to ~390 B per connection, taking the per-conn advantage over uvicorn from ~5× to ~28×. A `malloc_trim(0)` call after `lifespan.startup` returns ~2 MiB of glibc heap fragmentation (left over from FastAPI/Pydantic imports) to the OS — the sequential-idle floor dropped from 45.56 MiB to 43.15 MiB. README gains a "Production deployment" section recommending `MALLOC_ARENA_MAX=2` for another 5–15 MiB.
 - [x] **v0.13.0** — Resource caps + `Expect: 100-continue`. New `Limits` struct (`max_request_body`, `max_concurrent_connections`, `max_keepalive_requests`) wired into `serve()` and the CLI. Body cap fires 413 on declared `Content-Length` overflow and on incremental chunked-decode growth. Connection cap accepts overflow sockets (to drain the listen backlog) and immediately closes them. Keepalive-requests cap forces `Connection: close` on the Nth response, recycling pymalloc arenas. `Expect: 100-continue` writes the interim response before reading the body, except when the declared body would exceed the cap (in which case the client gets a 413 directly). Caps add zero RAM cost in benign workloads; under adversarial load they convert the architectural advantage into a **hard guarantee**.
-- [ ] **v0.14.0** — Graceful shutdown with in-flight drain on SIGTERM + robust ASGI exception isolation.
+- [x] **v0.14.0** — Graceful shutdown + ASGI exception isolation. New `g_draining` atomic flag; the SIGTERM/SIGINT handler sets it (and a second signal promotes to immediate force-exit). Main loop, on first observing drain mode, removes the listen fd from epoll (stops accepting), stamps a deadline, and continues processing in-flight requests — exit happens when `g_active_conns` reaches zero or `shutdown_timeout` (default 30 s) elapses. Idle keep-alive connections drain naturally via `keep_alive_timeout`. After the loop exits, `lifespan.shutdown` runs as before, then the process exits 0. App exceptions during dispatch are caught at the bridge: pre-headers raises produce a synthesized 500, mid-stream raises close the connection — server keeps serving subsequent requests. Tests now 44/44 (5 new in `test_shutdown.py`, 3 of which exercise real SIGTERM via `subprocess`).
 - [ ] **v0.15.0** — Metrics endpoint + access log opt-in + proxy headers + Unix domain sockets.
 - [ ] **v0.16.0** — RAM polish: `malloc_trim` after lifespan startup, adaptive read buffer, `MADV_DONTNEED` on idle pool buffers.
 - [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`) + production deployment guide.
@@ -211,7 +211,9 @@ LimitNOFILE=65535
 ExecStart=/usr/bin/saltare main:app --host 0.0.0.0 --port 8000
 ```
 
-For Kubernetes, set the env var on the pod spec and configure the readiness probe to `GET /` (or any cheap endpoint your app exposes). saltare honours `SIGTERM` for a graceful shutdown after v0.14.
+For Kubernetes, set the env var on the pod spec and configure the readiness probe to `GET /` (or any cheap endpoint your app exposes). saltare honours `SIGTERM` with a graceful drain (default 30 s, configurable via `--shutdown-timeout`): in-flight requests get to finish, `lifespan.shutdown` runs, then the process exits 0. Set `terminationGracePeriodSeconds` on the pod to whatever you set `--shutdown-timeout` to (or higher).
+
+App exceptions during request dispatch are caught: a raise *before* `http.response.start` becomes a 500 response, a raise *after* truncates the response and closes the connection. Either way the worker keeps serving subsequent requests — no crash, no resource leak.
 
 Internally, saltare already calls `malloc_trim(0)` once after `lifespan.startup` to return the heap fragmentation left over from your imports. You don't need to do anything for that.
 

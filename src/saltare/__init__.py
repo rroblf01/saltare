@@ -24,6 +24,7 @@ def run(
     max_concurrent_connections: int = 1024,
     max_keepalive_requests: int = 1000,
     max_request_body: int = 1024 * 1024,
+    shutdown_timeout: int = 30,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -60,6 +61,13 @@ def run(
     Apps using the `Expect: 100-continue` request header are honoured
     automatically: the interim response is written as soon as headers
     parse and the body-size cap check passes.
+
+    On `SIGTERM` / `SIGINT`, saltare enters a graceful drain: it stops
+    accepting new connections, lets in-flight requests finish, and only
+    then runs `lifespan.shutdown` and exits. `shutdown_timeout` (seconds)
+    bounds how long to wait — past that, surviving connections are cut
+    and the process exits regardless. A second signal during drain
+    promotes to immediate force-exit.
     """
     _core.serve(
         app,
@@ -74,4 +82,5 @@ def run(
         int(max_concurrent_connections),
         int(max_keepalive_requests),
         int(max_request_body),
+        int(shutdown_timeout),
     )

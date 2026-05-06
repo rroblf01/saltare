@@ -40,7 +40,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.13.0";
+const SERVER_HEADER = "saltare/0.14.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -59,6 +59,11 @@ pub const Timeouts = struct {
     /// the response (won't read its socket) cannot pin a write buffer
     /// indefinitely.
     write_secs: u32 = 30,
+    /// Maximum seconds the I/O loop will keep running after SIGTERM/SIGINT
+    /// before forcing exit. Used for k8s/systemd rolling deploys: in-flight
+    /// requests get to finish; after this many seconds, the process exits
+    /// regardless. Idle keep-alive connections drain via `keep_alive_secs`.
+    shutdown_secs: u32 = 30,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -86,6 +91,11 @@ pub const Limits = struct {
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
 var g_should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Set to true by the signal handler on SIGTERM/SIGINT. Triggers the main
+/// loop's graceful-drain path: stop accepting new connections, wait for
+/// in-flight requests to finish, exit cleanly. A second signal arriving
+/// while already draining promotes to immediate force-exit.
+var g_draining: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 /// Set by `run()`. Connections look these up at every state transition to
 /// arm the appropriate timeout.
@@ -141,10 +151,18 @@ fn isListenerEvent(data: ?*anyopaque) bool {
 }
 
 fn onSignal(_: c_int) callconv(.c) void {
-    g_should_stop.store(true, .seq_cst);
+    // First signal: enter graceful-drain mode (stop accepting, let
+    // in-flight finish). Second signal (or the shutdown deadline elapsing):
+    // force immediate exit.
+    if (g_draining.swap(true, .seq_cst)) {
+        g_should_stop.store(true, .seq_cst);
+    }
+    // Wake the I/O loop. SHUT_RD on the listener returns EAGAIN-ish on the
+    // next accept and triggers an EPOLLIN/EPOLLERR event so `loop.wait`
+    // returns; main loop then sees `g_draining` and acts.
     const fd = g_listen_fd.load(.seq_cst);
     if (fd >= 0) {
-        _ = c.shutdown(fd, c.SHUT_RDWR);
+        _ = c.shutdown(fd, c.SHUT_RD);
     }
 }
 
@@ -404,7 +422,38 @@ pub fn run(
 
     const tick_ctx = TickCtx{ .loop = &loop };
 
+    // Drain bookkeeping: stamp the moment we first see g_draining so the
+    // main loop can compare against shutdown_secs without re-reading the
+    // wall clock from the signal handler. -1 means "not yet draining".
+    var drain_started_sec: i64 = -1;
+
     while (!g_should_stop.load(.seq_cst)) {
+        if (g_draining.load(.seq_cst) and drain_started_sec < 0) {
+            // First time we observe drain mode: stop accepting (remove
+            // the listener from epoll so we don't even see EPOLLIN for
+            // backlog connections), and stamp the deadline.
+            drain_started_sec = @intCast(wheel.nowSec());
+            loop.remove(listen_fd);
+            std.log.info("saltare draining: {d}s timeout, {d} active conns", .{
+                timeouts.shutdown_secs,
+                g_active_conns.load(.seq_cst),
+            });
+        }
+
+        if (drain_started_sec >= 0) {
+            // Drain exit conditions:
+            //   - all connections gone → clean shutdown
+            //   - shutdown_secs elapsed → force exit (in-flight clipped)
+            if (g_active_conns.load(.seq_cst) == 0) break;
+            const elapsed = @as(i64, @intCast(wheel.nowSec())) - drain_started_sec;
+            if (elapsed >= @as(i64, @intCast(timeouts.shutdown_secs))) {
+                std.log.warn("saltare drain deadline reached, {d} conns still in flight", .{
+                    g_active_conns.load(.seq_cst),
+                });
+                break;
+            }
+        }
+
         // When connections are parked on framework setup chains we need to
         // drive the asyncio loop forward without sleeping for the full
         // 100 ms poll budget — otherwise a stalled batch of FastAPI
@@ -414,7 +463,12 @@ pub fn run(
         for (events) |ev| {
             if (g_should_stop.load(.seq_cst)) break;
             if (isListenerEvent(ev.data)) {
-                acceptAll(&loop, listen_fd, allocator, &rb_pool, &wheel);
+                // Skip listener events while draining — we already removed
+                // it from epoll above; this is just paranoia for any final
+                // event already in flight.
+                if (drain_started_sec < 0) {
+                    acceptAll(&loop, listen_fd, allocator, &rb_pool, &wheel);
+                }
             } else if (ev.data) |raw| {
                 const conn: *Connection = @ptrCast(@alignCast(raw));
                 handleConnEvent(&loop, conn, ev);
@@ -434,6 +488,7 @@ pub fn run(
     }
 
     g_stalled_head = null;
+    g_draining.store(false, .seq_cst);
     _ = c.close(listen_fd);
 }
 

@@ -14,4 +14,5 @@ def serve(
     max_concurrent_connections: int = ...,
     max_keepalive_requests: int = ...,
     max_request_body: int = ...,
+    shutdown_timeout: int = ...,
 ) -> None: ...
