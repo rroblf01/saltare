@@ -26,7 +26,7 @@ DOCKER_BUILD_ARGS = \
     --build-arg MANYLINUX_TAG=$(MANYLINUX_TAG) \
     --build-arg ZIG_VERSION=$(ZIG_VERSION)
 
-.PHONY: help build test bench build-local install-zig clean
+.PHONY: help build test bench benchmark build-local install-zig clean
 
 help:
 	@echo "Targets (no Zig on host):"
@@ -65,6 +65,9 @@ bench:
 		$(DOCKER_BUILD_ARGS) \
 		.
 	docker run --rm --platform=$(DOCKER_PLATFORM) saltare-bench
+
+# Alias: typing `make benchmark` is more discoverable than `make bench`.
+benchmark: bench
 
 build-local:
 	pip install -e ".[dev]"

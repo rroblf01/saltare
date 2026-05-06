@@ -39,6 +39,30 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--header-timeout",
+        type=int,
+        default=5,
+        help="seconds from accept to parsed headers (slowloris guard)",
+    )
+    parser.add_argument(
+        "--keep-alive-timeout",
+        type=int,
+        default=5,
+        help="seconds between requests on a kept-alive connection",
+    )
+    parser.add_argument(
+        "--body-timeout",
+        type=int,
+        default=30,
+        help="seconds from parsed headers to fully received body",
+    )
+    parser.add_argument(
+        "--write-timeout",
+        type=int,
+        default=30,
+        help="maximum seconds in the writing state",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -49,4 +73,12 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("missing app target (e.g. 'main:app')")
 
     app = _load_app(args.app)
-    run(app, host=args.host, port=args.port)
+    run(
+        app,
+        host=args.host,
+        port=args.port,
+        header_timeout=args.header_timeout,
+        keep_alive_timeout=args.keep_alive_timeout,
+        body_timeout=args.body_timeout,
+        write_timeout=args.write_timeout,
+    )

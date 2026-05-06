@@ -31,7 +31,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.10.0");
+    return py.PyUnicode_FromString("0.11.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -42,15 +42,26 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     // passes 5 positional args; missing TLS files come through as None.
     var ssl_cert_z: [*c]const u8 = null;
     var ssl_key_z: [*c]const u8 = null;
+    // Timeouts (seconds). Optional in PyArg, but the Python wrapper always
+    // forwards explicit values; defaults here only matter for direct
+    // _core.serve callers (tests, debugging).
+    var header_to: c_uint = 5;
+    var keep_alive_to: c_uint = 5;
+    var body_to: c_uint = 30;
+    var write_to: c_uint = 30;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz",
+        "Osizz|IIII",
         &app,
         &host_z,
         &port,
         &ssl_cert_z,
         &ssl_key_z,
+        &header_to,
+        &keep_alive_to,
+        &body_to,
+        &write_to,
     ) == 0) {
         return null;
     }
@@ -59,6 +70,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         py.PyErr_SetString(py.PyExc_ValueError, "port must be in [0, 65535]");
         return null;
     }
+
+    const timeouts = server.Timeouts{
+        .header_secs = @intCast(header_to),
+        .keep_alive_secs = @intCast(keep_alive_to),
+        .body_secs = @intCast(body_to),
+        .write_secs = @intCast(write_to),
+    };
 
     const both_set = ssl_cert_z != null and ssl_key_z != null;
     const either_set = ssl_cert_z != null or ssl_key_z != null;
@@ -100,7 +118,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     }
 
     const tstate = py.PyEval_SaveThread();
-    server.run(host, @intCast(port), tls_ctx) catch |err| {
+    server.run(host, @intCast(port), tls_ctx, timeouts) catch |err| {
         py.PyEval_RestoreThread(tstate);
         bridge.lifespanShutdown();
         bridge.shutdown();

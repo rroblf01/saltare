@@ -1,14 +1,15 @@
-// Saltare network core (v0.6).
+// Saltare network core (v0.11).
 //
 // Single-threaded non-blocking event loop on top of epoll, with HTTP/1.1
-// keep-alive and a shared pool for read buffers. RSS scales with the number
-// of *in-flight* requests rather than the number of *open keep-alive
-// connections*: idle connections release their 16 KiB buffer back to the
-// pool and reclaim one on the next read event.
+// keep-alive, a shared pool for read buffers, and per-connection idle
+// timeouts driven by a hashed timer wheel. RSS scales with the number of
+// *in-flight* requests rather than the number of *open keep-alive
+// connections*; slow / stuck clients cannot pin Connection structs in
+// memory because the timer wheel reaps them.
 //
 // Out of scope (planned for later):
-//   - lifespan, chunked Transfer-Encoding, streaming bodies (v0.5.x)
-//   - TLS (v0.7), WebSockets (v0.8), multi-worker (v1.0)
+//   - write-buffer size cap / streaming response bodies (v0.12+)
+//   - multi-worker (v1.0)
 //   - kqueue backend for macOS — see eventloop.zig's compileError
 
 const std = @import("std");
@@ -18,6 +19,7 @@ const eventloop = @import("eventloop.zig");
 const pool_mod = @import("pool.zig");
 const tls = @import("tls.zig");
 const ws = @import("ws.zig");
+const timer = @import("timer.zig");
 
 const c = @cImport({
     @cInclude("sys/socket.h");
@@ -38,11 +40,34 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.10.0";
+const SERVER_HEADER = "saltare/0.11.0";
+
+/// Per-connection deadlines, in seconds. Set by `run()` for the duration of
+/// one `serve()` call. Defaults match what the Python `saltare.run()`
+/// wrapper passes when the user provides nothing.
+pub const Timeouts = struct {
+    /// From accept (or TLS handshake start) to "headers fully parsed".
+    /// Bounds the slowloris window.
+    header_secs: u32 = 5,
+    /// Between requests on a keep-alive connection. After this many seconds
+    /// of inactivity following a response, the connection is closed.
+    keep_alive_secs: u32 = 5,
+    /// From "headers parsed" to "body fully received". Bounds slow-body
+    /// attacks (drip-feeding chunked or Content-Length bodies).
+    body_secs: u32 = 30,
+    /// Maximum time spent in the .writing state. A client that won't drain
+    /// the response (won't read its socket) cannot pin a write buffer
+    /// indefinitely.
+    write_secs: u32 = 30,
+};
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
 var g_should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+/// Set by `run()`. Connections look these up at every state transition to
+/// arm the appropriate timeout.
+var g_timeouts: Timeouts = .{};
 
 /// Set by `run` when TLS is enabled. Lives only for the duration of one
 /// `serve()` call. Each accepted connection wraps its fd with a fresh SSL
@@ -147,10 +172,18 @@ const Connection = struct {
     /// connection. 0 while protocol == .http.
     ws_handle: c_long,
 
+    /// Embedded directly so arming / cancelling is allocation-free. The
+    /// wheel manages an intrusive doubly-linked list through this field.
+    timer_node: timer.Node,
+    /// Pointer to the run()-local wheel, so destroy() can cancel the timer
+    /// without needing the wheel passed through every call site.
+    wheel: *timer.Wheel,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
         fd: c_int,
+        wheel: *timer.Wheel,
     ) !*Connection {
         const conn = try allocator.create(Connection);
         conn.* = .{
@@ -173,6 +206,8 @@ const Connection = struct {
             .ssl = null,
             .protocol = .http,
             .ws_handle = 0,
+            .timer_node = .{ .next = null, .prev = null, .bucket = 0, .armed = false },
+            .wheel = wheel,
         };
         return conn;
     }
@@ -182,11 +217,20 @@ const Connection = struct {
         // `wsTeardown` BEFORE calling destroy. We don't acquire the GIL
         // here — destroy is called from many paths (including non-WS)
         // and forcing a GIL acquisition was a footgun in tests.
+        self.wheel.cancel(&self.timer_node);
         if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b);
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
         _ = c.close(self.fd);
         self.allocator.destroy(self);
+    }
+
+    inline fn armTimer(self: *Connection, seconds: u32) void {
+        self.wheel.arm(&self.timer_node, seconds);
+    }
+
+    inline fn cancelTimer(self: *Connection) void {
+        self.wheel.cancel(&self.timer_node);
     }
 
     fn ensureBuffer(self: *Connection) !void {
@@ -203,9 +247,11 @@ const Connection = struct {
     }
 };
 
-pub fn run(host: []const u8, port: u16, tls_ctx: ?*tls.Ctx) !void {
+pub fn run(host: []const u8, port: u16, tls_ctx: ?*tls.Ctx, timeouts: Timeouts) !void {
     g_tls_ctx = tls_ctx;
     defer g_tls_ctx = null;
+    g_timeouts = timeouts;
+    defer g_timeouts = .{};
 
     const addr = try parseIpv4(host, port);
 
@@ -245,22 +291,45 @@ pub fn run(host: []const u8, port: u16, tls_ctx: ?*tls.Ctx) !void {
     var rb_pool = pool_mod.Pool.init(allocator);
     defer rb_pool.deinit();
 
+    var wheel = try timer.Wheel.init();
+
     std.log.info("saltare listening on {s}:{d}", .{ host, port });
+
+    const tick_ctx = TickCtx{ .loop = &loop };
 
     while (!g_should_stop.load(.seq_cst)) {
         const events = loop.wait(100); // 100 ms poll → bounds shutdown latency
         for (events) |ev| {
             if (g_should_stop.load(.seq_cst)) break;
             if (isListenerEvent(ev.data)) {
-                acceptAll(&loop, listen_fd, allocator, &rb_pool);
+                acceptAll(&loop, listen_fd, allocator, &rb_pool, &wheel);
             } else if (ev.data) |raw| {
                 const conn: *Connection = @ptrCast(@alignCast(raw));
                 handleConnEvent(&loop, conn, ev);
             }
         }
+        // Sweep expired connections. With a 100 ms epoll poll, the worst-
+        // case lag past a 1 s deadline is one bucket; granularity of all
+        // four configurable timeouts is therefore ±1 s.
+        wheel.tick(wheel.nowSec(), tick_ctx, fireExpired);
     }
 
     _ = c.close(listen_fd);
+}
+
+const TickCtx = struct { loop: *eventloop.Loop };
+
+fn fireExpired(ctx: TickCtx, node: *timer.Node) void {
+    const conn: *Connection = @fieldParentPtr("timer_node", node);
+    // WS connections never arm the timer (they have their own ping/pong
+    // keepalive semantics), so anything firing here is HTTP. Belt-and-
+    // suspenders: still tear down WS correctly if we ever do arm one.
+    if (conn.protocol == .websocket) {
+        wsTeardown(ctx.loop, conn);
+    } else {
+        ctx.loop.remove(conn.fd);
+        conn.destroy();
+    }
 }
 
 fn acceptAll(
@@ -268,12 +337,13 @@ fn acceptAll(
     listen_fd: c_int,
     allocator: std.mem.Allocator,
     p: *pool_mod.Pool,
+    wheel: *timer.Wheel,
 ) void {
     while (true) {
         const client = accept4(listen_fd, null, null, c.SOCK_NONBLOCK | c.SOCK_CLOEXEC);
         if (client < 0) return; // EAGAIN: drained the backlog
 
-        const conn = Connection.create(allocator, p, client) catch {
+        const conn = Connection.create(allocator, p, client, wheel) catch {
             _ = c.close(client);
             continue;
         };
@@ -295,6 +365,10 @@ fn acceptAll(
             conn.destroy();
             continue;
         };
+
+        // Slowloris guard: bound the time spent reaching "headers parsed"
+        // (or, for TLS, finishing the handshake before headers).
+        conn.armTimer(g_timeouts.header_secs);
     }
 }
 
@@ -471,6 +545,10 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                         return;
                     }
                 }
+                // Headers parsed: switch from header_timeout to body_timeout.
+                // If the body is already complete in this iteration, dispatch
+                // will arm write_timeout and overwrite this — harmless.
+                conn.armTimer(g_timeouts.body_secs);
             } else |err| switch (err) {
                 error.Incomplete => continue,
                 else => {
@@ -535,6 +613,7 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_pos = 0;
     conn.state = .writing;
     conn.keep_alive = keep_alive;
+    conn.armTimer(g_timeouts.write_secs);
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
         loop.remove(conn.fd);
@@ -617,6 +696,10 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // If the app already finished (called close right after accept), close
     // after we drain the frames; otherwise stay alive.
     conn.keep_alive = !opened.done;
+    // Once upgraded to WebSocket, HTTP's deadline-driven model no longer
+    // applies; long-lived idle WS connections are expected. Per-WS keep-
+    // alive should use ping/pong (TODO post-v0.11).
+    conn.cancelTimer();
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
         loop.remove(conn.fd);
@@ -949,6 +1032,9 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_pos = 0;
     conn.state = .reading;
     conn.keep_alive = false;
+    // Idle keep-alive deadline. If pipelined bytes are present we'll re-arm
+    // to header_timeout / body_timeout below as soon as they're observed.
+    conn.armTimer(g_timeouts.keep_alive_secs);
 
     loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
         loop.remove(conn.fd);
@@ -957,6 +1043,11 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
     };
 
     if (leftover > 0) {
+        // We already have data for the next request — restart the
+        // header-phase clock instead of leaving the keep-alive deadline
+        // running, which would unfairly count this request's parsing
+        // window against the previous one's idle window.
+        conn.armTimer(g_timeouts.header_secs);
         tryParsePipelined(loop, conn);
         return;
     }
@@ -976,6 +1067,8 @@ fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
     if (http.parse(data[0..conn.read_total], &conn.headers_storage)) |req| {
         conn.parsed = req;
         conn.body_offset = req.body_offset;
+        // Pipelined parse succeeded — same transition as in doReadHttp.
+        conn.armTimer(g_timeouts.body_secs);
         if (req.is_chunked) {
             conn.chunk_state = http.ChunkState.init();
             conn.chunk_consumed = 0;
@@ -1046,6 +1139,7 @@ fn sendStatus(loop: *eventloop.Loop, conn: *Connection, code: u16, reason: []con
     conn.state = .writing;
     // Errors always close — parser/state may be stale, can't safely keep-alive.
     conn.keep_alive = false;
+    conn.armTimer(g_timeouts.write_secs);
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
         loop.remove(conn.fd);
