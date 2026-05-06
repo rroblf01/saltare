@@ -37,7 +37,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.17.0");
+    return py.PyUnicode_FromString("0.18.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -62,10 +62,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var uds_path_z: [*c]const u8 = null;
     var metrics_path_z: [*c]const u8 = null;
     var access_log_flag: c_int = 0;
+    var ws_keepalive_to: c_uint = 20;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzzi",
+        "Osizz|IIIIIIKIzziI",
         &app,
         &host_z,
         &port,
@@ -82,6 +83,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &uds_path_z,
         &metrics_path_z,
         &access_log_flag,
+        &ws_keepalive_to,
     ) == 0) {
         return null;
     }
@@ -97,6 +99,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .body_secs = @intCast(body_to),
         .write_secs = @intCast(write_to),
         .shutdown_secs = @intCast(shutdown_to),
+        .ws_keepalive_secs = @intCast(ws_keepalive_to),
     };
     const limits = server.Limits{
         .max_request_body = @intCast(max_body),

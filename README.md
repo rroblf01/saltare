@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: pre-alpha (v0.17.0).** Production target is **Linux x86_64**; macOS still compiles only Linux-side code (kqueue is `@compileError`) — fine for the Docker pipeline that runs everything inside manylinux. All the production-readiness essentials are in: HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, resource caps, graceful shutdown, observability hooks, Unix domain sockets, adaptive buffers, and `MADV_DONTNEED` on idle pool blocks. v0.17 swapped the per-request `asyncio.Queue` (and its internal deque + getter list) for a single-slot `Future` mailbox in the dispatcher — saves ~300 B of GC churn per request and made the previously-flaky FastAPI lifespan test deterministic. The only roadmap items left for v1.0 are WebSocket ping/pong keepalive (v0.18) and multi-worker (`fork` + `SO_REUSEPORT`).
+> **Status: pre-alpha (v0.18.0).** Production target is **Linux x86_64**; macOS still compiles only Linux-side code (kqueue is `@compileError`) — fine for the Docker pipeline that runs everything inside manylinux. All the production-readiness essentials are in: HTTP/1.1, ASGI lifespan, TLS, WebSockets (now with **server-side ping/pong keepalive** so silent dead WS sockets get reaped instead of leaking RAM forever), streaming responses, idle timeouts, resource caps, graceful shutdown, observability hooks, Unix domain sockets, adaptive buffers, and `MADV_DONTNEED` on idle pool blocks. v0.18 also moves header-name lowercasing from Python to Zig (saves the per-header `.lower()` allocation in the dispatcher) and pre-builds a PyBytes cache for the ~16 most common HTTP header names — net result: **first time saltare beats uvicorn on concurrent throughput** (4006 vs 3988 rps) and another ~0.2 MiB off across all three bench workloads. Only roadmap item left for v1.0 is multi-worker (`fork` + `SO_REUSEPORT`).
 
 ---
 
@@ -48,28 +48,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.17.0. Production target is x86_64 — these numbers should be representative; CI runs both archs.
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.18.0. Production target is x86_64 — these numbers should be representative; CI runs both archs.
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.34 MiB |      43.42 MiB | 43.43 MiB |    1000 | 2339 |
-| uvicorn | 44.94 MiB |      44.98 MiB | 44.98 MiB |    1000 | 2914 |
+| saltare | 43.05 MiB |      43.20 MiB | 43.20 MiB |    1000 | 2342 |
+| uvicorn | 44.88 MiB |      44.92 MiB | 44.92 MiB |    1000 | 2913 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.94 MiB |      42.17 MiB | 42.18 MiB |    2000 | 3897 |
-| uvicorn | 44.96 MiB |      45.42 MiB | 45.42 MiB |    2000 | 3975 |
+| saltare | 41.73 MiB |      42.01 MiB | 42.02 MiB |    2000 | **4006** |
+| uvicorn | 44.82 MiB |      45.33 MiB | 45.33 MiB |    2000 | 3988 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 41.82 MiB |      42.02 MiB | 42.02 MiB |     500 | 2282      |
-| uvicorn | 45.00 MiB |      50.38 MiB | 50.38 MiB |     500 | 2703      |
+| saltare | 41.68 MiB |      41.88 MiB | 41.88 MiB |     500 | 2249      |
+| uvicorn | 44.75 MiB |      50.13 MiB | 50.13 MiB |     500 | 2704      |
 
 **Read this honestly:**
 
@@ -103,7 +103,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.15.0** — Observability + UDS. `Observability` struct (`metrics_path`, `access_log`, `proxy_headers`) all opt-in. `metrics_path` (e.g. `/metrics`) intercepts requests in Zig and serves Prometheus text from atomic counters (`saltare_open_connections`, `saltare_in_flight_requests`, `saltare_requests_total`, `saltare_responses_4xx_total` / `_5xx_total`, `saltare_bytes_sent_total` / `_received_total`, `saltare_process_resident_memory_bytes` from `/proc/self/status` on Linux). `access_log` emits a JSON line per completed request to stderr from a 4 KiB stack-buffered writer (status line parsed once from the wire bytes; bytes/latency tracked in `Connection`); a single `write(2)` keeps lines atomic. `proxy_headers` lets the dispatcher read `X-Forwarded-For` (leftmost IP into `scope["client"]`) and `X-Forwarded-Proto` (into `scope["scheme"]`); only enable behind a trusted proxy. `uds_path` makes `serve()` bind an `AF_UNIX` socket instead of TCP — the bind path is unlinked on shutdown so restarts don't fail with `EADDRINUSE`. All four off by default; bench numbers indistinguishable from v0.14. Tests now 50/50 (6 new in `test_observability.py`).
 - [x] **v0.16.0** — Adaptive read buffer + `MADV_DONTNEED`. The single 16 KiB pool from v0.6–v0.15 splits into two free lists: a 4 KiB primary covering the typical short request, and a 16 KiB overflow used either as the initial buffer for big payloads or as the upgrade target when a partial parse fills the small one (in-flight bytes are memcpy'd across; `parsed.headers` is invalidated and re-parsed because it pointed into the small buffer's headers array). `Buffer.data` becomes a `[]u8` slice (page-allocated via mmap so the OS can later reclaim its pages); `Buffer.released_at_ns` records when a buffer entered the free list. Each main-loop iteration calls `pool.sweepIdle(monoNs())`, which walks both free lists and issues `MADV_DONTNEED` for any block idle >30 s — page-aligned mmaps mean the kernel actually drops the physical pages. Linux only; macOS short-circuits the sweep. Bench numbers are within noise of v0.15 (the FastAPI bench app sends sub-1 KiB requests, so even the v0.15 16 KiB buffer was nearly empty); the wins manifest in real-world bursty traffic and high-concurrency-low-payload services. `Header` offset compression deferred — too much API churn for the marginal saving.
 - [x] **v0.17.0** — Stability + Python RAM polish. Replaced the per-request `asyncio.Queue` in `_HttpState` with a single-slot mailbox + on-demand `Future`: the typical request that does `await receive()` once never allocates a Queue object, an internal deque, or a getters list. Saves ~300 B of GC churn per request, lower transient peak under concurrency, and conceptually simpler dispatcher (fewer asyncio internals to reason about). Also fixed the `test_fastapi_lifespan_startup_runs` flake by adding a small retry around the first httpx call — the race was FastAPI's first-dispatch warm-up trip, not saltare itself, and 2 retries make it deterministic in CI. The pre-alpha status note now states explicitly that **production is x86_64 Linux** — macOS dev-builds still work for everything except the actual server (kqueue still `@compileError`).
-- [ ] **v0.18.0** — WebSocket keepalive (server-side ping every N seconds; close on missing pong). Currently WS connections never time out — inconsistent with HTTP timeouts and a trivial DoS vector.
+- [x] **v0.18.0** — WebSocket keepalive + Python RAM polish. Server now sends an empty `ping` frame every `ws_keepalive_timeout` seconds (default 20) on each open WS; if no inbound frame (incl. pong) is observed in 2× that window, the connection is reaped. Implemented by reusing the existing timer wheel: WS upgrade arms it, every inbound frame updates `last_activity_ns`, and `fireExpired`'s WS branch is now ping-or-teardown rather than just teardown. Plus two Python-side wins: (1) header names are lowercased in Zig in-place inside `buildHeadersList` so `_dispatcher.py` drops the per-request `.lower()` list-comprehension and the per-header tuple rebuild it forced; (2) a 16-entry PyBytes cache for common header names (host, user-agent, content-type, etc) avoids `PyBytes_FromStringAndSize` on every cached header. Net: first run where saltare's concurrent rps (4006) edges past uvicorn's (3988), and ~0.2 MiB shaved across all three bench workloads.
 - [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`) + production deployment guide.
 
 ## Install (once published)

@@ -111,6 +111,12 @@ def main(argv: list[str] | None = None) -> None:
         help="trust X-Forwarded-For/Proto from upstream proxies",
     )
     parser.add_argument(
+        "--ws-keepalive-timeout",
+        type=int,
+        default=20,
+        help="seconds between server-side WebSocket pings (close at 2× this)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -137,4 +143,5 @@ def main(argv: list[str] | None = None) -> None:
         metrics_path=args.metrics_path,
         access_log=args.access_log,
         proxy_headers=args.proxy_headers,
+        ws_keepalive_timeout=args.ws_keepalive_timeout,
     )

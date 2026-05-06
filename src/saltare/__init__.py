@@ -29,6 +29,7 @@ def run(
     metrics_path: str | None = None,
     access_log: bool = False,
     proxy_headers: bool = False,
+    ws_keepalive_timeout: int = 20,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -114,4 +115,5 @@ def run(
         uds_path,
         metrics_path,
         int(bool(access_log)),
+        int(ws_keepalive_timeout),
     )

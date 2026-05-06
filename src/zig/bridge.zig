@@ -42,6 +42,33 @@ threadlocal var g_server_port: c_int = 0;
 /// "http" or "https" — built once at init so dispatch doesn't reallocate.
 threadlocal var g_scheme: ?*py.PyObject = null;
 
+/// PyBytes cache for HTTP header names that show up on essentially every
+/// request. Each PyBytes is built once at `init()`, IncRef'd into the
+/// per-request headers list, and freed at `shutdown()`. Saves a
+/// `PyBytes_FromStringAndSize` allocation per cached header per request.
+/// Names must be lowercase — incoming names are lowercased in Zig before
+/// the lookup so the cache is hit-or-miss without case-folding.
+const COMMON_HEADER_NAMES = [_][]const u8{
+    "host",
+    "user-agent",
+    "accept",
+    "accept-encoding",
+    "accept-language",
+    "content-type",
+    "content-length",
+    "connection",
+    "cookie",
+    "referer",
+    "origin",
+    "cache-control",
+    "transfer-encoding",
+    "expect",
+    "x-forwarded-for",
+    "x-forwarded-proto",
+};
+threadlocal var g_common_header_cache: [COMMON_HEADER_NAMES.len]?*py.PyObject =
+    .{null} ** COMMON_HEADER_NAMES.len;
+
 /// Caller (module.zig) must hold the GIL.
 /// Acquires the references we need to dispatch requests.
 pub fn init(
@@ -85,6 +112,19 @@ pub fn init(
     if (g_scheme == null) return false;
 
     g_server_port = server_port;
+
+    // Pre-build PyBytes for common header names. Hot path for every
+    // request — saves ~10 PyBytes allocations per request when most of
+    // the headers are well-known names.
+    for (COMMON_HEADER_NAMES, 0..) |name, idx| {
+        const obj = py.PyBytes_FromStringAndSize(
+            @as([*c]const u8, @ptrCast(name.ptr)),
+            @as(py.Py_ssize_t, @intCast(name.len)),
+        );
+        if (obj == null) return false;
+        g_common_header_cache[idx] = obj;
+    }
+
     return true;
 }
 
@@ -141,6 +181,12 @@ pub fn shutdown() void {
     if (g_scheme) |s| {
         py.Py_DecRef(s);
         g_scheme = null;
+    }
+    for (&g_common_header_cache) |*slot| {
+        if (slot.*) |obj| {
+            py.Py_DecRef(obj);
+            slot.* = null;
+        }
     }
 }
 
@@ -476,10 +522,36 @@ fn copyBytes(obj: *py.PyObject, allocator: std.mem.Allocator) ?[]u8 {
     return buf;
 }
 
+/// Look up a (lowercased) header name in the common-name cache. On hit,
+/// returns an IncRef'd reference the caller can pass to PyTuple_SetItem
+/// (which steals it). On miss, returns null and the caller falls back
+/// to allocating a fresh PyBytes. Linear scan over ~16 entries — well
+/// below the cost of allocating a PyBytes object.
+fn lookupCachedHeaderName(name: []const u8) ?*py.PyObject {
+    for (COMMON_HEADER_NAMES, 0..) |candidate, idx| {
+        if (std.mem.eql(u8, name, candidate)) {
+            const cached = g_common_header_cache[idx] orelse return null;
+            py.Py_IncRef(cached);
+            return cached;
+        }
+    }
+    return null;
+}
+
 fn buildHeadersList(headers: []const http.Header) ?*py.PyObject {
     const list = py.PyList_New(@intCast(headers.len)) orelse return null;
     for (headers, 0..) |hdr, i| {
-        const name_obj = py.PyBytes_FromStringAndSize(
+        // ASGI requires lowercase header names. We lowercase in place
+        // (the bytes live in the connection's read buffer, owned by
+        // this request) so Python doesn't need to call `.lower()` on
+        // every header — saving ~50 B per header in transient bytes
+        // allocations and avoiding the per-header tuple rebuild that
+        // a list-comprehension `.lower()` would force.
+        const mut_name = @constCast(hdr.name);
+        for (mut_name) |*b| {
+            b.* = std.ascii.toLower(b.*);
+        }
+        const name_obj = lookupCachedHeaderName(hdr.name) orelse py.PyBytes_FromStringAndSize(
             @as([*c]const u8, @ptrCast(hdr.name.ptr)),
             @as(py.Py_ssize_t, @intCast(hdr.name.len)),
         ) orelse {

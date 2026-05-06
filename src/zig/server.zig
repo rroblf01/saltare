@@ -43,7 +43,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.17.0";
+const SERVER_HEADER = "saltare/0.18.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -67,6 +67,13 @@ pub const Timeouts = struct {
     /// requests get to finish; after this many seconds, the process exits
     /// regardless. Idle keep-alive connections drain via `keep_alive_secs`.
     shutdown_secs: u32 = 30,
+    /// Server-side WebSocket keepalive interval. Every this many seconds
+    /// saltare sends an empty `ping` frame to each open WS connection. If
+    /// no inbound frame (including the resulting `pong`) is observed in
+    /// `2 * ws_keepalive_secs`, the connection is torn down. Bounds the
+    /// RAM cost of long-lived WS sockets that have silently disconnected
+    /// (e.g. NAT timeouts, mobile network drops).
+    ws_keepalive_secs: u32 = 20,
 };
 
 /// Optional observability hooks. Each off by default so the v0.15 release
@@ -608,6 +615,12 @@ const Connection = struct {
     /// decrement it. False on early sendStatus paths (parse errors).
     request_in_flight: bool,
 
+    /// CLOCK_MONOTONIC ns of the last inbound activity on this connection.
+    /// Updated on every successful WebSocket frame parse; used by the
+    /// WS keepalive logic in `fireExpired` to decide whether to send a
+    /// ping or tear down a silently-dead connection.
+    last_activity_ns: i64,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -646,6 +659,7 @@ const Connection = struct {
             .bytes_sent = 0,
             .request_start_ns = 0,
             .request_in_flight = false,
+            .last_activity_ns = 0,
         };
         return conn;
     }
@@ -931,15 +945,29 @@ const TickCtx = struct { loop: *eventloop.Loop };
 
 fn fireExpired(ctx: TickCtx, node: *timer.Node) void {
     const conn: *Connection = @fieldParentPtr("timer_node", node);
-    // WS connections never arm the timer (they have their own ping/pong
-    // keepalive semantics), so anything firing here is HTTP. Belt-and-
-    // suspenders: still tear down WS correctly if we ever do arm one.
     if (conn.protocol == .websocket) {
-        wsTeardown(ctx.loop, conn);
-    } else {
-        ctx.loop.remove(conn.fd);
-        conn.destroy();
+        // WS keepalive: a fire means either "send a ping" or "we've
+        // gone too long without any inbound frame, give up". The cutoff
+        // is twice the ping interval — one missed pong is a network
+        // hiccup, two is a dead connection.
+        const idle_ns = monoNs() - conn.last_activity_ns;
+        const close_threshold = @as(i64, @intCast(g_timeouts.ws_keepalive_secs)) * 2 * std.time.ns_per_s;
+        if (conn.last_activity_ns != 0 and idle_ns >= close_threshold) {
+            wsTeardown(ctx.loop, conn);
+            return;
+        }
+        // Send ping, re-arm for the next interval. The ping is the
+        // smallest legal WS control frame (no payload, FIN=1).
+        sendControlFrame(conn, .ping, "") catch {
+            wsTeardown(ctx.loop, conn);
+            return;
+        };
+        flushOutbound(ctx.loop, conn);
+        conn.armTimer(g_timeouts.ws_keepalive_secs);
+        return;
     }
+    ctx.loop.remove(conn.fd);
+    conn.destroy();
 }
 
 fn acceptAll(
@@ -1465,10 +1493,10 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // If the app already finished (called close right after accept), close
     // after we drain the frames; otherwise stay alive.
     conn.keep_alive = !opened.done;
-    // Once upgraded to WebSocket, HTTP's deadline-driven model no longer
-    // applies; long-lived idle WS connections are expected. Per-WS keep-
-    // alive should use ping/pong (TODO post-v0.11).
-    conn.cancelTimer();
+    // Replace the HTTP-phase timer with the WebSocket keepalive cadence.
+    // `fireExpired`'s WS branch handles ping-or-teardown logic.
+    conn.last_activity_ns = monoNs();
+    conn.armTimer(g_timeouts.ws_keepalive_secs);
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
         loop.remove(conn.fd);
@@ -1610,6 +1638,9 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                 if (conn.read_total >= total) {
                     const payload = data[hdr.header_len..total];
                     ws.unmask(payload, hdr.mask_key);
+                    // Inbound frame counts as activity for the keepalive
+                    // gate — including pongs from earlier server pings.
+                    conn.last_activity_ns = monoNs();
                     handleWsFrame(loop, conn, hdr, payload);
                     if (conn.protocol != .websocket) return;
 

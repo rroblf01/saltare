@@ -18,4 +18,5 @@ def serve(
     uds_path: str | None = ...,
     metrics_path: str | None = ...,
     access_log: int = ...,
+    ws_keepalive_timeout: int = ...,
 ) -> None: ...

@@ -226,7 +226,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.17.0"
+_SERVER_HEADER = b"saltare/0.18.0"
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +369,8 @@ def ws_open(
     except UnicodeDecodeError:
         return (0, False, b"", True)
 
-    headers = [(name.lower(), value) for name, value in raw_headers]
+    # Same as the HTTP path: names already lowercase from the bridge.
+    headers = raw_headers
 
     scope: dict[str, Any] = {
         "type": "websocket",
@@ -719,7 +720,11 @@ def http_dispatch_start(
             True,
         )
 
-    headers = [(name.lower(), value) for name, value in raw_headers]
+    # Header names are already lowercased by the bridge (`buildHeadersList`
+    # lowercases in-place in Zig before building the PyBytes list), so the
+    # dispatcher can iterate `raw_headers` directly without an extra
+    # `.lower()` pass and the per-header tuple rebuild it forced.
+    headers = raw_headers
     effective_scheme = scheme
     effective_client: tuple[str, int] | None = None
 
