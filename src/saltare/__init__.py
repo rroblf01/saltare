@@ -25,6 +25,10 @@ def run(
     max_keepalive_requests: int = 1000,
     max_request_body: int = 1024 * 1024,
     shutdown_timeout: int = 30,
+    uds_path: str | None = None,
+    metrics_path: str | None = None,
+    access_log: bool = False,
+    proxy_headers: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -68,7 +72,31 @@ def run(
     bounds how long to wait — past that, surviving connections are cut
     and the process exits regardless. A second signal during drain
     promotes to immediate force-exit.
+
+    Observability + deployment knobs (all opt-in, off by default):
+        uds_path             — bind a Unix domain socket at this path
+                               instead of host:port. Saves the localhost
+                               TCP stack when behind nginx on the same box.
+        metrics_path         — if set (e.g. "/metrics"), saltare answers
+                               that path internally with Prometheus-format
+                               counters. The user app never sees the
+                               request; no Python overhead per scrape.
+        access_log           — emit one JSON line per completed request
+                               to stderr (method, path, status, bytes,
+                               latency_us, user_agent). Off-path is
+                               zero-allocation.
+        proxy_headers        — parse `X-Forwarded-For` and
+                               `X-Forwarded-Proto` from incoming requests
+                               into `scope["client"]` and `scope["scheme"]`.
+                               Only enable behind a trusted reverse proxy
+                               that strips client-supplied X-Forwarded-*
+                               headers; otherwise clients can spoof.
     """
+    # Wire Python-side proxy-headers handling. Done before _core.serve
+    # because the dispatcher's scope build happens on every request.
+    from saltare import _dispatcher
+    _dispatcher.set_proxy_headers(bool(proxy_headers))
+
     _core.serve(
         app,
         host,
@@ -83,4 +111,7 @@ def run(
         int(max_keepalive_requests),
         int(max_request_body),
         int(shutdown_timeout),
+        uds_path,
+        metrics_path,
+        int(bool(access_log)),
     )

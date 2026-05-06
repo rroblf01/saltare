@@ -37,7 +37,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.14.0");
+    return py.PyUnicode_FromString("0.15.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -59,10 +59,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var max_keepalive: c_uint = 1000;
     var max_body: c_ulonglong = 1024 * 1024;
     var shutdown_to: c_uint = 30;
+    var uds_path_z: [*c]const u8 = null;
+    var metrics_path_z: [*c]const u8 = null;
+    var access_log_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKI",
+        "Osizz|IIIIIIKIzzi",
         &app,
         &host_z,
         &port,
@@ -76,6 +79,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &max_keepalive,
         &max_body,
         &shutdown_to,
+        &uds_path_z,
+        &metrics_path_z,
+        &access_log_flag,
     ) == 0) {
         return null;
     }
@@ -97,6 +103,12 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .max_concurrent_connections = @intCast(max_concurrent),
         .max_keepalive_requests = @intCast(max_keepalive),
     };
+    const obs = server.Observability{
+        .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
+        .access_log = access_log_flag != 0,
+        .proxy_headers = false, // Python wrapper handles this; not threaded through.
+    };
+    const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 
     const both_set = ssl_cert_z != null and ssl_key_z != null;
     const either_set = ssl_cert_z != null or ssl_key_z != null;
@@ -148,7 +160,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     }
 
     const tstate = py.PyEval_SaveThread();
-    server.run(host, @intCast(port), tls_ctx, timeouts, limits) catch |err| {
+    server.run(host, @intCast(port), tls_ctx, timeouts, limits, obs, uds_path) catch |err| {
         py.PyEval_RestoreThread(tstate);
         bridge.lifespanShutdown();
         bridge.shutdown();

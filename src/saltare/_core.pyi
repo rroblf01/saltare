@@ -15,4 +15,7 @@ def serve(
     max_keepalive_requests: int = ...,
     max_request_body: int = ...,
     shutdown_timeout: int = ...,
+    uds_path: str | None = ...,
+    metrics_path: str | None = ...,
+    access_log: int = ...,
 ) -> None: ...

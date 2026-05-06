@@ -87,6 +87,30 @@ def main(argv: list[str] | None = None) -> None:
         help="seconds to wait for in-flight requests after SIGTERM/SIGINT",
     )
     parser.add_argument(
+        "--uds",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="bind a Unix domain socket at PATH instead of host:port",
+    )
+    parser.add_argument(
+        "--metrics-path",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="serve Prometheus-format metrics at PATH (e.g. '/metrics')",
+    )
+    parser.add_argument(
+        "--access-log",
+        action="store_true",
+        help="emit one JSON line per completed request to stderr",
+    )
+    parser.add_argument(
+        "--proxy-headers",
+        action="store_true",
+        help="trust X-Forwarded-For/Proto from upstream proxies",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -109,4 +133,8 @@ def main(argv: list[str] | None = None) -> None:
         max_keepalive_requests=args.max_keepalive_requests,
         max_request_body=args.max_request_body,
         shutdown_timeout=args.shutdown_timeout,
+        uds_path=args.uds,
+        metrics_path=args.metrics_path,
+        access_log=args.access_log,
+        proxy_headers=args.proxy_headers,
     )

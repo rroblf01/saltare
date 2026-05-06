@@ -33,6 +33,19 @@ from urllib.parse import unquote_to_bytes
 # across servers and produced segfaults during cleanup.
 _state = threading.local()
 
+# Process-wide flag for v0.15 X-Forwarded-* parsing. Off by default —
+# enabling it on a server that *isn't* behind a trusted proxy lets clients
+# spoof their address. Set via `saltare.run(proxy_headers=True)` (the
+# wrapper calls `set_proxy_headers` before invoking _core.serve).
+_proxy_headers_enabled = False
+
+
+def set_proxy_headers(enabled: bool) -> None:
+    """Toggle X-Forwarded-For / X-Forwarded-Proto handling. Called by the
+    `saltare.run()` wrapper just before the I/O loop starts."""
+    global _proxy_headers_enabled
+    _proxy_headers_enabled = bool(enabled)
+
 
 def _ensure_state() -> threading.local:
     if not hasattr(_state, "loop"):
@@ -213,7 +226,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.14.0"
+_SERVER_HEADER = b"saltare/0.15.0"
 
 
 # ---------------------------------------------------------------------------
@@ -673,18 +686,40 @@ def http_dispatch_start(
         )
 
     headers = [(name.lower(), value) for name, value in raw_headers]
+    effective_scheme = scheme
+    effective_client: tuple[str, int] | None = None
+
+    if _proxy_headers_enabled:
+        for name, value in headers:
+            if name == b"x-forwarded-for":
+                # Convention: leftmost IP is the original client; entries
+                # to the right are intermediate proxies. We trust the
+                # whole chain here — saltare assumes the immediate peer
+                # is a trusted proxy that already filtered spoofed values.
+                first = value.split(b",", 1)[0].strip()
+                if first:
+                    try:
+                        ip = first.decode("ascii")
+                        effective_client = (ip, 0)
+                    except UnicodeDecodeError:
+                        pass
+            elif name == b"x-forwarded-proto":
+                proto = value.strip().lower()
+                if proto in (b"http", b"https"):
+                    effective_scheme = proto.decode("ascii")
+
     scope: dict[str, Any] = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
         "http_version": "1.1",
         "method": method,
-        "scheme": scheme,
+        "scheme": effective_scheme,
         "path": path,
         "raw_path": raw_path,
         "query_string": query_string,
         "headers": headers,
         "server": (server_host, server_port),
-        "client": None,
+        "client": effective_client,
         "root_path": "",
     }
 

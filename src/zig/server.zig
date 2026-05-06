@@ -13,6 +13,7 @@
 //   - kqueue backend for macOS — see eventloop.zig's compileError
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("http.zig");
 const bridge = @import("bridge.zig");
 const eventloop = @import("eventloop.zig");
@@ -24,9 +25,11 @@ const timer = @import("timer.zig");
 const c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
+    @cInclude("sys/un.h");
     @cInclude("unistd.h");
     @cInclude("signal.h");
     @cInclude("fcntl.h");
+    @cInclude("time.h");
 });
 
 // accept4 is a Linux/glibc extension. Defining _GNU_SOURCE in the @cImport
@@ -40,7 +43,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.14.0";
+const SERVER_HEADER = "saltare/0.15.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -64,6 +67,26 @@ pub const Timeouts = struct {
     /// requests get to finish; after this many seconds, the process exits
     /// regardless. Idle keep-alive connections drain via `keep_alive_secs`.
     shutdown_secs: u32 = 30,
+};
+
+/// Optional observability hooks. Each off by default so the v0.15 release
+/// doesn't change the RAM floor for users who don't ask for it.
+pub const Observability = struct {
+    /// If non-null, requests whose path equals this string are intercepted
+    /// in Zig and answered with a Prometheus-format text dump of saltare's
+    /// counters. The user app never sees the request. A common choice:
+    /// "/metrics".
+    metrics_path: ?[]const u8 = null,
+    /// If true, every completed request emits a one-line JSON record to
+    /// stderr (method, path, status, bytes_sent, latency_us, user_agent).
+    /// Off by default — when off, zero work happens per request.
+    access_log: bool = false,
+    /// If true, the dispatcher honours `X-Forwarded-For` /
+    /// `X-Forwarded-Proto` from the request to populate `scope["client"]`
+    /// and `scope["scheme"]`. Only enable behind a trusted reverse proxy
+    /// that strips client-supplied X-Forwarded-* headers — otherwise
+    /// clients can spoof their address.
+    proxy_headers: bool = false,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -104,10 +127,35 @@ var g_timeouts: Timeouts = .{};
 /// Set by `run()`. Caps checked at accept / parse / keep-alive reset.
 var g_limits: Limits = .{};
 
+/// Set by `run()`. Looked up at every dispatch (metrics_path) and every
+/// completed request (access_log). When `metrics_path == null` and
+/// `access_log == false` the v0.14-equivalent fast paths run unchanged.
+var g_obs: Observability = .{};
+
 /// Number of accepted connections currently alive (i.e. created but not
 /// yet destroyed). Atomic for paranoia even though the I/O loop is
 /// single-threaded — keeps the pattern uniform with `g_listen_fd`.
 var g_active_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
+// ---------------------------------------------------------------------------
+// Metrics counters. All single-threaded writes from the I/O loop, atomic for
+// future-proofing (multi-worker may share these via shared memory).
+
+var g_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var g_total_requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var g_total_bytes_sent: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var g_total_bytes_received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var g_total_4xx: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+var g_total_5xx: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+fn resetMetrics() void {
+    g_in_flight.store(0, .seq_cst);
+    g_total_requests.store(0, .seq_cst);
+    g_total_bytes_sent.store(0, .seq_cst);
+    g_total_bytes_received.store(0, .seq_cst);
+    g_total_4xx.store(0, .seq_cst);
+    g_total_5xx.store(0, .seq_cst);
+}
 
 /// Set by `run` when TLS is enabled. Lives only for the duration of one
 /// `serve()` call. Each accepted connection wraps its fd with a fresh SSL
@@ -119,6 +167,271 @@ var g_tls_ctx: ?*tls.Ctx = null;
 /// not driven by socket I/O (typically: framework setup chains spanning
 /// multiple awaits). Reset to null by `run()`.
 var g_stalled_head: ?*Connection = null;
+
+/// CLOCK_MONOTONIC nanoseconds. Wraps the libc call inline so the cost
+/// of a metrics scrape is dominated by the formatting, not by Zig
+/// indirection. Off the hot path when `access_log` is off (we only call
+/// it on request start/end then).
+fn monoNs() i64 {
+    var ts: c.struct_timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.tv_nsec));
+}
+
+/// Parse the status code out of a wire response prefix `"HTTP/1.x NNN ..."`.
+/// Returns 0 if the prefix isn't recognisable. We read the status from the
+/// raw bytes (not from a Python-side struct field) so the metrics counters
+/// and the access log don't need a bridge round-trip.
+fn parseStatus(chunks: []const u8) u16 {
+    if (chunks.len < 12) return 0;
+    if (!std.mem.startsWith(u8, chunks, "HTTP/1.")) return 0;
+    if (chunks[8] != ' ') return 0;
+    return std.fmt.parseInt(u16, chunks[9..12], 10) catch 0;
+}
+
+/// Bounded JSON builder backed by a stack buffer. The access log is
+/// strictly bounded by request metadata (method, path, status, headers
+/// like User-Agent), so a 4 KiB buffer covers every realistic case
+/// without allocations. Overflow is silent — we'd rather drop a single
+/// log line than fail a request.
+const LogBuf = struct {
+    buf: [4096]u8 = undefined,
+    pos: usize = 0,
+    overflow: bool = false,
+
+    fn appendByte(self: *LogBuf, b: u8) void {
+        if (self.overflow) return;
+        if (self.pos >= self.buf.len) {
+            self.overflow = true;
+            return;
+        }
+        self.buf[self.pos] = b;
+        self.pos += 1;
+    }
+
+    fn appendSlice(self: *LogBuf, s: []const u8) void {
+        if (self.overflow) return;
+        if (self.pos + s.len > self.buf.len) {
+            self.overflow = true;
+            return;
+        }
+        @memcpy(self.buf[self.pos .. self.pos + s.len], s);
+        self.pos += s.len;
+    }
+
+    fn printFmt(self: *LogBuf, comptime fmt: []const u8, args: anytype) void {
+        if (self.overflow) return;
+        const out = std.fmt.bufPrint(self.buf[self.pos..], fmt, args) catch {
+            self.overflow = true;
+            return;
+        };
+        self.pos += out.len;
+    }
+
+    /// Append a JSON-quoted string. Strict escaping of `"`, `\`, control
+    /// chars, and any non-ASCII byte (rendered `\u00XX`) so user-supplied
+    /// header values can never break the line format.
+    fn appendJsonString(self: *LogBuf, raw: []const u8) void {
+        self.appendByte('"');
+        for (raw) |byte| {
+            switch (byte) {
+                '"' => self.appendSlice("\\\""),
+                '\\' => self.appendSlice("\\\\"),
+                '\n' => self.appendSlice("\\n"),
+                '\r' => self.appendSlice("\\r"),
+                '\t' => self.appendSlice("\\t"),
+                0x00...0x08, 0x0B, 0x0C, 0x0E...0x1F, 0x7F...0xFF => {
+                    var b6: [6]u8 = undefined;
+                    const out = std.fmt.bufPrint(&b6, "\\u00{x:0>2}", .{byte}) catch unreachable;
+                    self.appendSlice(out);
+                },
+                else => self.appendByte(byte),
+            }
+        }
+        self.appendByte('"');
+    }
+};
+
+fn emitAccessLog(conn: *Connection) void {
+    const req = conn.parsed orelse return;
+
+    var log: LogBuf = .{};
+
+    log.appendSlice("{\"method\":");
+    log.appendJsonString(req.method);
+    log.appendSlice(",\"path\":");
+    log.appendJsonString(req.target);
+    log.printFmt(",\"status\":{d},\"bytes\":{d}", .{ conn.response_status, conn.bytes_sent });
+
+    const latency_us: i64 = if (conn.request_start_ns != 0)
+        @divTrunc(monoNs() - conn.request_start_ns, 1000)
+    else
+        0;
+    log.printFmt(",\"latency_us\":{d}", .{latency_us});
+
+    const ua_raw = req.header("user-agent") orelse "";
+    const trimmed_ua = std.mem.trim(u8, ua_raw, " \t");
+    log.appendSlice(",\"user_agent\":");
+    log.appendJsonString(trimmed_ua);
+    log.appendSlice("}\n");
+
+    if (!log.overflow) {
+        // Single write(2) keeps the line atomic from the kernel's view —
+        // partial interleaving with other workers' lines is impossible
+        // even without explicit locking.
+        _ = c.write(2, &log.buf, log.pos);
+    }
+}
+
+fn updateStatusCounters(status: u16) void {
+    if (status >= 400 and status < 500) _ = g_total_4xx.fetchAdd(1, .seq_cst);
+    if (status >= 500 and status < 600) _ = g_total_5xx.fetchAdd(1, .seq_cst);
+}
+
+/// End-of-request hook: decrement the in-flight gauge if dispatch was ever
+/// started, bump status-class counters, emit the access log line. Safe to
+/// call from any "the response just finished" path (drain to close, drain
+/// to keep-alive reset, sendStatus → close). Idempotent: a second call on
+/// the same connection is a no-op because `request_in_flight` is cleared.
+fn finishRequest(conn: *Connection) void {
+    if (conn.request_in_flight) {
+        _ = g_in_flight.fetchSub(1, .seq_cst);
+        conn.request_in_flight = false;
+    }
+    updateStatusCounters(conn.response_status);
+    if (g_obs.access_log and conn.parsed != null) emitAccessLog(conn);
+}
+
+/// Read VmRSS (resident set) from `/proc/self/status`. Best-effort: any
+/// parse failure returns 0 so the metric still renders. Linux-only; on
+/// macOS the comptime branch in `serveMetrics` skips it. Uses libc
+/// directly because Zig 0.16's `std.posix.open` is absent.
+fn readVmRssBytes() u64 {
+    const fd = c.open("/proc/self/status", c.O_RDONLY);
+    if (fd < 0) return 0;
+    defer _ = c.close(fd);
+    var buf: [4096]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return 0;
+    const data = buf[0..@intCast(n)];
+    const idx = std.mem.indexOf(u8, data, "VmRSS:") orelse return 0;
+    const tail = data[idx + "VmRSS:".len ..];
+    var start: usize = 0;
+    while (start < tail.len and (tail[start] == ' ' or tail[start] == '\t')) start += 1;
+    var num_end: usize = start;
+    while (num_end < tail.len and std.ascii.isDigit(tail[num_end])) num_end += 1;
+    const kib = std.fmt.parseInt(u64, tail[start..num_end], 10) catch return 0;
+    return kib * 1024;
+}
+
+/// Build a Prometheus-format text dump of saltare's counters and write it
+/// to the connection. Bypasses the bridge entirely — the user app never
+/// sees the request, so there's no Python overhead per scrape.
+fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
+    var body_buf: [2048]u8 = undefined;
+    var body_len: usize = 0;
+
+    const sections = .{
+        .{ "# HELP saltare_open_connections Currently accepted connections held open.\n", {} },
+        .{ "# TYPE saltare_open_connections gauge\n", {} },
+    };
+    _ = sections;
+
+    // Build body via repeated bufPrint cursor.
+    const w = struct {
+        buf: []u8,
+        pos: *usize,
+
+        fn write(self: @This(), comptime fmt: []const u8, args: anytype) void {
+            const out = std.fmt.bufPrint(self.buf[self.pos.*..], fmt, args) catch return;
+            self.pos.* += out.len;
+        }
+    }{ .buf = &body_buf, .pos = &body_len };
+
+    const open_conns = g_active_conns.load(.seq_cst);
+    const in_flight = g_in_flight.load(.seq_cst);
+    const total_reqs = g_total_requests.load(.seq_cst);
+    const total_4xx = g_total_4xx.load(.seq_cst);
+    const total_5xx = g_total_5xx.load(.seq_cst);
+    const total_bytes_sent = g_total_bytes_sent.load(.seq_cst);
+    const total_bytes_recv = g_total_bytes_received.load(.seq_cst);
+    const rss_bytes: u64 = if (comptime builtin.os.tag == .linux) readVmRssBytes() else 0;
+
+    w.write(
+        \\# HELP saltare_open_connections Currently accepted connections held open.
+        \\# TYPE saltare_open_connections gauge
+        \\saltare_open_connections {d}
+        \\# HELP saltare_in_flight_requests HTTP requests being dispatched right now.
+        \\# TYPE saltare_in_flight_requests gauge
+        \\saltare_in_flight_requests {d}
+        \\# HELP saltare_requests_total HTTP requests fully served since startup.
+        \\# TYPE saltare_requests_total counter
+        \\saltare_requests_total {d}
+        \\# HELP saltare_responses_4xx_total Total 4xx responses emitted.
+        \\# TYPE saltare_responses_4xx_total counter
+        \\saltare_responses_4xx_total {d}
+        \\# HELP saltare_responses_5xx_total Total 5xx responses emitted.
+        \\# TYPE saltare_responses_5xx_total counter
+        \\saltare_responses_5xx_total {d}
+        \\# HELP saltare_bytes_sent_total Bytes written to client sockets.
+        \\# TYPE saltare_bytes_sent_total counter
+        \\saltare_bytes_sent_total {d}
+        \\# HELP saltare_bytes_received_total Bytes read from client sockets.
+        \\# TYPE saltare_bytes_received_total counter
+        \\saltare_bytes_received_total {d}
+        \\# HELP saltare_process_resident_memory_bytes RSS of the worker, from /proc/self/status (Linux only; 0 elsewhere).
+        \\# TYPE saltare_process_resident_memory_bytes gauge
+        \\saltare_process_resident_memory_bytes {d}
+        \\
+    , .{
+        open_conns,
+        in_flight,
+        total_reqs,
+        total_4xx,
+        total_5xx,
+        total_bytes_sent,
+        total_bytes_recv,
+        rss_bytes,
+    });
+
+    var head_buf: [256]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 200 OK\r\n" ++
+            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "Content-Type: text/plain; version=0.0.4\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: keep-alive\r\n" ++
+            "\r\n",
+        .{body_len},
+    ) catch {
+        sendStatus(loop, conn, 500, "Internal Server Error");
+        return;
+    };
+
+    const total_len = head.len + body_len;
+    const heap = conn.allocator.alloc(u8, total_len) catch {
+        sendStatus(loop, conn, 503, "Service Unavailable");
+        return;
+    };
+    @memcpy(heap[0..head.len], head);
+    @memcpy(heap[head.len..], body_buf[0..body_len]);
+
+    if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+    conn.write_buf = heap;
+    conn.write_pos = 0;
+    conn.state = .writing;
+    conn.keep_alive = conn.parsed.?.wantsKeepAlive();
+    conn.response_status = 200;
+    conn.armTimer(g_timeouts.write_secs);
+
+    loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    doWrite(loop, conn);
+}
 
 fn linkStalled(conn: *Connection) void {
     if (conn.stalled) return;
@@ -278,6 +591,23 @@ const Connection = struct {
     /// to recycle the connection.
     keepalive_request_count: u32,
 
+    // Per-request metrics state. Reset at dispatch start, read by the
+    // access-log emit path right before keepAliveReset / close. None of
+    // these cost a syscall when access_log is off.
+    /// HTTP status code of the in-flight or just-finished response. 0
+    /// before we've parsed any wire bytes for this request.
+    response_status: u16,
+    /// Bytes successfully written to the socket for this request, summed
+    /// across all chunks of a streamed response.
+    bytes_sent: u64,
+    /// CLOCK_MONOTONIC nanoseconds at request start (after parse-success);
+    /// used to compute latency for the access log. 0 when access_log off.
+    request_start_ns: i64,
+    /// True when the dispatch path incremented `g_in_flight` for this
+    /// request and `finishRequest` therefore needs to symmetrically
+    /// decrement it. False on early sendStatus paths (parse errors).
+    request_in_flight: bool,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -312,6 +642,10 @@ const Connection = struct {
             .stalled_prev = null,
             .stalled = false,
             .keepalive_request_count = 0,
+            .response_status = 0,
+            .bytes_sent = 0,
+            .request_start_ns = 0,
+            .request_in_flight = false,
         };
         return conn;
     }
@@ -362,12 +696,65 @@ const Connection = struct {
     }
 };
 
+fn bindTcpSocket(host: []const u8, port: u16) !c_int {
+    const addr = try parseIpv4(host, port);
+    const fd = c.socket(
+        c.AF_INET,
+        c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC,
+        c.IPPROTO_TCP,
+    );
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = c.close(fd);
+
+    var yes: c_int = 1;
+    if (c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, @ptrCast(&yes), @sizeOf(c_int)) != 0) {
+        return error.SetsockoptFailed;
+    }
+    if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    if (c.listen(fd, 256) != 0) return error.ListenFailed;
+    return fd;
+}
+
+/// Bind a Unix domain socket at `path` for AF_UNIX accept(). Caller is
+/// responsible for unlinking the path on shutdown (run() does this in a
+/// defer block). v0.15: server-only; no abstract namespace, no SO_PEERCRED
+/// auth. Behind nginx on the same host, this avoids the localhost TCP
+/// stack entirely.
+fn bindUnixSocket(path: []const u8) !c_int {
+    if (path.len == 0 or path.len >= @sizeOf(@TypeOf(@as(c.struct_sockaddr_un, undefined).sun_path))) {
+        return error.InvalidAddress;
+    }
+    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0);
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = c.close(fd);
+
+    var addr: c.struct_sockaddr_un = std.mem.zeroes(c.struct_sockaddr_un);
+    addr.sun_family = c.AF_UNIX;
+    @memcpy(addr.sun_path[0..path.len], path);
+    addr.sun_path[path.len] = 0;
+
+    // Best-effort: remove a leftover socket file from a previous run that
+    // exited without unlinking. The bind would otherwise fail EADDRINUSE.
+    {
+        var z: [108]u8 = undefined;
+        @memcpy(z[0..path.len], path);
+        z[path.len] = 0;
+        _ = std.c.unlink(@ptrCast(&z));
+    }
+
+    if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    if (c.listen(fd, 256) != 0) return error.ListenFailed;
+    return fd;
+}
+
 pub fn run(
     host: []const u8,
     port: u16,
     tls_ctx: ?*tls.Ctx,
     timeouts: Timeouts,
     limits: Limits,
+    obs: Observability,
+    uds_path: ?[]const u8,
 ) !void {
     g_tls_ctx = tls_ctx;
     defer g_tls_ctx = null;
@@ -375,32 +762,26 @@ pub fn run(
     defer g_timeouts = .{};
     g_limits = limits;
     defer g_limits = .{};
+    g_obs = obs;
+    defer g_obs = .{};
     g_active_conns.store(0, .seq_cst);
     defer g_active_conns.store(0, .seq_cst);
+    resetMetrics();
 
-    const addr = try parseIpv4(host, port);
-
-    const listen_fd = c.socket(
-        c.AF_INET,
-        c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC,
-        c.IPPROTO_TCP,
-    );
-    if (listen_fd < 0) return error.SocketFailed;
+    const listen_fd = if (uds_path) |path|
+        try bindUnixSocket(path)
+    else
+        try bindTcpSocket(host, port);
     errdefer _ = c.close(listen_fd);
-
-    var yes: c_int = 1;
-    if (c.setsockopt(
-        listen_fd,
-        c.SOL_SOCKET,
-        c.SO_REUSEADDR,
-        @ptrCast(&yes),
-        @sizeOf(c_int),
-    ) != 0) return error.SetsockoptFailed;
-
-    if (c.bind(listen_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) {
-        return error.BindFailed;
-    }
-    if (c.listen(listen_fd, 256) != 0) return error.ListenFailed;
+    // For UDS, remove the socket file when run() exits so a second start
+    // doesn't fail with EADDRINUSE on the path. Best-effort.
+    defer if (uds_path) |path| {
+        var z: [108]u8 = undefined;
+        const len = @min(path.len, z.len - 1);
+        @memcpy(z[0..len], path[0..len]);
+        z[len] = 0;
+        _ = std.c.unlink(@ptrCast(&z));
+    };
 
     g_listen_fd.store(listen_fd, .seq_cst);
     defer g_listen_fd.store(-1, .seq_cst);
@@ -418,7 +799,11 @@ pub fn run(
 
     var wheel = try timer.Wheel.init();
 
-    std.log.info("saltare listening on {s}:{d}", .{ host, port });
+    if (uds_path) |path| {
+        std.log.info("saltare listening on unix:{s}", .{path});
+    } else {
+        std.log.info("saltare listening on {s}:{d}", .{ host, port });
+    }
 
     const tick_ctx = TickCtx{ .loop = &loop };
 
@@ -870,6 +1255,29 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         return startWebSocket(loop, conn);
     }
 
+    // Per-request metrics bookkeeping. Cheap atomics; no Python touched.
+    _ = g_total_requests.fetchAdd(1, .seq_cst);
+    _ = g_in_flight.fetchAdd(1, .seq_cst);
+    conn.request_in_flight = true;
+    conn.bytes_sent = 0;
+    conn.response_status = 0;
+    conn.request_start_ns = if (g_obs.access_log) monoNs() else 0;
+
+    // Approximate request bytes received: header bytes parsed + declared
+    // body length. Misses bytes from rejected (413, 400) requests but is
+    // good enough for the Prometheus counter.
+    _ = g_total_bytes_received.fetchAdd(
+        conn.body_offset + conn.body_len,
+        .seq_cst,
+    );
+
+    // Internal endpoints (only when explicitly opted in).
+    if (g_obs.metrics_path) |path| {
+        if (std.mem.eql(u8, req.target, path)) {
+            return serveMetrics(loop, conn);
+        }
+    }
+
     const data = &conn.read_buf.?.data;
     const body = data[conn.body_offset .. conn.body_offset + conn.body_len];
     var keep_alive = req.wantsKeepAlive();
@@ -905,6 +1313,12 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
         conn.write_buf = start.chunks;
         conn.write_pos = 0;
+        // First chunks of a streaming response always begin with the wire
+        // status line. Parse it once so the access log + status counters
+        // see the right code.
+        if (conn.response_status == 0) {
+            conn.response_status = parseStatus(start.chunks);
+        }
     }
 
     conn.state = .writing;
@@ -1012,7 +1426,11 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
             const remaining = conn.write_buf[conn.write_pos..];
             const r = connWrite(conn, remaining);
             switch (r.status) {
-                .ok => conn.write_pos += r.n,
+                .ok => {
+                    conn.write_pos += r.n;
+                    conn.bytes_sent += r.n;
+                    _ = g_total_bytes_sent.fetchAdd(r.n, .seq_cst);
+                },
                 .would_block, .want_write => {
                     if (conn.ssl != null) epollWantWrite(loop, conn);
                     return;
@@ -1061,6 +1479,10 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
             conn.write_buf = tick.chunks;
             conn.write_pos = 0;
             conn.dispatch_active = !tick.done;
+            // First chunk of the response holds the status line.
+            if (conn.response_status == 0) {
+                conn.response_status = parseStatus(tick.chunks);
+            }
             continue;
         }
 
@@ -1084,6 +1506,7 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
     }
 
     // write_buf fully drained AND dispatch is no longer active.
+    finishRequest(conn);
     if (conn.keep_alive) {
         keepAliveReset(loop, conn);
     } else {
@@ -1520,6 +1943,9 @@ fn sendStatus(loop: *eventloop.Loop, conn: *Connection, code: u16, reason: []con
     conn.state = .writing;
     // Errors always close — parser/state may be stale, can't safely keep-alive.
     conn.keep_alive = false;
+    // Make the access log + status counters see this code, even on early-
+    // error paths that never reach the streaming dispatch tick.
+    conn.response_status = code;
     conn.armTimer(g_timeouts.write_secs);
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {

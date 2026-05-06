@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: pre-alpha (v0.14.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, resource caps, and **graceful shutdown** are all in. v0.14 wires SIGTERM/SIGINT to a drain phase (`shutdown_timeout` configurable, default 30 s): in-flight requests finish, then `lifespan.shutdown` runs, then the process exits 0 — k8s rolling deploys land cleanly. App exceptions during dispatch are caught and turned into 500 responses without taking the worker down. Production-readiness gaps remaining for v1.0: observability, multi-worker.
+> **Status: pre-alpha (v0.15.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, resource caps, graceful shutdown, **observability hooks**, and **Unix domain sockets** are all in. v0.15 adds an opt-in Prometheus `/metrics` endpoint served straight from Zig (no Python overhead per scrape), an opt-in JSON access log straight to stderr, opt-in `X-Forwarded-For/Proto` parsing for deployments behind a trusted proxy, and `--uds PATH` to bind a Unix socket instead of `host:port`. All four are off by default — the v0.14 RAM and throughput numbers are unchanged when you don't ask for them. Production-readiness gap remaining for v1.0: multi-worker.
 
 ---
 
@@ -48,28 +48,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.14.0:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.15.0:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.31 MiB |      43.39 MiB | 43.39 MiB |    1000 | 2321 |
-| uvicorn | 44.88 MiB |      44.92 MiB | 44.92 MiB |    1000 | 2899 |
+| saltare | 43.32 MiB |      43.46 MiB | 43.46 MiB |    1000 | 2340 |
+| uvicorn | 44.92 MiB |      44.96 MiB | 44.96 MiB |    1000 | 2921 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.71 MiB |      41.98 MiB | 42.00 MiB |    2000 | 3832 |
-| uvicorn | 44.82 MiB |      45.29 MiB | 45.29 MiB |    2000 | 4029 |
+| saltare | 41.78 MiB |      42.06 MiB | 42.08 MiB |    2000 | 3815 |
+| uvicorn | 44.89 MiB |      45.34 MiB | 45.34 MiB |    2000 | 3966 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 41.57 MiB |      41.70 MiB | 41.70 MiB |     500 | 2055      |
-| uvicorn | 44.85 MiB |      50.23 MiB | 50.23 MiB |     500 | 3365      |
+| saltare | 41.95 MiB |      42.08 MiB | 42.08 MiB |     500 | 2069      |
+| uvicorn | 44.87 MiB |      50.25 MiB | 50.25 MiB |     500 | 2894      |
 
 **Read this honestly:**
 
@@ -99,8 +99,8 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.12.1** — Per-connection RAM polish. The `[64]Header` array previously inlined into `Connection` (~2 KiB) is now bundled into the same `pool.zig` `Buffer` that holds the read data, so it's released atomically when the connection goes idle: idle keep-alive cost drops from ~2 KiB to ~390 B per connection, taking the per-conn advantage over uvicorn from ~5× to ~28×. A `malloc_trim(0)` call after `lifespan.startup` returns ~2 MiB of glibc heap fragmentation (left over from FastAPI/Pydantic imports) to the OS — the sequential-idle floor dropped from 45.56 MiB to 43.15 MiB. README gains a "Production deployment" section recommending `MALLOC_ARENA_MAX=2` for another 5–15 MiB.
 - [x] **v0.13.0** — Resource caps + `Expect: 100-continue`. New `Limits` struct (`max_request_body`, `max_concurrent_connections`, `max_keepalive_requests`) wired into `serve()` and the CLI. Body cap fires 413 on declared `Content-Length` overflow and on incremental chunked-decode growth. Connection cap accepts overflow sockets (to drain the listen backlog) and immediately closes them. Keepalive-requests cap forces `Connection: close` on the Nth response, recycling pymalloc arenas. `Expect: 100-continue` writes the interim response before reading the body, except when the declared body would exceed the cap (in which case the client gets a 413 directly). Caps add zero RAM cost in benign workloads; under adversarial load they convert the architectural advantage into a **hard guarantee**.
 - [x] **v0.14.0** — Graceful shutdown + ASGI exception isolation. New `g_draining` atomic flag; the SIGTERM/SIGINT handler sets it (and a second signal promotes to immediate force-exit). Main loop, on first observing drain mode, removes the listen fd from epoll (stops accepting), stamps a deadline, and continues processing in-flight requests — exit happens when `g_active_conns` reaches zero or `shutdown_timeout` (default 30 s) elapses. Idle keep-alive connections drain naturally via `keep_alive_timeout`. After the loop exits, `lifespan.shutdown` runs as before, then the process exits 0. App exceptions during dispatch are caught at the bridge: pre-headers raises produce a synthesized 500, mid-stream raises close the connection — server keeps serving subsequent requests. Tests now 44/44 (5 new in `test_shutdown.py`, 3 of which exercise real SIGTERM via `subprocess`).
-- [ ] **v0.15.0** — Metrics endpoint + access log opt-in + proxy headers + Unix domain sockets.
-- [ ] **v0.16.0** — RAM polish: `malloc_trim` after lifespan startup, adaptive read buffer, `MADV_DONTNEED` on idle pool buffers.
+- [x] **v0.15.0** — Observability + UDS. `Observability` struct (`metrics_path`, `access_log`, `proxy_headers`) all opt-in. `metrics_path` (e.g. `/metrics`) intercepts requests in Zig and serves Prometheus text from atomic counters (`saltare_open_connections`, `saltare_in_flight_requests`, `saltare_requests_total`, `saltare_responses_4xx_total` / `_5xx_total`, `saltare_bytes_sent_total` / `_received_total`, `saltare_process_resident_memory_bytes` from `/proc/self/status` on Linux). `access_log` emits a JSON line per completed request to stderr from a 4 KiB stack-buffered writer (status line parsed once from the wire bytes; bytes/latency tracked in `Connection`); a single `write(2)` keeps lines atomic. `proxy_headers` lets the dispatcher read `X-Forwarded-For` (leftmost IP into `scope["client"]`) and `X-Forwarded-Proto` (into `scope["scheme"]`); only enable behind a trusted proxy. `uds_path` makes `serve()` bind an `AF_UNIX` socket instead of TCP — the bind path is unlinked on shutdown so restarts don't fail with `EADDRINUSE`. All four off by default; bench numbers indistinguishable from v0.14. Tests now 50/50 (6 new in `test_observability.py`).
+- [ ] **v0.16.0** — RAM polish: adaptive read buffer (4 KiB primary / 16 KiB overflow), `MADV_DONTNEED` on long-idle pool buffers, compressed `Header` to u16 offsets.
 - [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`) + production deployment guide.
 
 ## Install (once published)
@@ -184,6 +184,45 @@ saltare.run(
 ```
 
 CLI flags: `--max-concurrent-connections`, `--max-keepalive-requests`, `--max-request-body`. Defaults match the values above. `Expect: 100-continue` is honoured automatically (the interim response is written before the body is read, except when the declared `Content-Length` already exceeds `max_request_body` — in which case the client gets a 413 directly). In v0.13 the read buffer (16 KiB) is the practical hard ceiling for `max_request_body`; request-body streaming for larger bodies lands in a follow-up.
+
+### Observability and deployment knobs (v0.15)
+
+```python
+saltare.run(
+    app,
+    metrics_path="/metrics",   # Prometheus text from Zig counters; no Python overhead per scrape
+    access_log=True,           # JSON line to stderr per completed request
+    proxy_headers=True,        # parse X-Forwarded-For / X-Forwarded-Proto
+    uds_path="/run/saltare.sock",  # bind a Unix socket instead of host:port
+)
+```
+
+CLI: `--metrics-path PATH`, `--access-log`, `--proxy-headers`, `--uds PATH`. All off by default — the bench numbers above are taken with all four disabled, so turning any of them on costs only what that feature costs (e.g. `access_log=True` adds one `clock_gettime` + one `write(2)` per request).
+
+Metrics endpoint exposes:
+
+```
+saltare_open_connections           gauge   – active TCP/UDS sockets
+saltare_in_flight_requests         gauge   – HTTP requests being dispatched right now
+saltare_requests_total             counter – HTTP requests dispatched since startup
+saltare_responses_4xx_total        counter
+saltare_responses_5xx_total        counter
+saltare_bytes_sent_total           counter
+saltare_bytes_received_total       counter
+saltare_process_resident_memory_bytes gauge – RSS from /proc/self/status (Linux)
+```
+
+The `metrics_path` request is answered entirely from Zig — your ASGI app never sees it.
+
+Access log format (one JSON line per completed request, to stderr):
+
+```
+{"method":"GET","path":"/users/42","status":200,"bytes":318,"latency_us":1234,"user_agent":"curl/8.0"}
+```
+
+Stack-buffered, JSON-escaped, single `write(2)` per line so concurrent workers don't interleave.
+
+Proxy headers: `X-Forwarded-For` (leftmost address → `scope["client"]`) and `X-Forwarded-Proto` (`http`/`https` → `scope["scheme"]`). Only enable behind a proxy that strips client-supplied `X-Forwarded-*` headers, otherwise clients can spoof their identity.
 
 ## Production deployment
 
