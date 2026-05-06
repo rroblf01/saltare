@@ -30,6 +30,7 @@ def run(
     access_log: bool = False,
     proxy_headers: bool = False,
     ws_keepalive_timeout: int = 20,
+    workers: int = 1,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -74,6 +75,15 @@ def run(
     and the process exits regardless. A second signal during drain
     promotes to immediate force-exit.
 
+    Multi-worker (`workers > 1`): saltare forks N pre-fork workers that
+    each run lifespan + accept loop on a shared listen socket. The master
+    supervises and propagates SIGTERM. A worker exiting unexpectedly
+    propagates shutdown to the rest (v1.0 policy: if a worker dies, the
+    pod dies — let your supervisor restart). Each worker reports its
+    own counters at `metrics_path`; aggregation across workers is left
+    to the scraper. `workers=1` (the default) keeps the legacy single-
+    process flow unchanged.
+
     Observability + deployment knobs (all opt-in, off by default):
         uds_path             — bind a Unix domain socket at this path
                                instead of host:port. Saves the localhost
@@ -116,4 +126,5 @@ def run(
         metrics_path,
         int(bool(access_log)),
         int(ws_keepalive_timeout),
+        int(workers),
     )

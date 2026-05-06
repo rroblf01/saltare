@@ -43,7 +43,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.18.0";
+const SERVER_HEADER = "saltare/1.0.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -726,6 +726,14 @@ const Connection = struct {
     }
 };
 
+/// Public wrapper used by the multi-worker master to bind the listen
+/// socket once before forking. Workers later receive this fd via
+/// `run(..., inherited_listen_fd=fd)`.
+pub fn bindAndListen(host: []const u8, port: u16, uds_path: ?[]const u8) !c_int {
+    if (uds_path) |p| return bindUnixSocket(p);
+    return bindTcpSocket(host, port);
+}
+
 fn bindTcpSocket(host: []const u8, port: u16) !c_int {
     const addr = try parseIpv4(host, port);
     const fd = c.socket(
@@ -785,6 +793,7 @@ pub fn run(
     limits: Limits,
     obs: Observability,
     uds_path: ?[]const u8,
+    inherited_listen_fd: ?c_int,
 ) !void {
     g_tls_ctx = tls_ctx;
     defer g_tls_ctx = null;
@@ -798,15 +807,24 @@ pub fn run(
     defer g_active_conns.store(0, .seq_cst);
     resetMetrics();
 
-    const listen_fd = if (uds_path) |path|
+    // Multi-worker (v1.0): the master process binds + listens, then forks
+    // N children that inherit the fd. When `inherited_listen_fd` is set we
+    // skip bind/listen and use that fd directly. UDS unlink on shutdown
+    // is the master's responsibility, not the worker's — workers shouldn't
+    // remove the socket the master also serves.
+    const owns_listen_fd = inherited_listen_fd == null;
+    const listen_fd: c_int = if (inherited_listen_fd) |fd|
+        fd
+    else if (uds_path) |path|
         try bindUnixSocket(path)
     else
         try bindTcpSocket(host, port);
-    errdefer _ = c.close(listen_fd);
-    // For UDS, remove the socket file when run() exits so a second start
-    // doesn't fail with EADDRINUSE on the path. Best-effort.
-    defer if (uds_path) |path| {
+    errdefer if (owns_listen_fd) {
+        _ = c.close(listen_fd);
+    };
+    defer if (owns_listen_fd and uds_path != null) {
         var z: [108]u8 = undefined;
+        const path = uds_path.?;
         const len = @min(path.len, z.len - 1);
         @memcpy(z[0..len], path[0..len]);
         z[len] = 0;
@@ -909,7 +927,9 @@ pub fn run(
 
     g_stalled_head = null;
     g_draining.store(false, .seq_cst);
-    _ = c.close(listen_fd);
+    if (owns_listen_fd) {
+        _ = c.close(listen_fd);
+    }
 }
 
 fn drainStalled(loop: *eventloop.Loop) void {

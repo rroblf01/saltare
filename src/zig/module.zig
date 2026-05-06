@@ -14,6 +14,15 @@ const builtin = @import("builtin");
 const server = @import("server.zig");
 const bridge = @import("bridge.zig");
 const tls = @import("tls.zig");
+const master_mod = @import("master.zig");
+
+const c = @cImport({
+    @cInclude("unistd.h");
+    @cInclude("sys/types.h");
+    @cInclude("sys/wait.h");
+    @cInclude("sys/prctl.h");
+    @cInclude("signal.h");
+});
 
 // glibc-only. We guard the call site with `builtin.os.tag == .linux` so the
 // extern reference is dead-code-eliminated on macOS / non-glibc targets and
@@ -37,7 +46,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.18.0");
+    return py.PyUnicode_FromString("1.0.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -63,10 +72,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var metrics_path_z: [*c]const u8 = null;
     var access_log_flag: c_int = 0;
     var ws_keepalive_to: c_uint = 20;
+    var workers: c_uint = 1;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziI",
+        "Osizz|IIIIIIKIzziII",
         &app,
         &host_z,
         &port,
@@ -84,7 +94,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &metrics_path_z,
         &access_log_flag,
         &ws_keepalive_to,
+        &workers,
     ) == 0) {
+        return null;
+    }
+
+    if (workers == 0 or workers > master_mod.MAX_WORKERS) {
+        py.PyErr_SetString(py.PyExc_ValueError, "workers must be in [1, 256]");
         return null;
     }
 
@@ -142,7 +158,41 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     }
     defer if (tls_ctx) |ctx| tls.freeContext(ctx);
 
-    if (!bridge.init(app.?, host, port, both_set)) {
+    if (workers > 1) {
+        // Multi-worker (v1.0): master binds once, forks N children that
+        // each run lifespan + accept loop, then supervises with pause()
+        // and waitpid(). Lifespan is per-worker — each child gets its
+        // own asyncio loop, its own DB connections, etc. The master
+        // never imports the user app's behaviour, only its references.
+        const listen_fd = server.bindAndListen(host, @intCast(port), uds_path) catch |err| {
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrintZ(&msg_buf, "saltare bind failed: {s}", .{@errorName(err)}) catch "saltare bind failed";
+            py.PyErr_SetString(py.PyExc_RuntimeError, msg.ptr);
+            return null;
+        };
+        return runMultiWorker(app.?, host, port, ssl_cert_z, ssl_key_z, both_set, tls_ctx, timeouts, limits, obs, uds_path, listen_fd, workers);
+    }
+
+    // Single-worker path. Identical to v0.18 except `inherited_listen_fd`
+    // is now an explicit `null` instead of an absent argument.
+    return runSingleWorker(app.?, host, port, both_set, tls_ctx, timeouts, limits, obs, uds_path, null);
+}
+
+/// Run lifespan + I/O loop + lifespan-shutdown in this process. Used for
+/// both the single-worker entry point and (after fork) each worker child.
+fn runSingleWorker(
+    app: *py.PyObject,
+    host: []const u8,
+    port: c_int,
+    is_tls: bool,
+    tls_ctx: ?*tls.Ctx,
+    timeouts: server.Timeouts,
+    limits: server.Limits,
+    obs: server.Observability,
+    uds_path: ?[]const u8,
+    inherited_listen_fd: ?c_int,
+) ?*py.PyObject {
+    if (!bridge.init(app, host, port, is_tls)) {
         return null;
     }
 
@@ -163,7 +213,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     }
 
     const tstate = py.PyEval_SaveThread();
-    server.run(host, @intCast(port), tls_ctx, timeouts, limits, obs, uds_path) catch |err| {
+    server.run(host, @intCast(port), tls_ctx, timeouts, limits, obs, uds_path, inherited_listen_fd) catch |err| {
         py.PyEval_RestoreThread(tstate);
         bridge.lifespanShutdown();
         bridge.shutdown();
@@ -180,6 +230,80 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
 
     bridge.lifespanShutdown();
     bridge.shutdown();
+
+    if (py.PyErr_CheckSignals() != 0) return null;
+    return pyReturnNone();
+}
+
+/// Multi-worker master: forks `workers` children, each running
+/// `runSingleWorker` against the master's bound `listen_fd`, then
+/// supervises them via `master_mod.manage`. Returns once every child
+/// has exited. The master never serves traffic itself.
+fn runMultiWorker(
+    app: *py.PyObject,
+    host: []const u8,
+    port: c_int,
+    ssl_cert_z: [*c]const u8,
+    ssl_key_z: [*c]const u8,
+    is_tls: bool,
+    tls_ctx: ?*tls.Ctx,
+    timeouts: server.Timeouts,
+    limits: server.Limits,
+    obs: server.Observability,
+    uds_path: ?[]const u8,
+    listen_fd: c_int,
+    workers: c_uint,
+) ?*py.PyObject {
+    _ = ssl_cert_z;
+    _ = ssl_key_z;
+
+    var pids: [master_mod.MAX_WORKERS]c.pid_t = undefined;
+    const n: usize = @intCast(workers);
+    for (0..n) |i| pids[i] = -1;
+
+    var spawned: usize = 0;
+    while (spawned < n) : (spawned += 1) {
+        const pid = c.fork();
+        if (pid < 0) {
+            // Fork failed mid-way: terminate any children we already
+            // forked, then surface the error.
+            for (pids[0..spawned]) |p| {
+                if (p > 0) _ = c.kill(p, c.SIGTERM);
+            }
+            for (pids[0..spawned]) |p| {
+                if (p > 0) {
+                    var status: c_int = 0;
+                    _ = c.waitpid(p, &status, 0);
+                }
+            }
+            _ = c.close(listen_fd);
+            py.PyErr_SetString(py.PyExc_RuntimeError, "saltare: fork() failed during worker spawn");
+            return null;
+        }
+        if (pid == 0) {
+            // Child. Tell the kernel to send SIGTERM if the master goes
+            // away unexpectedly (so an SIGKILL'd master doesn't leave
+            // orphan workers behind, which would then take the full
+            // shutdown_timeout to notice the world ended).
+            if (comptime builtin.os.tag == .linux) {
+                _ = c.prctl(c.PR_SET_PDEATHSIG, @as(c_ulong, c.SIGTERM), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
+            }
+            const result = runSingleWorker(app, host, port, is_tls, tls_ctx, timeouts, limits, obs, uds_path, listen_fd);
+            // Child must exit — we don't return up the Python call stack.
+            // Use the conventional `_exit` to skip atexit handlers (which
+            // might double-flush stdio with the master).
+            std.c._exit(if (result == null) 1 else 0);
+        }
+        pids[spawned] = pid;
+    }
+
+    // Master supervises. Release the GIL so any incidental Python work
+    // in the master process (there shouldn't be any) doesn't deadlock.
+    const tstate = py.PyEval_SaveThread();
+    master_mod.manage(pids[0..n]);
+    py.PyEval_RestoreThread(tstate);
+
+    _ = c.close(listen_fd);
 
     if (py.PyErr_CheckSignals() != 0) return null;
     return pyReturnNone();

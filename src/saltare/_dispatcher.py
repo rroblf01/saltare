@@ -226,7 +226,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.18.0"
+_SERVER_HEADER = b"saltare/1.0.0"
 
 
 # ---------------------------------------------------------------------------

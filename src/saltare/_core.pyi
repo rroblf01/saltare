@@ -19,4 +19,5 @@ def serve(
     metrics_path: str | None = ...,
     access_log: int = ...,
     ws_keepalive_timeout: int = ...,
+    workers: int = ...,
 ) -> None: ...
