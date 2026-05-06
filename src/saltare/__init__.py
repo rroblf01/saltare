@@ -21,6 +21,9 @@ def run(
     keep_alive_timeout: int = 5,
     body_timeout: int = 30,
     write_timeout: int = 30,
+    max_concurrent_connections: int = 1024,
+    max_keepalive_requests: int = 1000,
+    max_request_body: int = 1024 * 1024,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -35,6 +38,28 @@ def run(
         body_timeout         — headers parsed → body fully received.
         write_timeout        — maximum time held in the writing state
                                (slow / non-draining client).
+
+    Resource caps (turn the architectural RAM win into a hard guarantee):
+        max_concurrent_connections
+                             — accepted connections held open at once.
+                               Past this, new connections are accepted to
+                               drain the listen backlog and immediately
+                               closed.
+        max_keepalive_requests
+                             — requests served on a single keep-alive
+                               connection before forcing `Connection: close`.
+                               Recycles CPython arena memory on long-lived
+                               connections.
+        max_request_body     — declared body size (Content-Length, or the
+                               final decoded length for chunked) that the
+                               server will accept; oversize requests get
+                               a 413. Bounded by the read-buffer size in
+                               v0.13 (request-body streaming lifts that
+                               in a later milestone).
+
+    Apps using the `Expect: 100-continue` request header are honoured
+    automatically: the interim response is written as soon as headers
+    parse and the body-size cap check passes.
     """
     _core.serve(
         app,
@@ -46,4 +71,7 @@ def run(
         int(keep_alive_timeout),
         int(body_timeout),
         int(write_timeout),
+        int(max_concurrent_connections),
+        int(max_keepalive_requests),
+        int(max_request_body),
     )

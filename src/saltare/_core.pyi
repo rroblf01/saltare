@@ -11,4 +11,7 @@ def serve(
     keep_alive_timeout: int = ...,
     body_timeout: int = ...,
     write_timeout: int = ...,
+    max_concurrent_connections: int = ...,
+    max_keepalive_requests: int = ...,
+    max_request_body: int = ...,
 ) -> None: ...

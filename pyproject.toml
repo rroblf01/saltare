@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "saltare"
-version = "0.12.1"
+version = "0.13.0"
 description = "Low-RAM ASGI HTTP server with a Zig backbone."
 readme = "README.md"
 requires-python = ">=3.10"

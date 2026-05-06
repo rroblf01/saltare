@@ -63,6 +63,24 @@ def main(argv: list[str] | None = None) -> None:
         help="maximum seconds in the writing state",
     )
     parser.add_argument(
+        "--max-concurrent-connections",
+        type=int,
+        default=1024,
+        help="accepted connections held open at once (overflow is dropped)",
+    )
+    parser.add_argument(
+        "--max-keepalive-requests",
+        type=int,
+        default=1000,
+        help="requests per keep-alive connection before forcing close",
+    )
+    parser.add_argument(
+        "--max-request-body",
+        type=int,
+        default=1024 * 1024,
+        help="largest request body (in bytes) the server will accept",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -81,4 +99,7 @@ def main(argv: list[str] | None = None) -> None:
         keep_alive_timeout=args.keep_alive_timeout,
         body_timeout=args.body_timeout,
         write_timeout=args.write_timeout,
+        max_concurrent_connections=args.max_concurrent_connections,
+        max_keepalive_requests=args.max_keepalive_requests,
+        max_request_body=args.max_request_body,
     )

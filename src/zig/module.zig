@@ -37,7 +37,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("0.12.1");
+    return py.PyUnicode_FromString("0.13.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -48,17 +48,20 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     // passes 5 positional args; missing TLS files come through as None.
     var ssl_cert_z: [*c]const u8 = null;
     var ssl_key_z: [*c]const u8 = null;
-    // Timeouts (seconds). Optional in PyArg, but the Python wrapper always
-    // forwards explicit values; defaults here only matter for direct
+    // Timeouts (seconds) + caps. Optional in PyArg, but the Python wrapper
+    // always forwards explicit values; defaults here only matter for direct
     // _core.serve callers (tests, debugging).
     var header_to: c_uint = 5;
     var keep_alive_to: c_uint = 5;
     var body_to: c_uint = 30;
     var write_to: c_uint = 30;
+    var max_concurrent: c_uint = 1024;
+    var max_keepalive: c_uint = 1000;
+    var max_body: c_ulonglong = 1024 * 1024;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIII",
+        "Osizz|IIIIIIK",
         &app,
         &host_z,
         &port,
@@ -68,6 +71,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &keep_alive_to,
         &body_to,
         &write_to,
+        &max_concurrent,
+        &max_keepalive,
+        &max_body,
     ) == 0) {
         return null;
     }
@@ -82,6 +88,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .keep_alive_secs = @intCast(keep_alive_to),
         .body_secs = @intCast(body_to),
         .write_secs = @intCast(write_to),
+    };
+    const limits = server.Limits{
+        .max_request_body = @intCast(max_body),
+        .max_concurrent_connections = @intCast(max_concurrent),
+        .max_keepalive_requests = @intCast(max_keepalive),
     };
 
     const both_set = ssl_cert_z != null and ssl_key_z != null;
@@ -134,7 +145,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     }
 
     const tstate = py.PyEval_SaveThread();
-    server.run(host, @intCast(port), tls_ctx, timeouts) catch |err| {
+    server.run(host, @intCast(port), tls_ctx, timeouts, limits) catch |err| {
         py.PyEval_RestoreThread(tstate);
         bridge.lifespanShutdown();
         bridge.shutdown();

@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: pre-alpha (v0.12.1).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, idle timeouts, and streaming response bodies are all in. v0.12.1 pulls the per-request headers array into the read-buffer pool: idle keep-alive connections now cost **~390 B each** (down from ~2 KiB), pushing the per-connection RAM advantage over uvicorn from ~5× to **~28×**. A `malloc_trim(0)` after lifespan startup trims another ~2 MiB off the floor. Production-readiness gaps remaining for v1.0: resource caps (max body, max conns), graceful shutdown, observability, multi-worker.
+> **Status: pre-alpha (v0.13.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, and **resource caps** are all in. v0.13 adds `max_request_body`, `max_concurrent_connections`, `max_keepalive_requests`, plus `Expect: 100-continue` support — the architectural ~28× per-connection RAM advantage over uvicorn now holds under adversarial load too. Production-readiness gaps remaining for v1.0: graceful shutdown, observability, multi-worker.
 
 ---
 
@@ -48,28 +48,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.12.1:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.13.0:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.15 MiB |      43.29 MiB | 43.29 MiB |    1000 | 2271 |
-| uvicorn | 44.90 MiB |      44.94 MiB | 44.94 MiB |    1000 | 2923 |
+| saltare | 43.46 MiB |      43.54 MiB | 43.54 MiB |    1000 | 2305 |
+| uvicorn | 44.90 MiB |      44.94 MiB | 44.94 MiB |    1000 | 2898 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.87 MiB |      42.14 MiB | 42.16 MiB |    2000 | 3790 |
-| uvicorn | 44.83 MiB |      45.22 MiB | 45.22 MiB |    2000 | 3951 |
+| saltare | 41.64 MiB |      41.96 MiB | 41.97 MiB |    2000 | 3878 |
+| uvicorn | 44.99 MiB |      45.41 MiB | 45.41 MiB |    2000 | 4024 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 41.76 MiB |      41.95 MiB | 41.95 MiB |     500 | 2167      |
-| uvicorn | 44.97 MiB |      50.35 MiB | 50.35 MiB |     500 | 2905      |
+| saltare | 41.87 MiB |      42.06 MiB | 42.06 MiB |     500 | 2304      |
+| uvicorn | 44.81 MiB |      50.19 MiB | 50.19 MiB |     500 | 2918      |
 
 **Read this honestly:**
 
@@ -97,7 +97,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.11.0** — Per-connection idle timeouts via a hashed timer wheel (`src/zig/timer.zig`). Four configurable deadlines (`header_timeout`, `keep_alive_timeout`, `body_timeout`, `write_timeout`) with defaults of 5/5/30/30 seconds. Slowloris and slow-body attacks are now reaped instead of holding `Connection` structs indefinitely. Wheel uses 128 buckets of 1 second; nodes are intrusive in `Connection` (24 B / conn) so arming and cancelling are allocation-free O(1). WS connections are exempt — long-lived idle sockets are expected there; ping/pong-driven WS keepalive lands post-v0.11.
 - [x] **v0.12.0** — Streaming response bodies. Each HTTP request runs as a long-lived asyncio Task with its own `recv_queue` and `outgoing` list; the app's `send({type: "http.response.body", more_body: True/False})` calls flow chunk-by-chunk through the bridge into Zig's `write_buf` instead of being buffered into a single Python `bytes`. When the app does not declare a Content-Length, saltare adds `Transfer-Encoding: chunked` automatically. Concurrency uses a global "stalled list" of connections whose Task is parked on framework-internal awaits (e.g. FastAPI middleware chains): the main loop runs one global asyncio pump per iteration to advance every parked Task in lockstep, then drains each one — no per-connection multi-pumping, no level-triggered EPOLLOUT spin. Request bodies are still capped to the 16 KiB read buffer (request-side streaming lands in v0.12.x).
 - [x] **v0.12.1** — Per-connection RAM polish. The `[64]Header` array previously inlined into `Connection` (~2 KiB) is now bundled into the same `pool.zig` `Buffer` that holds the read data, so it's released atomically when the connection goes idle: idle keep-alive cost drops from ~2 KiB to ~390 B per connection, taking the per-conn advantage over uvicorn from ~5× to ~28×. A `malloc_trim(0)` call after `lifespan.startup` returns ~2 MiB of glibc heap fragmentation (left over from FastAPI/Pydantic imports) to the OS — the sequential-idle floor dropped from 45.56 MiB to 43.15 MiB. README gains a "Production deployment" section recommending `MALLOC_ARENA_MAX=2` for another 5–15 MiB.
-- [ ] **v0.13.0** — Caps configurable (max body, max concurrent connections, max keepalive_requests, max write buffer) + 413/431 + `Expect: 100-continue`.
+- [x] **v0.13.0** — Resource caps + `Expect: 100-continue`. New `Limits` struct (`max_request_body`, `max_concurrent_connections`, `max_keepalive_requests`) wired into `serve()` and the CLI. Body cap fires 413 on declared `Content-Length` overflow and on incremental chunked-decode growth. Connection cap accepts overflow sockets (to drain the listen backlog) and immediately closes them. Keepalive-requests cap forces `Connection: close` on the Nth response, recycling pymalloc arenas. `Expect: 100-continue` writes the interim response before reading the body, except when the declared body would exceed the cap (in which case the client gets a 413 directly). Caps add zero RAM cost in benign workloads; under adversarial load they convert the architectural advantage into a **hard guarantee**.
 - [ ] **v0.14.0** — Graceful shutdown with in-flight drain on SIGTERM + robust ASGI exception isolation.
 - [ ] **v0.15.0** — Metrics endpoint + access log opt-in + proxy headers + Unix domain sockets.
 - [ ] **v0.16.0** — RAM polish: `malloc_trim` after lifespan startup, adaptive read buffer, `MADV_DONTNEED` on idle pool buffers.
@@ -171,6 +171,19 @@ saltare.run(
 ```
 
 The same flags are exposed on the CLI (`--header-timeout`, `--keep-alive-timeout`, `--body-timeout`, `--write-timeout`). Defaults match the values above. WebSocket connections are exempt — long-lived idle WS sockets are expected, and ping/pong-driven keepalive lands post-v0.11.
+
+### Resource caps
+
+```python
+saltare.run(
+    app,
+    max_concurrent_connections=1024,    # accepted sockets held open at once
+    max_keepalive_requests=1000,        # requests per keep-alive conn before close
+    max_request_body=1024 * 1024,       # bytes; oversize gets 413
+)
+```
+
+CLI flags: `--max-concurrent-connections`, `--max-keepalive-requests`, `--max-request-body`. Defaults match the values above. `Expect: 100-continue` is honoured automatically (the interim response is written before the body is read, except when the declared `Content-Length` already exceeds `max_request_body` — in which case the client gets a 413 directly). In v0.13 the read buffer (16 KiB) is the practical hard ceiling for `max_request_body`; request-body streaming for larger bodies lands in a follow-up.
 
 ## Production deployment
 

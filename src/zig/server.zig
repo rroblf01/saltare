@@ -40,7 +40,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.12.1";
+const SERVER_HEADER = "saltare/0.13.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -61,6 +61,28 @@ pub const Timeouts = struct {
     write_secs: u32 = 30,
 };
 
+/// Resource ceilings that turn the architectural RAM win into a guaranteed
+/// upper bound under adversarial load. Set by `run()`; checked at accept
+/// time, parse time, and keep-alive reset.
+pub const Limits = struct {
+    /// Maximum declared body size for a single HTTP request, in bytes. A
+    /// `Content-Length` (or end-of-chunked-decode) larger than this gets a
+    /// 413 response and the connection is closed. Defaults to 1 MiB; in
+    /// v0.13 the read buffer (16 KiB) is the practical hard ceiling
+    /// regardless of this value — request body streaming lifts that in a
+    /// later milestone.
+    max_request_body: usize = 1024 * 1024,
+    /// Maximum number of accepted connections held open at once. Beyond
+    /// this we accept the kernel's connection (we have to, to drain the
+    /// listen backlog) and immediately close it; client sees a TCP RST.
+    max_concurrent_connections: u32 = 1024,
+    /// Maximum number of HTTP requests served on a single keep-alive
+    /// connection before saltare forces `Connection: close`. Recycles
+    /// CPython's pymalloc arenas by amortising any per-request fragmentation
+    /// across many shorter-lived TCP connections.
+    max_keepalive_requests: u32 = 1000,
+};
+
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
 var g_should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
@@ -68,6 +90,14 @@ var g_should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 /// Set by `run()`. Connections look these up at every state transition to
 /// arm the appropriate timeout.
 var g_timeouts: Timeouts = .{};
+
+/// Set by `run()`. Caps checked at accept / parse / keep-alive reset.
+var g_limits: Limits = .{};
+
+/// Number of accepted connections currently alive (i.e. created but not
+/// yet destroyed). Atomic for paranoia even though the I/O loop is
+/// single-threaded — keeps the pattern uniform with `g_listen_fd`.
+var g_active_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 /// Set by `run` when TLS is enabled. Lives only for the duration of one
 /// `serve()` call. Each accepted connection wraps its fd with a fresh SSL
@@ -224,6 +254,12 @@ const Connection = struct {
     stalled_prev: ?*Connection,
     stalled: bool,
 
+    /// Number of HTTP requests fully served on this connection so far.
+    /// Compared against `g_limits.max_keepalive_requests` at the start of
+    /// each new request; once the cap is hit, `keep_alive` is forced false
+    /// to recycle the connection.
+    keepalive_request_count: u32,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -257,6 +293,7 @@ const Connection = struct {
             .stalled_next = null,
             .stalled_prev = null,
             .stalled = false,
+            .keepalive_request_count = 0,
         };
         return conn;
     }
@@ -279,6 +316,9 @@ const Connection = struct {
         if (self.read_buf) |b| self.pool.release(b);
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
         _ = c.close(self.fd);
+        // Pair with the increment in acceptAll. Subtract before destroying
+        // so `g_active_conns` reflects the soon-to-be-freed slot.
+        _ = g_active_conns.fetchSub(1, .seq_cst);
         self.allocator.destroy(self);
     }
 
@@ -304,11 +344,21 @@ const Connection = struct {
     }
 };
 
-pub fn run(host: []const u8, port: u16, tls_ctx: ?*tls.Ctx, timeouts: Timeouts) !void {
+pub fn run(
+    host: []const u8,
+    port: u16,
+    tls_ctx: ?*tls.Ctx,
+    timeouts: Timeouts,
+    limits: Limits,
+) !void {
     g_tls_ctx = tls_ctx;
     defer g_tls_ctx = null;
     g_timeouts = timeouts;
     defer g_timeouts = .{};
+    g_limits = limits;
+    defer g_limits = .{};
+    g_active_conns.store(0, .seq_cst);
+    defer g_active_conns.store(0, .seq_cst);
 
     const addr = try parseIpv4(host, port);
 
@@ -442,8 +492,20 @@ fn acceptAll(
         const client = accept4(listen_fd, null, null, c.SOCK_NONBLOCK | c.SOCK_CLOEXEC);
         if (client < 0) return; // EAGAIN: drained the backlog
 
+        // Bound the number of in-flight connections. We have to accept the
+        // socket to drain the kernel backlog, but if we're already at the
+        // configured cap we close it immediately — the client sees a
+        // server-side connection close (no orderly HTTP response, since
+        // we haven't read anything yet).
+        if (g_active_conns.load(.seq_cst) >= g_limits.max_concurrent_connections) {
+            _ = c.close(client);
+            continue;
+        }
+        _ = g_active_conns.fetchAdd(1, .seq_cst);
+
         const conn = Connection.create(allocator, p, client, wheel) catch {
             _ = c.close(client);
+            _ = g_active_conns.fetchSub(1, .seq_cst);
             continue;
         };
 
@@ -568,6 +630,32 @@ fn connWrite(conn: *Connection, buf: []const u8) struct { status: IoStatus, n: u
     return .{ .status = .ok, .n = @intCast(cret) };
 }
 
+/// Honour `Expect: 100-continue` by writing the interim response straight
+/// to the socket. Called between parse-success and body-wait. Synchronous —
+/// the 25-byte preamble effectively never returns EAGAIN on a fresh
+/// connection. Returns false on any I/O failure so the caller can tear
+/// the connection down.
+fn sendContinue(conn: *Connection) bool {
+    const preamble = "HTTP/1.1 100 Continue\r\n\r\n";
+    var written: usize = 0;
+    while (written < preamble.len) {
+        const r = connWrite(conn, preamble[written..]);
+        switch (r.status) {
+            .ok => written += r.n,
+            else => return false,
+        }
+    }
+    return true;
+}
+
+/// True iff the request advertised `Expect: 100-continue` (case-insensitive,
+/// surrounding whitespace tolerated). RFC 7231 §5.1.1.
+fn wantsExpectContinue(req: http.Request) bool {
+    const v = req.header("expect") orelse return false;
+    const trimmed = std.mem.trim(u8, v, " \t");
+    return std.ascii.eqlIgnoreCase(trimmed, "100-continue");
+}
+
 fn epollWantRead(loop: *eventloop.Loop, conn: *Connection) void {
     loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
         loop.remove(conn.fd);
@@ -639,8 +727,23 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                     conn.chunk_decoded = 0;
                 } else {
                     conn.body_len = req.content_length orelse 0;
+                    if (conn.body_len > g_limits.max_request_body) {
+                        sendStatus(loop, conn, 413, "Content Too Large");
+                        return;
+                    }
                     if (conn.body_offset + conn.body_len > data.len) {
                         sendStatus(loop, conn, 413, "Content Too Large");
+                        return;
+                    }
+                }
+                // Honour `Expect: 100-continue` by writing the interim
+                // response immediately so the client sends the body. We do
+                // this *after* the body-size cap check so we never invite
+                // the client to send a body we won't accept.
+                if (wantsExpectContinue(req)) {
+                    if (!sendContinue(conn)) {
+                        loop.remove(conn.fd);
+                        conn.destroy();
                         return;
                     }
                 }
@@ -670,9 +773,22 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                 &conn.chunk_consumed,
                 &conn.chunk_decoded,
             )) {
-                .needs_more => continue,
+                .needs_more => {
+                    // For chunked we can't know the final size up-front;
+                    // bound the in-progress decoded length against the cap
+                    // so a slow drip-stream can't exceed our budget.
+                    if (conn.chunk_decoded > g_limits.max_request_body) {
+                        sendStatus(loop, conn, 413, "Content Too Large");
+                        return;
+                    }
+                    continue;
+                },
                 .done => {
                     conn.body_len = conn.chunk_decoded;
+                    if (conn.body_len > g_limits.max_request_body) {
+                        sendStatus(loop, conn, 413, "Content Too Large");
+                        return;
+                    }
                     dispatch(loop, conn);
                     return;
                 },
@@ -701,7 +817,14 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
 
     const data = &conn.read_buf.?.data;
     const body = data[conn.body_offset .. conn.body_offset + conn.body_len];
-    const keep_alive = req.wantsKeepAlive();
+    var keep_alive = req.wantsKeepAlive();
+    // Recycle the connection once we've served `max_keepalive_requests` on
+    // it. Forces this response's `Connection: close` and bypasses the
+    // keep-alive reset path. Helps bound CPython arena fragmentation that
+    // accumulates over very long-lived connections.
+    if (conn.keepalive_request_count + 1 >= g_limits.max_keepalive_requests) {
+        keep_alive = false;
+    }
 
     // v0.12 narrows scope to fully-buffered request bodies → more_body=false.
     // Streaming requests will lift this constraint in a follow-up; the
@@ -1211,6 +1334,10 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
     // already popped the per-request state; clear our handle.
     conn.dispatch_handle = 0;
     conn.dispatch_active = false;
+    // One more request fully served on this connection. The cap is checked
+    // in dispatch() on the *next* request via `keepalive_request_count + 1
+    // >= max_keepalive_requests`, so we never reach this point past the cap.
+    conn.keepalive_request_count += 1;
     // Idle keep-alive deadline. If pipelined bytes are present we'll re-arm
     // to header_timeout / body_timeout below as soon as they're observed.
     conn.armTimer(g_timeouts.keep_alive_secs);
@@ -1262,18 +1389,38 @@ fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
                 &conn.chunk_consumed,
                 &conn.chunk_decoded,
             )) {
-                .needs_more => {}, // wait for more bytes
+                .needs_more => {
+                    if (conn.chunk_decoded > g_limits.max_request_body) {
+                        sendStatus(loop, conn, 413, "Content Too Large");
+                        return;
+                    }
+                },
                 .done => {
                     conn.body_len = conn.chunk_decoded;
+                    if (conn.body_len > g_limits.max_request_body) {
+                        sendStatus(loop, conn, 413, "Content Too Large");
+                        return;
+                    }
                     dispatch(loop, conn);
                 },
                 .invalid => sendStatus(loop, conn, 400, "Bad Request"),
             }
         } else {
             conn.body_len = req.content_length orelse 0;
+            if (conn.body_len > g_limits.max_request_body) {
+                sendStatus(loop, conn, 413, "Content Too Large");
+                return;
+            }
             if (conn.body_offset + conn.body_len > data.len) {
                 sendStatus(loop, conn, 413, "Content Too Large");
                 return;
+            }
+            if (wantsExpectContinue(req)) {
+                if (!sendContinue(conn)) {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                }
             }
             if (conn.read_total >= conn.body_offset + conn.body_len) {
                 dispatch(loop, conn);
