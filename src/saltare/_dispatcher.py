@@ -39,6 +39,8 @@ def _ensure_state() -> threading.local:
         _state.loop = asyncio.new_event_loop()
         _state.ws_states = {}
         _state.next_ws_handle = 1
+        _state.http_states = {}
+        _state.next_http_handle = 1
         _state.lifespan_task = None
         _state.lifespan_receive_queue = None
         _state.lifespan_send_queue = None
@@ -211,7 +213,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.11.0"
+_SERVER_HEADER = b"saltare/0.12.0"
 
 
 # ---------------------------------------------------------------------------
@@ -294,8 +296,15 @@ def _pump_once() -> None:
     """Process one batch of ready callbacks on the loop. We use the
     `_run_once` private method directly: it's the cheapest way to advance
     coroutines parked on a Future that we've just resolved (via Queue.put)
-    without the overhead of wrapping a marker coroutine in a Task."""
+    without the overhead of wrapping a marker coroutine in a Task.
+
+    A no-op `call_soon` is scheduled before each tick so `_run_once` sees
+    `_ready` as non-empty and uses `timeout=0` for its selector poll. Without
+    this, an app awaiting on `asyncio.sleep(N)` between sends would block
+    the entire I/O loop for N seconds inside the asyncio selector.
+    """
     loop = _ensure_loop()
+    loop.call_soon(_no_op)
     # Each WS event we process needs the loop to "see" itself as the
     # currently running loop, otherwise asyncio.get_running_loop() inside
     # any framework code (FastAPI, Starlette) raises.
@@ -304,6 +313,23 @@ def _pump_once() -> None:
         loop._run_once()
     finally:
         asyncio.events._set_running_loop(None)
+
+
+def _no_op() -> None:
+    pass
+
+
+def http_global_pump() -> None:
+    """One iteration of the asyncio loop. Advances every in-flight Task by
+    one step concurrently; cheaper than per-connection multi-pumping when
+    many requests are in flight (work is amortized across all of them).
+
+    Called by the Zig main loop once per iteration whenever the stalled
+    list is non-empty. The loop also calls this implicitly through
+    `http_dispatch_start` and `http_dispatch_push_body` for the
+    common-case fast path where a simple app completes in one tick.
+    """
+    _pump_once()
 
 
 def ws_open(
@@ -417,29 +443,236 @@ def ws_disconnect(handle: int, code: int) -> bytes:
     return ws_state.drain()
 
 
-def dispatch(
+# ---------------------------------------------------------------------------
+# HTTP streaming dispatch (v0.12).
+#
+# Each in-flight HTTP request is a long-lived asyncio.Task. The Zig core
+# pumps it via four entry points:
+#
+#   http_dispatch_start(app, ..., initial_body, more_body)
+#       Build the ASGI scope, create the Task, push the first request.
+#       chunk to its receive queue, pump the loop once. Return any wire
+#       bytes the app produced (typically status line + headers + first
+#       body chunk if the app responded synchronously).
+#
+#   http_dispatch_push_body(handle, body, more_body)
+#       More request-body bytes arrived. Push them into the Task's receive
+#       queue and pump. Return any newly-produced wire bytes.
+#
+#   http_dispatch_tick(handle)
+#       Drain remaining response chunks without pushing input. Used by Zig
+#       between socket-write events to pull more chunks the app may have
+#       produced after its last `await send()`.
+#
+#   http_dispatch_abort(handle)
+#       Connection went away mid-stream. Cancel the Task, clean up.
+#
+# Wire-format building lives entirely in Python: each `http.response.start`
+# stages headers; the first `http.response.body` decides Content-Length vs
+# Transfer-Encoding: chunked based on whether the app declared a length and
+# whether more body chunks are coming. Subsequent chunks are wrapped in
+# chunked-encoding frames if needed. Zig just writes raw bytes.
+
+
+def _encode_chunk(body: bytes) -> bytes:
+    """RFC 7230 chunked-encoding frame for a single non-empty chunk."""
+    return f"{len(body):x}\r\n".encode("ascii") + body + b"\r\n"
+
+
+class _HttpState:
+    __slots__ = (
+        "recv_queue",
+        "outgoing",
+        "task",
+        "status",
+        "out_headers",
+        "headers_sent",
+        "chunked",
+        "explicit_cl",
+        "ka",
+        "headers_done",
+        "body_done",
+    )
+
+    def __init__(
+        self,
+        app: Any,
+        scope: dict[str, Any],
+        initial_body: bytes,
+        more_body: bool,
+        keep_alive: bool,
+    ) -> None:
+        self.recv_queue: asyncio.Queue = asyncio.Queue()
+        # Wire bytes produced by the app, drained by the I/O loop.
+        self.outgoing: list[bytes] = []
+        # Filled in when http.response.start arrives.
+        self.status: int = 500
+        self.out_headers: list[tuple[bytes, bytes]] = []
+        self.headers_sent: bool = False
+        self.headers_done: bool = False
+        # True once a body chunk with more_body=False has been processed.
+        # _finalize_if_needed checks this to avoid emitting a duplicate
+        # chunked terminator when the app already sent its last chunk.
+        self.body_done: bool = False
+        # Decided when the first http.response.body is observed (we need to
+        # know if more chunks are coming to pick Content-Length vs chunked).
+        self.chunked: bool = False
+        self.explicit_cl: bool = False
+        self.ka: bool = bool(keep_alive)
+
+        async def receive() -> dict[str, Any]:
+            return await self.recv_queue.get()
+
+        async def send(message: dict[str, Any]) -> None:
+            mtype = message.get("type")
+            if mtype == "http.response.start":
+                if self.headers_done:
+                    return  # ASGI: ignore double-start
+                self.status = int(message.get("status", 500))
+                self.out_headers = list(message.get("headers", []))
+                self.explicit_cl = any(
+                    name.lower() == b"content-length"
+                    for name, _ in self.out_headers
+                )
+                self.headers_done = True
+            elif mtype == "http.response.body":
+                chunk = message.get("body", b"") or b""
+                more = bool(message.get("more_body", False))
+                if not self.headers_sent:
+                    if not self.headers_done:
+                        return  # ASGI violation; bail without crashing
+                    self._emit_headers(
+                        streaming=more,
+                        complete_body_len=None if more else len(chunk),
+                    )
+                    self.headers_sent = True
+                if chunk:
+                    if self.chunked:
+                        self.outgoing.append(_encode_chunk(chunk))
+                    else:
+                        self.outgoing.append(chunk)
+                if not more:
+                    if self.chunked:
+                        self.outgoing.append(b"0\r\n\r\n")
+                    self.body_done = True
+            # Ignored message types (http.response.trailers etc.) silently drop.
+
+        loop = _ensure_loop()
+        self.task: asyncio.Task = loop.create_task(app(scope, receive, send))
+        # Push the first http.request event; the app will see it on its
+        # first `await receive()`.
+        self.recv_queue.put_nowait(
+            {"type": "http.request", "body": initial_body, "more_body": more_body}
+        )
+
+    def _emit_headers(
+        self, streaming: bool, complete_body_len: int | None
+    ) -> None:
+        reason = _REASONS.get(self.status, "OK")
+        parts: list[bytes] = [
+            f"HTTP/1.1 {self.status} {reason}\r\n".encode("ascii"),
+            b"server: " + _SERVER_HEADER + b"\r\n",
+            b"connection: keep-alive\r\n" if self.ka else b"connection: close\r\n",
+        ]
+
+        if streaming:
+            if self.explicit_cl:
+                # App declared length: trust it and emit raw.
+                self.chunked = False
+            else:
+                # Streaming with no declared length → chunked encoding.
+                self.chunked = True
+        else:
+            # Single-shot (more_body=False on the first body chunk).
+            if not self.explicit_cl:
+                parts.append(
+                    f"content-length: {complete_body_len or 0}\r\n".encode("ascii")
+                )
+
+        for name, value in self.out_headers:
+            lname = name.lower()
+            # saltare owns Connection and (when chunked) Transfer-Encoding.
+            if lname == b"connection":
+                continue
+            if self.chunked and lname == b"transfer-encoding":
+                continue
+            parts.append(name + b": " + value + b"\r\n")
+
+        if self.chunked:
+            parts.append(b"transfer-encoding: chunked\r\n")
+
+        parts.append(b"\r\n")
+        self.outgoing.extend(parts)
+
+    def push_body(self, body: bytes, more_body: bool) -> None:
+        self.recv_queue.put_nowait(
+            {"type": "http.request", "body": body, "more_body": more_body}
+        )
+
+    def push_disconnect(self) -> None:
+        self.recv_queue.put_nowait({"type": "http.disconnect"})
+
+    def drain(self) -> bytes:
+        if not self.outgoing:
+            return b""
+        out = b"".join(self.outgoing)
+        self.outgoing.clear()
+        return out
+
+
+def _finalize_if_needed(handle: int, s: _HttpState) -> bytes:
+    """If the app finished without ever emitting headers/body, synthesize
+    a 500 so the wire is a valid HTTP response. Otherwise, if it sent
+    headers but never sent a final more_body=False, close out the chunked
+    stream. Returns extra wire bytes to append."""
+    extra = b""
+    if not s.headers_sent:
+        # App returned without responding at all → 500.
+        extra = _build_wire(
+            500,
+            [(b"content-type", b"text/plain; charset=utf-8")],
+            b"Internal Server Error\n",
+            keep_alive=False,
+        )
+    elif s.chunked and not s.body_done:
+        # App finished but didn't send the terminating empty chunk. RFC 7230
+        # requires `0\r\n\r\n` to delimit a chunked response.
+        extra = b"0\r\n\r\n"
+    return extra
+
+
+def http_dispatch_start(
     app: Any,
     method: str,
     raw_path: bytes,
     query_string: bytes,
     raw_headers: list[tuple[bytes, bytes]],
-    body: bytes,
+    initial_body: bytes,
+    more_body: int,
     server_host: str,
     server_port: int,
     keep_alive: int,
     scheme: str,
-) -> bytes:
-    """Run the ASGI app once. Returns the full HTTP/1.1 response as bytes."""
-    loop = _ensure_loop()
+) -> tuple[int, bytes, bool]:
+    """Begin a streaming dispatch. Returns (handle, initial_chunks, done).
+
+    handle:         opaque int Zig keeps for subsequent push_body / tick / abort calls.
+    initial_chunks: any wire bytes the app produced before suspending. For
+                    fast non-streaming apps this is the *full* response.
+    done:           True if the Task finished in this initial pump.
+    """
+    state_obj = _ensure_state()
 
     try:
         path = unquote_to_bytes(raw_path).decode("utf-8")
     except UnicodeDecodeError:
-        return _build_wire(400, [], b"path is not valid UTF-8\n", keep_alive=False)
+        return (
+            0,
+            _build_wire(400, [], b"path is not valid UTF-8\n", keep_alive=False),
+            True,
+        )
 
-    # ASGI requires lowercased header names.
     headers = [(name.lower(), value) for name, value in raw_headers]
-
     scope: dict[str, Any] = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.3"},
@@ -455,49 +688,130 @@ def dispatch(
         "root_path": "",
     }
 
-    request_consumed = False
-    responses: list[dict[str, Any]] = []
+    handle = state_obj.next_http_handle
+    state_obj.next_http_handle += 1
 
-    async def receive() -> dict[str, Any]:
-        nonlocal request_consumed
-        if request_consumed:
-            return {"type": "http.disconnect"}
-        request_consumed = True
-        return {
-            "type": "http.request",
-            "body": body,
-            "more_body": False,
-        }
-
-    async def send(message: dict[str, Any]) -> None:
-        responses.append(message)
+    s = _HttpState(app, scope, initial_body, bool(more_body), bool(keep_alive))
+    state_obj.http_states[handle] = s
 
     try:
-        loop.run_until_complete(app(scope, receive, send))
-    except Exception:
+        _pump_once()
+    except BaseException:
         traceback.print_exc(file=sys.stderr)
-        # Errors close the connection — parser/state is no longer trustworthy.
-        return _build_wire(
-            500,
-            [(b"content-type", b"text/plain; charset=utf-8")],
-            b"Internal Server Error\n",
-            keep_alive=False,
-        )
 
-    status = 500
-    out_headers: list[tuple[bytes, bytes]] = []
-    body_chunks: list[bytes] = []
-    for msg in responses:
-        msg_type = msg.get("type")
-        if msg_type == "http.response.start":
-            status = msg["status"]
-            out_headers = msg.get("headers", [])
-        elif msg_type == "http.response.body":
-            chunk = msg.get("body", b"")
-            if chunk:
-                body_chunks.append(chunk)
+    chunks = s.drain()
+    done = s.task.done()
 
-    return _build_wire(status, out_headers, b"".join(body_chunks), keep_alive=bool(keep_alive))
+    if done:
+        # Surface any task exception so it isn't silently swallowed.
+        if not s.task.cancelled():
+            exc = s.task.exception()
+            if exc is not None:
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+                # If we never emitted a response, give the client a 500.
+                if not s.headers_sent:
+                    chunks = chunks + _build_wire(
+                        500,
+                        [(b"content-type", b"text/plain; charset=utf-8")],
+                        b"Internal Server Error\n",
+                        keep_alive=False,
+                    )
+                    state_obj.http_states.pop(handle, None)
+                    return (handle, chunks, True)
+        chunks += _finalize_if_needed(handle, s)
+        state_obj.http_states.pop(handle, None)
+
+    return (handle, chunks, done)
+
+
+def http_dispatch_push_body(
+    handle: int, body: bytes, more_body: int
+) -> tuple[bytes, bool]:
+    """Push more request-body bytes into the running Task. Pumps once and
+    returns (chunks, done)."""
+    state_obj = _ensure_state()
+    s = state_obj.http_states.get(handle)
+    if s is None or s.task.done():
+        return (b"", True)
+
+    s.push_body(body, bool(more_body))
+
+    try:
+        _pump_once()
+    except BaseException:
+        traceback.print_exc(file=sys.stderr)
+
+    chunks = s.drain()
+    done = s.task.done()
+
+    if done:
+        if not s.task.cancelled():
+            exc = s.task.exception()
+            if exc is not None:
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        chunks += _finalize_if_needed(handle, s)
+        state_obj.http_states.pop(handle, None)
+
+    return (chunks, done)
+
+
+def http_dispatch_drain(handle: int) -> tuple[bytes, bool]:
+    """Return any wire bytes the request's Task has emitted since the last
+    drain, *without* pumping the asyncio loop. Used by the Zig server loop
+    after a global pump to harvest output from each stalled connection
+    without paying the per-connection pump cost.
+
+    Returns (chunks, done). When `done`, the handle is freed.
+    """
+    state_obj = _ensure_state()
+    s = state_obj.http_states.get(handle)
+    if s is None or s.task.done():
+        # Either never existed (stale handle) or already finished. If
+        # finished but state still around (race), drain it now.
+        if s is not None and s.task.done():
+            chunks = s.drain()
+            if not s.task.cancelled():
+                exc = s.task.exception()
+                if exc is not None:
+                    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+            chunks += _finalize_if_needed(handle, s)
+            state_obj.http_states.pop(handle, None)
+            return (chunks, True)
+        return (b"", True)
+
+    chunks = s.drain()
+    done = s.task.done()
+
+    if done:
+        if not s.task.cancelled():
+            exc = s.task.exception()
+            if exc is not None:
+                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+        chunks += _finalize_if_needed(handle, s)
+        state_obj.http_states.pop(handle, None)
+
+    return (chunks, done)
+
+
+def http_dispatch_abort(handle: int) -> None:
+    """Connection went away mid-stream. Cancel the Task and free state."""
+    state_obj = _ensure_state()
+    s = state_obj.http_states.pop(handle, None)
+    if s is None:
+        return
+
+    if not s.task.done():
+        s.push_disconnect()
+        try:
+            _pump_once()
+        except BaseException:
+            pass
+    if not s.task.done():
+        s.task.cancel()
+        try:
+            _pump_once()
+        except BaseException:
+            pass
 
 
 def _build_wire(
@@ -507,6 +821,9 @@ def _build_wire(
     *,
     keep_alive: bool,
 ) -> bytes:
+    """Build a single-shot HTTP/1.1 response. Used for synthesized error
+    responses (saltare-emitted 4xx/5xx); the streaming dispatcher emits
+    its own wire bytes incrementally."""
     reason = _REASONS.get(status, "OK")
     parts: list[bytes] = [f"HTTP/1.1 {status} {reason}\r\n".encode("ascii")]
     parts.append(b"server: " + _SERVER_HEADER + b"\r\n")
@@ -514,7 +831,6 @@ def _build_wire(
 
     has_content_length = False
     for name, value in headers:
-        # Strip any Connection header from the app — saltare owns that decision.
         if name.lower() == b"connection":
             continue
         if name.lower() == b"content-length":

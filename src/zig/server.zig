@@ -40,7 +40,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.11.0";
+const SERVER_HEADER = "saltare/0.12.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -73,6 +73,34 @@ var g_timeouts: Timeouts = .{};
 /// `serve()` call. Each accepted connection wraps its fd with a fresh SSL
 /// derived from this context.
 var g_tls_ctx: ?*tls.Ctx = null;
+
+/// Head of the doubly-linked list of stalled connections. A connection is
+/// stalled when its in-flight HTTP dispatch's Task is parked on something
+/// not driven by socket I/O (typically: framework setup chains spanning
+/// multiple awaits). Reset to null by `run()`.
+var g_stalled_head: ?*Connection = null;
+
+fn linkStalled(conn: *Connection) void {
+    if (conn.stalled) return;
+    conn.stalled = true;
+    conn.stalled_prev = null;
+    conn.stalled_next = g_stalled_head;
+    if (g_stalled_head) |h| h.stalled_prev = conn;
+    g_stalled_head = conn;
+}
+
+fn unlinkStalled(conn: *Connection) void {
+    if (!conn.stalled) return;
+    if (conn.stalled_prev) |p| {
+        p.stalled_next = conn.stalled_next;
+    } else {
+        g_stalled_head = conn.stalled_next;
+    }
+    if (conn.stalled_next) |n| n.stalled_prev = conn.stalled_prev;
+    conn.stalled = false;
+    conn.stalled_next = null;
+    conn.stalled_prev = null;
+}
 
 // Sentinel pointer used as `event.data.ptr` for the listening socket so the
 // event loop can tell it apart from connection events without a hashmap.
@@ -179,6 +207,21 @@ const Connection = struct {
     /// without needing the wheel passed through every call site.
     wheel: *timer.Wheel,
 
+    /// Opaque handle into Python's `_dispatcher.http_states` for the
+    /// in-flight request. Zero between requests.
+    dispatch_handle: c_long,
+    /// True while the asyncio Task driving the request is alive. Cleared
+    /// when the Task completes or the connection is torn down.
+    dispatch_active: bool,
+    /// Linked-list pointers for the global "stalled" list of connections
+    /// whose Task is parked waiting on something that's not socket I/O
+    /// (typically: still chaining through framework setup awaits). The
+    /// main loop walks this list after each `loop.wait` and runs one
+    /// global asyncio pump to advance every stalled Task in lockstep.
+    stalled_next: ?*Connection,
+    stalled_prev: ?*Connection,
+    stalled: bool,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -208,6 +251,11 @@ const Connection = struct {
             .ws_handle = 0,
             .timer_node = .{ .next = null, .prev = null, .bucket = 0, .armed = false },
             .wheel = wheel,
+            .dispatch_handle = 0,
+            .dispatch_active = false,
+            .stalled_next = null,
+            .stalled_prev = null,
+            .stalled = false,
         };
         return conn;
     }
@@ -218,6 +266,14 @@ const Connection = struct {
         // here — destroy is called from many paths (including non-WS)
         // and forcing a GIL acquisition was a footgun in tests.
         self.wheel.cancel(&self.timer_node);
+        unlinkStalled(self);
+        if (self.dispatch_active and self.dispatch_handle != 0) {
+            // Re-acquires the GIL; cancels the asyncio Task and frees the
+            // per-request state on the Python side.
+            bridge.httpDispatchAbort(self.dispatch_handle);
+            self.dispatch_active = false;
+            self.dispatch_handle = 0;
+        }
         if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b);
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
@@ -298,7 +354,12 @@ pub fn run(host: []const u8, port: u16, tls_ctx: ?*tls.Ctx, timeouts: Timeouts) 
     const tick_ctx = TickCtx{ .loop = &loop };
 
     while (!g_should_stop.load(.seq_cst)) {
-        const events = loop.wait(100); // 100 ms poll → bounds shutdown latency
+        // When connections are parked on framework setup chains we need to
+        // drive the asyncio loop forward without sleeping for the full
+        // 100 ms poll budget — otherwise a stalled batch of FastAPI
+        // requests would each take 100 ms per await to unblock.
+        const wait_timeout: c_int = if (g_stalled_head != null) 0 else 100;
+        const events = loop.wait(wait_timeout);
         for (events) |ev| {
             if (g_should_stop.load(.seq_cst)) break;
             if (isListenerEvent(ev.data)) {
@@ -312,9 +373,46 @@ pub fn run(host: []const u8, port: u16, tls_ctx: ?*tls.Ctx, timeouts: Timeouts) 
         // case lag past a 1 s deadline is one bucket; granularity of all
         // four configurable timeouts is therefore ±1 s.
         wheel.tick(wheel.nowSec(), tick_ctx, fireExpired);
+
+        // Drive any stalled HTTP dispatches forward. One global asyncio
+        // pump advances every parked Task by one step; we then walk the
+        // stalled list and harvest each one's output. Connections that
+        // got chunks transition back to .writing; those still parked
+        // re-link themselves on the next stall path.
+        if (g_stalled_head != null) drainStalled(&loop);
     }
 
+    g_stalled_head = null;
     _ = c.close(listen_fd);
+}
+
+fn drainStalled(loop: *eventloop.Loop) void {
+    bridge.httpGlobalPump();
+
+    // Snapshot the head — connections may unlink themselves as we iterate
+    // (transition back to .writing or get destroyed by an error path).
+    var node = g_stalled_head;
+    while (node) |conn| {
+        const next = conn.stalled_next;
+        unlinkStalled(conn);
+        // The Task may have produced wire bytes; harvest them. If it's
+        // still parked, doWrite's stall path will re-link us.
+        if (conn.dispatch_active and conn.dispatch_handle != 0) {
+            // Switch back to WANT_WRITE; doWrite will drain + try writing.
+            // If there's nothing to write yet and the Task is still
+            // parked, doWrite re-stalls (re-links + flips back to
+            // WANT_READ).
+            conn.state = .writing;
+            loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                node = next;
+                continue;
+            };
+            doWrite(loop, conn);
+        }
+        node = next;
+    }
 }
 
 const TickCtx = struct { loop: *eventloop.Loop };
@@ -604,15 +702,33 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     const body = data[conn.body_offset .. conn.body_offset + conn.body_len];
     const keep_alive = req.wantsKeepAlive();
 
-    const response = bridge.dispatch(req, body, keep_alive, conn.allocator) orelse {
+    // v0.12 narrows scope to fully-buffered request bodies → more_body=false.
+    // Streaming requests will lift this constraint in a follow-up; the
+    // bridge already accepts the more_body flag.
+    const start = bridge.httpDispatchStart(req, body, false, keep_alive, conn.allocator) orelse {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
     };
 
-    conn.write_buf = response;
-    conn.write_pos = 0;
-    conn.state = .writing;
+    conn.dispatch_handle = start.handle;
+    conn.dispatch_active = !start.done;
     conn.keep_alive = keep_alive;
+
+    if (start.chunks.len == 0 and start.done) {
+        // App returned without producing wire bytes. Python should have
+        // synthesized a 500 (chunks empty would be a bug there). Close.
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    }
+
+    if (start.chunks.len > 0) {
+        if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+        conn.write_buf = start.chunks;
+        conn.write_pos = 0;
+    }
+
+    conn.state = .writing;
     conn.armTimer(g_timeouts.write_secs);
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
@@ -711,32 +827,84 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
-    while (conn.write_pos < conn.write_buf.len) {
-        const remaining = conn.write_buf[conn.write_pos..];
-        const r = connWrite(conn, remaining);
-        switch (r.status) {
-            .ok => conn.write_pos += r.n,
-            .would_block, .want_write => {
-                if (conn.ssl != null) epollWantWrite(loop, conn);
-                return;
-            },
-            .want_read => {
-                epollWantRead(loop, conn);
-                return;
-            },
-            .closed, .fatal => {
-                loop.remove(conn.fd);
-                conn.destroy();
-                return;
-            },
+    while (true) {
+        // Drain whatever's currently in write_buf.
+        while (conn.write_pos < conn.write_buf.len) {
+            const remaining = conn.write_buf[conn.write_pos..];
+            const r = connWrite(conn, remaining);
+            switch (r.status) {
+                .ok => conn.write_pos += r.n,
+                .would_block, .want_write => {
+                    if (conn.ssl != null) epollWantWrite(loop, conn);
+                    return;
+                },
+                .want_read => {
+                    epollWantRead(loop, conn);
+                    return;
+                },
+                .closed, .fatal => {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                },
+            }
         }
-    }
 
-    if (conn.protocol == .websocket) {
-        wsAfterWrite(loop, conn);
+        if (conn.protocol == .websocket) {
+            wsAfterWrite(loop, conn);
+            return;
+        }
+
+        // HTTP path: if a streaming dispatch is still active, pull the next
+        // batch of wire bytes the app produced. Loops until the Task either
+        // hands us new chunks (and we keep writing), declares itself done
+        // (and we move on to keep-alive / close), or stalls (no chunks, not
+        // done — kept in .writing state, level-triggered EPOLLOUT will wake
+        // us back into doWrite when the kernel sees the socket writable).
+        if (!conn.dispatch_active) break;
+
+        if (conn.write_buf.len > 0) {
+            conn.allocator.free(conn.write_buf);
+            conn.write_buf = &.{};
+        }
+        conn.write_pos = 0;
+
+        // Drain only — the global pump in the main loop is responsible for
+        // advancing the asyncio Task. If chunks have been emitted since the
+        // last drain, write them.
+        const tick = bridge.httpDispatchDrain(conn.dispatch_handle, conn.allocator) orelse {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
+
+        if (tick.chunks.len > 0) {
+            conn.write_buf = tick.chunks;
+            conn.write_pos = 0;
+            conn.dispatch_active = !tick.done;
+            continue;
+        }
+
+        if (tick.done) {
+            conn.dispatch_active = false;
+            conn.dispatch_handle = 0;
+            break;
+        }
+
+        // No chunks, not done: Task is parked on something not driven by
+        // socket I/O. Park the connection on the global stalled list and
+        // switch off WANT_WRITE so the kernel doesn't fire EPOLLOUT in a
+        // tight loop. The main loop's per-iteration global pump will
+        // advance the Task; subsequent drains here will harvest its output.
+        linkStalled(conn);
+        loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+            loop.remove(conn.fd);
+            conn.destroy();
+        };
         return;
     }
 
+    // write_buf fully drained AND dispatch is no longer active.
     if (conn.keep_alive) {
         keepAliveReset(loop, conn);
     } else {
@@ -1032,6 +1200,11 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_pos = 0;
     conn.state = .reading;
     conn.keep_alive = false;
+    // Streaming dispatch is finished by the time we reach keepAliveReset
+    // (doWrite only falls through here once tick.done is true). Python has
+    // already popped the per-request state; clear our handle.
+    conn.dispatch_handle = 0;
+    conn.dispatch_active = false;
     // Idle keep-alive deadline. If pipelined bytes are present we'll re-arm
     // to header_timeout / body_timeout below as soon as they're observed.
     conn.armTimer(g_timeouts.keep_alive_secs);

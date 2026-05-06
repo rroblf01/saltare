@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: pre-alpha (v0.11.0).** HTTP/1.1 (with chunked encoding, keep-alive, pipelining), ASGI lifespan, TLS termination, WebSockets, and per-connection idle timeouts are all in. Production-readiness gaps remaining for v1.0: write-buffer caps, streaming response bodies, multi-worker.
+> **Status: pre-alpha (v0.12.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, idle timeouts, and **streaming response bodies** are all in. Apps that emit `more_body=True` chunks now stream through the bridge instead of buffering in Python; auto-chunked encoding is added when no Content-Length is declared. Production-readiness gaps remaining for v1.0: resource caps (max body, max conns), graceful shutdown, observability, multi-worker.
 
 ---
 
@@ -48,38 +48,39 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.11.0:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.12.0:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.74 MiB |      45.74 MiB | 45.74 MiB |    1000 | 2599 |
-| uvicorn | 44.84 MiB |      44.88 MiB | 44.88 MiB |    1000 | 2901 |
+| saltare | 45.56 MiB |      45.70 MiB | 45.71 MiB |    1000 | 2286 |
+| uvicorn | 45.00 MiB |      45.04 MiB | 45.04 MiB |    1000 | 2878 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.74 MiB |      41.79 MiB | 41.79 MiB |    2000 | 3871 |
-| uvicorn | 44.84 MiB |      45.28 MiB | 45.28 MiB |    2000 | 3983 |
+| saltare | 41.74 MiB |      42.04 MiB | 42.05 MiB |    2000 | 3810 |
+| uvicorn | 44.99 MiB |      45.46 MiB | 45.46 MiB |    2000 | 3954 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 41.91 MiB |      42.89 MiB | 42.89 MiB |     500 | 3584      |
-| uvicorn | 44.84 MiB |      50.22 MiB | 50.22 MiB |     500 | 2885      |
+| saltare | 42.04 MiB |      43.13 MiB | 43.13 MiB |     500 | 2190      |
+| uvicorn | 44.99 MiB |      50.37 MiB | 50.37 MiB |     500 | 2772      |
 
 **Read this honestly:**
 
-- The **idle keep-alive workload is where saltare's architectural advantage becomes visible**: 500 idle connections cost saltare **+0.98 MiB** (~2 KiB/conn) vs uvicorn's **+5.38 MiB** (~11 KiB/conn). That's a **~5.5× per-connection memory saving** in a realistic workload (clients that hold connections open between bursts of activity).
+- The **idle keep-alive workload is where saltare's architectural advantage becomes visible**: 500 idle connections cost saltare **+1.09 MiB** (~2 KiB/conn) vs uvicorn's **+5.38 MiB** (~11 KiB/conn). That's still a **~5× per-connection memory saving** for a realistic workload (clients that hold connections open between bursts of activity).
 - The reason: saltare's `pool.zig` returns the 16 KiB read buffer to a shared free list as soon as a keep-alive connection goes idle. uvicorn's asyncio Transport keeps its per-connection buffers and Protocol/Task state alive for the lifetime of the socket.
-- **Throughput parity (concurrent):** saltare 3871 rps vs uvicorn 3983 rps — within ~3%. The remaining gap is primarily `httptools` (uvicorn's tuned C parser) vs the Zig parser; both are fast.
-- **v0.11 timer wheel cost is invisible at this scale.** Adding per-connection idle / header / body / write timeouts (4 deadlines, intrusive doubly-linked-list nodes, embedded in `Connection`) added 32 B per conn and ~1 KiB for the wheel itself. At 500 idle conns that's ~17 KiB, well below RSS measurement noise.
+- **Throughput parity (concurrent):** saltare 3810 rps vs uvicorn 3954 rps — within ~4%. The remaining gap is primarily `httptools` (uvicorn's tuned C parser) and uvicorn's tighter asyncio integration vs the bridge-driven dispatch.
+- **v0.12 streaming dispatch cost a few percent on sequential.** Every HTTP request now runs as a long-lived asyncio Task with a per-request `recv_queue` and `outgoing` list — that's the price of supporting `more_body=True` and auto-chunked output. Sequential RPS dropped from ~2599 (v0.11) to 2286 (v0.12); concurrent and idle-keepalive workloads were largely unaffected because they were already gated by other costs.
+- The new architecture pays off as soon as response sizes go up: a streaming endpoint that emits 10 MiB across 100 chunks now keeps RSS flat instead of buffering the whole 10 MiB in Python `bytes` before flushing — a saving the bench harness above doesn't measure (its FastAPI app returns ~30 bytes).
 - The ~42 MiB floor is Python + FastAPI itself. No userland server can shrink that without changing what the user app loads. Python 3.14 raises this floor a few MiB versus 3.12 because 3.14 imports more stdlib eagerly.
 
-**Where saltare's architectural win shows up most:** long-lived idle connections (the WebSocket and keep-alive workloads above) and very high concurrency (10k+ open sockets). The sequential workload runs short-lived requests; per-connection allocations are barely visible because connections live for milliseconds. Expect the gap to widen further once streaming response bodies (v0.14) keep large responses out of Python's heap.
+**Where saltare's architectural win shows up most:** long-lived idle connections (the WebSocket and keep-alive workloads above), very high concurrency (10k+ open sockets), and now **large streamed responses** (file downloads, SSE, JSON over MB).
 
 ## Roadmap
 
@@ -94,11 +95,12 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.9.0** — TLS termination via OpenSSL. Pass `ssl_certfile=` and `ssl_keyfile=` to `saltare.run()` to serve HTTPS. The connection state machine gains a `handshaking` phase; `doRead`/`doWrite` route through SSL_read/SSL_write and translate WANT_READ/WANT_WRITE into epoll interest changes. SSL_pending drained between keep-alive cycles. `auditwheel` bundles libssl/libcrypto into the wheel — self-contained, no host OpenSSL dependency. Single-cert/single-key, server-only (no mTLS, no SNI, no ALPN).
 - [x] **v0.10.0** — WebSockets. RFC 6455 handshake, single-frame text/binary messages, ping auto-pong, close echo. Frames unmasked in place over the existing 16 KiB read buffer; outbound frames concatenated onto the same `write_buf` that HTTP responses use. Out of scope: continuation frames, message-level fragmentation, per-message deflate.
 - [x] **v0.11.0** — Per-connection idle timeouts via a hashed timer wheel (`src/zig/timer.zig`). Four configurable deadlines (`header_timeout`, `keep_alive_timeout`, `body_timeout`, `write_timeout`) with defaults of 5/5/30/30 seconds. Slowloris and slow-body attacks are now reaped instead of holding `Connection` structs indefinitely. Wheel uses 128 buckets of 1 second; nodes are intrusive in `Connection` (24 B / conn) so arming and cancelling are allocation-free O(1). WS connections are exempt — long-lived idle sockets are expected there; ping/pong-driven WS keepalive lands post-v0.11.
-- [ ] **v0.12.0** — Caps configurable (max body, max concurrent connections, max keepalive_requests) + 413/431 + `Expect: 100-continue`.
-- [ ] **v0.13.0** — Graceful shutdown with in-flight drain on SIGTERM.
-- [ ] **v0.14.0** — Streaming response bodies (true chunked output): callback path Python → Zig.
+- [x] **v0.12.0** — Streaming response bodies. Each HTTP request runs as a long-lived asyncio Task with its own `recv_queue` and `outgoing` list; the app's `send({type: "http.response.body", more_body: True/False})` calls flow chunk-by-chunk through the bridge into Zig's `write_buf` instead of being buffered into a single Python `bytes`. When the app does not declare a Content-Length, saltare adds `Transfer-Encoding: chunked` automatically. Concurrency uses a global "stalled list" of connections whose Task is parked on framework-internal awaits (e.g. FastAPI middleware chains): the main loop runs one global asyncio pump per iteration to advance every parked Task in lockstep, then drains each one — no per-connection multi-pumping, no level-triggered EPOLLOUT spin. Request bodies are still capped to the 16 KiB read buffer (request-side streaming lands in v0.12.x).
+- [ ] **v0.13.0** — Caps configurable (max body, max concurrent connections, max keepalive_requests, max write buffer) + 413/431 + `Expect: 100-continue`.
+- [ ] **v0.14.0** — Graceful shutdown with in-flight drain on SIGTERM + robust ASGI exception isolation.
 - [ ] **v0.15.0** — Metrics endpoint + access log opt-in + proxy headers + Unix domain sockets.
-- [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`).
+- [ ] **v0.16.0** — RAM polish: `malloc_trim` after lifespan startup, adaptive read buffer, `MADV_DONTNEED` on idle pool buffers.
+- [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`) + production deployment guide.
 
 ## Install (once published)
 
@@ -136,6 +138,22 @@ saltare.run(app, host="0.0.0.0", port=443,
 ```
 
 Both per-request HTTP dispatch and ASGI lifespan startup/shutdown are wired up: `FastAPI(lifespan=...)` and the older `@app.on_event("startup")` work as expected.
+
+### Streaming responses
+
+Apps can emit response bodies in chunks via the standard ASGI `more_body` flag — saltare flushes each chunk to the wire as soon as the app produces it instead of buffering the full response in Python:
+
+```python
+async def streaming_endpoint(scope, receive, send):
+    await receive()
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"text/plain")]})
+    for chunk in produce_chunks():        # arbitrary length, no upfront size needed
+        await send({"type": "http.response.body", "body": chunk, "more_body": True})
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+```
+
+When the app does not declare a `Content-Length`, saltare adds `Transfer-Encoding: chunked` automatically. Apps that do declare a `Content-Length` get raw bytes streamed (no chunked framing). FastAPI's `StreamingResponse` and Starlette's SSE helpers both work without changes.
 
 ### Idle timeouts
 

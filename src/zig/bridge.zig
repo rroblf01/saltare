@@ -27,7 +27,11 @@ pub const py = @cImport({
 // DECREF references that another running daemon is still using and
 // trigger use-after-free segfaults during cleanup.
 threadlocal var g_app: ?*py.PyObject = null;
-threadlocal var g_dispatch: ?*py.PyObject = null;
+threadlocal var g_http_start: ?*py.PyObject = null;
+threadlocal var g_http_push: ?*py.PyObject = null;
+threadlocal var g_http_drain: ?*py.PyObject = null;
+threadlocal var g_http_pump: ?*py.PyObject = null;
+threadlocal var g_http_abort: ?*py.PyObject = null;
 threadlocal var g_lifespan_startup: ?*py.PyObject = null;
 threadlocal var g_lifespan_shutdown: ?*py.PyObject = null;
 threadlocal var g_ws_open: ?*py.PyObject = null;
@@ -56,7 +60,11 @@ pub fn init(
     const mod = py.PyImport_ImportModule("saltare._dispatcher") orelse return false;
     defer py.Py_DecRef(mod);
 
-    g_dispatch = py.PyObject_GetAttrString(mod, "dispatch") orelse return false;
+    g_http_start = py.PyObject_GetAttrString(mod, "http_dispatch_start") orelse return false;
+    g_http_push = py.PyObject_GetAttrString(mod, "http_dispatch_push_body") orelse return false;
+    g_http_drain = py.PyObject_GetAttrString(mod, "http_dispatch_drain") orelse return false;
+    g_http_pump = py.PyObject_GetAttrString(mod, "http_global_pump") orelse return false;
+    g_http_abort = py.PyObject_GetAttrString(mod, "http_dispatch_abort") orelse return false;
     g_lifespan_startup = py.PyObject_GetAttrString(mod, "lifespan_startup") orelse return false;
     g_lifespan_shutdown = py.PyObject_GetAttrString(mod, "lifespan_shutdown") orelse return false;
     g_ws_open = py.PyObject_GetAttrString(mod, "ws_open") orelse return false;
@@ -82,9 +90,25 @@ pub fn init(
 
 /// Caller (module.zig) must hold the GIL.
 pub fn shutdown() void {
-    if (g_dispatch) |d| {
+    if (g_http_start) |s| {
+        py.Py_DecRef(s);
+        g_http_start = null;
+    }
+    if (g_http_push) |p| {
+        py.Py_DecRef(p);
+        g_http_push = null;
+    }
+    if (g_http_drain) |d| {
         py.Py_DecRef(d);
-        g_dispatch = null;
+        g_http_drain = null;
+    }
+    if (g_http_pump) |p| {
+        py.Py_DecRef(p);
+        g_http_pump = null;
+    }
+    if (g_http_abort) |a| {
+        py.Py_DecRef(a);
+        g_http_abort = null;
     }
     if (g_lifespan_startup) |s| {
         py.Py_DecRef(s);
@@ -142,39 +166,39 @@ pub fn lifespanShutdown() void {
     py.Py_DecRef(result);
 }
 
-/// Run one ASGI dispatch and return the wire response as a freshly allocated
-/// buffer. Returns `null` on failure (Python exception was printed to stderr).
-/// Caller (server.zig) must NOT hold the GIL — we re-acquire it here.
-pub fn dispatch(
+// ---------------------------------------------------------------------------
+// HTTP streaming dispatch (v0.12). Each request is driven by an asyncio.Task
+// in Python that we pump through these four entry points. The Python side
+// owns wire-format building (status line, headers, chunked framing); Zig
+// just shovels raw bytes between sockets and the bridge.
+
+pub const HttpStart = struct {
+    /// Opaque handle Python uses to look up the per-request state. Pass
+    /// back to push_body / tick / abort. Zero is "never started".
+    handle: c_long,
+    /// Owned by allocator; caller must free. Empty slice if no chunks yet.
+    chunks: []u8,
+    /// True if the Task finished synchronously in this initial pump. For
+    /// fast non-streaming apps this is the common case.
+    done: bool,
+};
+
+pub const HttpTick = struct {
+    chunks: []u8,
+    done: bool,
+};
+
+/// Caller (server.zig) does NOT hold the GIL. We re-acquire here.
+pub fn httpDispatchStart(
     req: http.Request,
-    body: []const u8,
+    initial_body: []const u8,
+    more_body: bool,
     keep_alive: bool,
     allocator: std.mem.Allocator,
-) ?[]u8 {
+) ?HttpStart {
     const gstate = py.PyGILState_Ensure();
     defer py.PyGILState_Release(gstate);
 
-    const result = callDispatch(req, body, keep_alive) orelse {
-        py.PyErr_Print();
-        return null;
-    };
-    defer py.Py_DecRef(result);
-
-    var resp_ptr: [*c]u8 = undefined;
-    var resp_len: py.Py_ssize_t = 0;
-    if (py.PyBytes_AsStringAndSize(result, @ptrCast(&resp_ptr), &resp_len) != 0) {
-        py.PyErr_Clear();
-        return null;
-    }
-
-    const len: usize = @intCast(resp_len);
-    const buf = allocator.alloc(u8, len) catch return null;
-    @memcpy(buf, resp_ptr[0..len]);
-    return buf;
-}
-
-fn callDispatch(req: http.Request, body: []const u8, keep_alive: bool) ?*py.PyObject {
-    // Split the request-target into raw_path and query_string at the first '?'.
     const q_idx = std.mem.indexOfScalar(u8, req.target, '?');
     const raw_path = if (q_idx) |i| req.target[0..i] else req.target;
     const query = if (q_idx) |i| req.target[i + 1 ..] else "";
@@ -182,10 +206,11 @@ fn callDispatch(req: http.Request, body: []const u8, keep_alive: bool) ?*py.PyOb
     const headers_obj = buildHeadersList(req.headers) orelse return null;
     defer py.Py_DecRef(headers_obj);
 
-    // Args: (app, method, raw_path, query, headers, body, host, port, keep_alive, scheme)
-    return py.PyObject_CallFunction(
-        g_dispatch.?,
-        "Os#y#y#Oy#OiiO",
+    // Args: (app, method, raw_path, query, headers, initial_body,
+    //        more_body, host, port, keep_alive, scheme)
+    const result = py.PyObject_CallFunction(
+        g_http_start.?,
+        "Os#y#y#Oy#iOiiO",
         g_app.?,
         @as([*c]const u8, @ptrCast(req.method.ptr)),
         @as(py.Py_ssize_t, @intCast(req.method.len)),
@@ -194,13 +219,115 @@ fn callDispatch(req: http.Request, body: []const u8, keep_alive: bool) ?*py.PyOb
         @as([*c]const u8, @ptrCast(query.ptr)),
         @as(py.Py_ssize_t, @intCast(query.len)),
         headers_obj,
-        @as([*c]const u8, @ptrCast(body.ptr)),
-        @as(py.Py_ssize_t, @intCast(body.len)),
+        @as([*c]const u8, @ptrCast(initial_body.ptr)),
+        @as(py.Py_ssize_t, @intCast(initial_body.len)),
+        @as(c_int, if (more_body) 1 else 0),
         g_server_host.?,
         g_server_port,
         @as(c_int, if (keep_alive) 1 else 0),
         g_scheme.?,
-    );
+    ) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractHttpStart(result, allocator);
+}
+
+pub fn httpDispatchPushBody(
+    handle: c_long,
+    body: []const u8,
+    more_body: bool,
+    allocator: std.mem.Allocator,
+) ?HttpTick {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(
+        g_http_push.?,
+        "ly#i",
+        handle,
+        @as([*c]const u8, @ptrCast(body.ptr)),
+        @as(py.Py_ssize_t, @intCast(body.len)),
+        @as(c_int, if (more_body) 1 else 0),
+    ) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractHttpTick(result, allocator);
+}
+
+/// Drain wire bytes the request's Task has emitted *without* pumping the
+/// asyncio loop. Use this after `httpGlobalPump` has advanced every Task in
+/// flight by one step — it harvests the per-connection output without
+/// paying the per-handle pump cost N times.
+pub fn httpDispatchDrain(handle: c_long, allocator: std.mem.Allocator) ?HttpTick {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(g_http_drain.?, "l", handle) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractHttpTick(result, allocator);
+}
+
+/// Run one iteration of the asyncio loop, advancing every in-flight Task by
+/// one step. The Zig main loop calls this once per iteration whenever the
+/// stalled list is non-empty; per-Task work is then done by `httpDispatchDrain`.
+pub fn httpGlobalPump() void {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallNoArgs(g_http_pump.?) orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    py.Py_DecRef(result);
+}
+
+pub fn httpDispatchAbort(handle: c_long) void {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(g_http_abort.?, "l", handle) orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    py.Py_DecRef(result);
+}
+
+fn extractHttpStart(result: *py.PyObject, allocator: std.mem.Allocator) ?HttpStart {
+    if (py.PyTuple_Size(result) != 3) return null;
+
+    const handle_obj = py.PyTuple_GetItem(result, 0);
+    const chunks_obj = py.PyTuple_GetItem(result, 1);
+    const done_obj = py.PyTuple_GetItem(result, 2);
+    if (handle_obj == null or chunks_obj == null or done_obj == null) return null;
+
+    const handle = py.PyLong_AsLong(handle_obj);
+    const done = py.PyObject_IsTrue(done_obj) == 1;
+    const chunks = copyBytes(chunks_obj.?, allocator) orelse return null;
+
+    return .{ .handle = handle, .chunks = chunks, .done = done };
+}
+
+fn extractHttpTick(result: *py.PyObject, allocator: std.mem.Allocator) ?HttpTick {
+    if (py.PyTuple_Size(result) != 2) return null;
+
+    const chunks_obj = py.PyTuple_GetItem(result, 0);
+    const done_obj = py.PyTuple_GetItem(result, 1);
+    if (chunks_obj == null or done_obj == null) return null;
+
+    const done = py.PyObject_IsTrue(done_obj) == 1;
+    const chunks = copyBytes(chunks_obj.?, allocator) orelse return null;
+
+    return .{ .chunks = chunks, .done = done };
 }
 
 // ---------------------------------------------------------------------------

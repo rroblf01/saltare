@@ -102,7 +102,7 @@ def test_https_get(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert b"saltare parsed: GET /some/path" in response.content
     assert b"scheme=https" in response.content
-    assert response.headers["server"] == "saltare/0.11.0"
+    assert response.headers["server"] == "saltare/0.12.0"
 
 
 def test_https_keep_alive(tmp_path: Path) -> None:
