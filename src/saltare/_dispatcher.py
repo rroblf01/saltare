@@ -226,7 +226,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/0.16.0"
+_SERVER_HEADER = b"saltare/0.17.0"
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +494,15 @@ def _encode_chunk(body: bytes) -> bytes:
 
 class _HttpState:
     __slots__ = (
-        "recv_queue",
+        # Single-slot mailbox: holds the next request event for the app's
+        # `await receive()`. None when the queue is empty.
+        "_pending_event",
+        # When the app awaits receive() and there is no pending event, we
+        # park it on this Future. The next `push_body` / `push_disconnect`
+        # resolves it. Replaces v0.12's `asyncio.Queue` per request — saves
+        # ~300 B of GC churn (Queue + internal deque + getters list) for
+        # the typical request that does receive() once and is done.
+        "_recv_future",
         "outgoing",
         "task",
         "status",
@@ -515,7 +523,13 @@ class _HttpState:
         more_body: bool,
         keep_alive: bool,
     ) -> None:
-        self.recv_queue: asyncio.Queue = asyncio.Queue()
+        # Initial request event sits in the mailbox; receive() pops it.
+        self._pending_event: dict[str, Any] | None = {
+            "type": "http.request",
+            "body": initial_body,
+            "more_body": more_body,
+        }
+        self._recv_future: asyncio.Future | None = None
         # Wire bytes produced by the app, drained by the I/O loop.
         self.outgoing: list[bytes] = []
         # Filled in when http.response.start arrives.
@@ -534,7 +548,20 @@ class _HttpState:
         self.ka: bool = bool(keep_alive)
 
         async def receive() -> dict[str, Any]:
-            return await self.recv_queue.get()
+            # Fast path: an event is already in the mailbox.
+            ev = self._pending_event
+            if ev is not None:
+                self._pending_event = None
+                return ev
+            # Park on a Future; the next push_* will resolve it. Re-creating
+            # the Future per await is unavoidable because asyncio's contract
+            # is one-shot — but it's cheaper than a Queue + deque + getters.
+            loop = asyncio.get_running_loop()
+            self._recv_future = loop.create_future()
+            try:
+                return await self._recv_future
+            finally:
+                self._recv_future = None
 
         async def send(message: dict[str, Any]) -> None:
             mtype = message.get("type")
@@ -572,11 +599,8 @@ class _HttpState:
 
         loop = _ensure_loop()
         self.task: asyncio.Task = loop.create_task(app(scope, receive, send))
-        # Push the first http.request event; the app will see it on its
-        # first `await receive()`.
-        self.recv_queue.put_nowait(
-            {"type": "http.request", "body": initial_body, "more_body": more_body}
-        )
+        # The initial request event is already in `_pending_event`; the
+        # app will pick it up on its first `await receive()`.
 
     def _emit_headers(
         self, streaming: bool, complete_body_len: int | None
@@ -618,12 +642,22 @@ class _HttpState:
         self.outgoing.extend(parts)
 
     def push_body(self, body: bytes, more_body: bool) -> None:
-        self.recv_queue.put_nowait(
-            {"type": "http.request", "body": body, "more_body": more_body}
-        )
+        self._deliver({"type": "http.request", "body": body, "more_body": more_body})
 
     def push_disconnect(self) -> None:
-        self.recv_queue.put_nowait({"type": "http.disconnect"})
+        self._deliver({"type": "http.disconnect"})
+
+    def _deliver(self, event: dict[str, Any]) -> None:
+        """Hand `event` to the app's pending `await receive()`. If a Future
+        is parked we resolve it directly (the app resumes on the next loop
+        tick); otherwise the event sits in the mailbox until receive() is
+        called. Mirrors the old `asyncio.Queue.put_nowait` semantics
+        without the queue."""
+        fut = self._recv_future
+        if fut is not None and not fut.done():
+            fut.set_result(event)
+        else:
+            self._pending_event = event
 
     def drain(self) -> bytes:
         if not self.outgoing:
