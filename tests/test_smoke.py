@@ -59,7 +59,7 @@ def _serve_in_background(app: Any, port: int) -> None:
 def test_version_string() -> None:
     import saltare
 
-    assert saltare.__version__ == "1.1.0"
+    assert saltare.__version__ == "1.2.0"
 
 
 def test_core_exports() -> None:
@@ -67,7 +67,7 @@ def test_core_exports() -> None:
 
     assert callable(_core.version)
     assert callable(_core.serve)
-    assert _core.version() == "1.1.0"
+    assert _core.version() == "1.2.0"
 
 
 def test_get_dispatches_to_app() -> None:

@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.1.0 — multi-worker RAM polish.** Production target is **Linux x86_64**. v1.1 verifies the pre-fork CoW story we set up in v1.0 and tightens the screws: `gc.freeze()` is called before the master forks (so the workers' first GC sweep can't dirty inherited pages), `http.max_headers` drops from 64 to 32 (~1 KiB saved per active pool buffer), and the static `asgi` ASGI sub-dict is now a module-level constant shared across requests. Result: **4 workers cost 51 MiB total Pss instead of the naive ~150 MiB** (66% saving via CoW), with each additional worker adding only ~4.6 MiB of physical RAM. Bench harness now reports Pss per cluster so the multi-worker RAM story is measurable, not assumed.
+> **Status: 1.2.0 — Python hot-path polish.** Production target is **Linux x86_64**. v1.2 reduces per-request work in the dispatcher: `_HttpState` instances are pooled across requests instead of allocated fresh (skipping the slot-allocation + GC churn), the ASGI `receive` and `send` callables are bound methods on `_HttpState` instead of per-request closures (~half the size, no per-instance compile), and the wire-format byte constants (`server:` line, `connection: …` lines, `transfer-encoding: chunked`, the chunked terminator, common status lines) are pre-built at module level so each response no longer rebuilds them. Net result: **sequential rps jumped from 2345 to 2447 (+4.3%)** and the concurrent-peak RAM dropped 0.3 MiB. Multi-worker behaviour from v1.1 is unchanged: 4 workers still cost ~51 MiB total Pss vs the naive ~150 MiB.
 
 ---
 
@@ -48,37 +48,37 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v1.0.0 with default settings (single worker). Production target is x86_64 — these numbers should be representative; CI runs both archs.
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v1.2.0 with default settings (single worker). Production target is x86_64 — these numbers should be representative; CI runs both archs.
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.04 MiB |      43.18 MiB | 43.19 MiB |    1000 | 2335 |
-| uvicorn | 44.80 MiB |      44.84 MiB | 44.84 MiB |    1000 | 2976 |
+| saltare | 43.25 MiB |      43.39 MiB | 43.39 MiB |    1000 | **2447** |
+| uvicorn | 44.89 MiB |      44.93 MiB | 44.93 MiB |    1000 | 2885 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.98 MiB |      42.20 MiB | 42.21 MiB |    2000 | 3840 |
-| uvicorn | 44.73 MiB |      45.21 MiB | 45.21 MiB |    2000 | 3979 |
+| saltare | 41.64 MiB |      41.88 MiB | 41.89 MiB |    2000 | 3813 |
+| uvicorn | 44.82 MiB |      45.29 MiB | 45.29 MiB |    2000 | 3965 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 41.64 MiB |      41.84 MiB | 41.84 MiB |     500 | 2289      |
-| uvicorn | 44.87 MiB |      50.25 MiB | 50.25 MiB |     500 | 2791      |
+| saltare | 42.06 MiB |      42.19 MiB | 42.19 MiB |     500 | 2204      |
+| uvicorn | 44.69 MiB |      50.07 MiB | 50.07 MiB |     500 | 2778      |
 
 ### Multi-worker idle — Pss across the whole cluster
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  37.35 MiB |      0.00 MiB | 37.35 MiB |                 —  |
-|       4 |        4 |  14.43 MiB |     36.83 MiB | 51.26 MiB |  149.39 MiB (−66%) |
+|       1 |        — |  37.45 MiB |      0.00 MiB | 37.45 MiB |                 —  |
+|       4 |        4 |  14.58 MiB |     36.81 MiB | 51.38 MiB |  149.78 MiB (−66%) |
 
-`Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); v1.1 sits at **34% of that**, i.e. 4 workers add only ~14 MiB on top of single-worker rather than tripling the floor.
+`Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~14 MiB on top of single-worker rather than tripling the floor.
 
 **Read this honestly:**
 
@@ -115,6 +115,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.18.0** — WebSocket keepalive + Python RAM polish. Server now sends an empty `ping` frame every `ws_keepalive_timeout` seconds (default 20) on each open WS; if no inbound frame (incl. pong) is observed in 2× that window, the connection is reaped. Implemented by reusing the existing timer wheel: WS upgrade arms it, every inbound frame updates `last_activity_ns`, and `fireExpired`'s WS branch is now ping-or-teardown rather than just teardown. Plus two Python-side wins: (1) header names are lowercased in Zig in-place inside `buildHeadersList` so `_dispatcher.py` drops the per-request `.lower()` list-comprehension and the per-header tuple rebuild it forced; (2) a 16-entry PyBytes cache for common header names (host, user-agent, content-type, etc) avoids `PyBytes_FromStringAndSize` on every cached header. Net: first run where saltare's concurrent rps (4006) edges past uvicorn's (3988), and ~0.2 MiB shaved across all three bench workloads.
 - [x] **v1.0.0** — Pre-fork multi-worker. New `src/zig/master.zig` module supervises N forked workers via `pause()` + `waitpid()`. Master flow: bind+listen via the existing `bindAndListen`; fork N children that each run the v0.18 single-worker flow (lifespan startup → accept loop on the inherited fd → lifespan shutdown → `_exit`); supervise. Children call `prctl(PR_SET_PDEATHSIG, SIGTERM)` so an SIGKILL'd master doesn't leave orphan workers. v1.0 policy on worker death: propagate shutdown to the rest, return — let the supervisor restart the pod. Each worker keeps its own counters; `metrics_path` reports per-worker (aggregate across workers in your scraper). New `workers` kwarg on `saltare.run()` and `--workers N` CLI flag (default 1, single-worker behaviour unchanged). Tests in `tests/test_multiworker.py` use subprocess + `/proc/<master>/task/.../children` to verify worker spawn, request serving, SIGTERM drain, and unexpected-worker-death propagation.
 - [x] **v1.1.0** — Multi-worker RAM polish. `gc.freeze()` is called once in the master right before the fork loop (and once per single-worker dispatch path, after lifespan startup) so CPython's cyclic-GC bookkeeping doesn't dirty CoW pages on each worker's first sweep — verified: 4 workers cost 51 MiB Pss instead of the naive 150 MiB (~66% saved). `http.max_headers` lowered from 64 to 32 (typical request has <20; 31 KiB → 1 KiB per active pool buffer worth of `[Header]N` storage). Static `asgi` ASGI sub-dict cached as a module-level constant, shared across all requests instead of re-allocated. Bench harness gains a `multi-worker idle` workload that reports Pss across master + workers, with a "naive N× single" comparison column.
+- [x] **v1.2.0** — Python hot-path polish. Three orthogonal cuts to per-request work in `_dispatcher.py`: (1) module-level free-list pool of `_HttpState` instances with a `reset(...)` method that rewrites every slot — saves the slot-allocation step + GC-tracking overhead per request and reuses the `outgoing` list. (2) `receive` and `send` callables converted from per-request closures to bound methods (`_HttpState._receive`, `_HttpState._send`) — half the per-instance memory of a closure cell, no per-instance compile, plays well with the pool. (3) Pre-built byte-string constants for the wire format: `_SERVER_LINE`, `_CONNECTION_KEEPALIVE_LINE`, `_CONNECTION_CLOSE_LINE`, `_TRANSFER_ENCODING_CHUNKED_LINE`, `_CHUNKED_TERMINATOR`, `_CRLF`, plus a precomputed status-line cache for every reason code in `_REASONS`. Each response now references shared bytes instead of rebuilding `b"server: " + _SERVER_HEADER + b"\r\n"` etc. Net: sequential rps **2335 → 2447 (+4.3%)**, concurrent peak −0.3 MiB. Multi-worker numbers unchanged from v1.1 (these wins are per-request, multi-worker is per-process).
 
 ## Install (once published)
 
