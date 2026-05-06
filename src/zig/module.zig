@@ -29,6 +29,25 @@ const c = @cImport({
 // the symbol is never resolved at link time on those platforms.
 extern fn malloc_trim(pad: usize) c_int;
 
+/// Move every currently-tracked Python object to the GC's "permanent
+/// generation" so future cycles never re-trace them. This is a free CPU
+/// win single-worker, but the real reason it's here is multi-worker
+/// CoW: without freeze(), the very first cyclic-GC sweep in each forked
+/// worker writes to the GC's bookkeeping pages, breaking sharing with
+/// the master and inflating per-pod RSS. Caller must hold the GIL.
+fn freezePython() void {
+    const gc_module = py.PyImport_ImportModule("gc") orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    defer py.Py_DecRef(gc_module);
+    const result = py.PyObject_CallMethod(gc_module, "freeze", null) orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    py.Py_DecRef(result);
+}
+
 // Reuse bridge.zig's @cImport translation unit. Distinct @cImport blocks
 // produce distinct Zig types for the same C structs, which makes
 // `*py.PyObject` from one file fail to coerce to `*py.PyObject` from
@@ -46,7 +65,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("1.0.0");
+    return py.PyUnicode_FromString("1.1.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -212,6 +231,12 @@ fn runSingleWorker(
         _ = malloc_trim(0);
     }
 
+    // Freeze the GC's tracking. Single-worker case: minor CPU win
+    // (smaller per-cycle scans). Multi-worker children that inherit
+    // from a master who already froze: their first GC sweep won't
+    // dirty any of the master's CoW pages.
+    freezePython();
+
     const tstate = py.PyEval_SaveThread();
     server.run(host, @intCast(port), tls_ctx, timeouts, limits, obs, uds_path, inherited_listen_fd) catch |err| {
         py.PyEval_RestoreThread(tstate);
@@ -260,6 +285,13 @@ fn runMultiWorker(
     var pids: [master_mod.MAX_WORKERS]c.pid_t = undefined;
     const n: usize = @intCast(workers);
     for (0..n) |i| pids[i] = -1;
+
+    // Freeze BEFORE the fork loop so each child inherits the master's
+    // already-frozen permanent generation. The user's app, FastAPI's
+    // routing tables, Pydantic's compiled schemas — all get marked
+    // perma-shared, so the first GC cycle in each worker doesn't dirty
+    // pages the kernel could otherwise keep CoW'd across all workers.
+    freezePython();
 
     var spawned: usize = 0;
     while (spawned < n) : (spawned += 1) {

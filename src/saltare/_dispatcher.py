@@ -132,7 +132,7 @@ def lifespan_startup(app: Any) -> bool:
 
     scope: dict[str, Any] = {
         "type": "lifespan",
-        "asgi": {"version": "3.0", "spec_version": "2.0"},
+        "asgi": _ASGI_LIFESPAN_SUB,
     }
 
     state.lifespan_task = loop.create_task(app(scope, lifespan_receive, lifespan_send))
@@ -226,7 +226,15 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/1.0.0"
+_SERVER_HEADER = b"saltare/1.1.0"
+
+# ASGI scope sub-dicts. These never change between requests, so caching them
+# at module level avoids one dict allocation (~200 B) per dispatch. ASGI
+# consumers are not allowed to mutate `scope["asgi"]` per spec, so sharing
+# the same instance across all requests is safe.
+_ASGI_LIFESPAN_SUB = {"version": "3.0", "spec_version": "2.0"}
+_ASGI_HTTP_SUB = {"version": "3.0", "spec_version": "2.3"}
+_ASGI_WS_SUB = {"version": "3.0", "spec_version": "2.3"}
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +382,7 @@ def ws_open(
 
     scope: dict[str, Any] = {
         "type": "websocket",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "asgi": _ASGI_WS_SUB,
         "http_version": "1.1",
         "scheme": "wss" if scheme == "https" else "ws",
         "path": path,
@@ -749,7 +757,7 @@ def http_dispatch_start(
 
     scope: dict[str, Any] = {
         "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "asgi": _ASGI_HTTP_SUB,
         "http_version": "1.1",
         "method": method,
         "scheme": effective_scheme,

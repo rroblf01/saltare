@@ -56,6 +56,41 @@ def read_status(pid: int) -> Sample:
     return Sample(rss, hwm, size)
 
 
+def read_pss_kib(pid: int) -> int:
+    """Proportional Set Size for a single process, in KiB. Pss assigns
+    each shared page proportionally to the processes mapping it, so
+    Σ pss across a process tree is the real physical memory the tree
+    uses (RSS would over-count CoW-shared pages N times)."""
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1])
+    except FileNotFoundError:
+        return 0
+    return 0
+
+
+def list_children(master_pid: int) -> list[int]:
+    """Read the master's direct children from /proc. Used by the
+    multi-worker workload to compute the cluster-wide Pss."""
+    path = f"/proc/{master_pid}/task/{master_pid}/children"
+    try:
+        with open(path) as f:
+            return [int(p) for p in f.read().split() if p]
+    except FileNotFoundError:
+        return []
+
+
+def cluster_pss_kib(master_pid: int) -> tuple[int, int]:
+    """Return (master_pss, sum_workers_pss) in KiB. Reading both
+    separately lets us show the CoW-amortised cost: with healthy
+    sharing, sum_workers ≪ N × master."""
+    master = read_pss_kib(master_pid)
+    workers = sum(read_pss_kib(c) for c in list_children(master_pid))
+    return master, workers
+
+
 def wait_ready(port: int, timeout: float = 5.0) -> None:
     deadline = time.monotonic() + timeout
     last_err: Exception | None = None
@@ -86,8 +121,13 @@ class Result:
     elapsed_seconds: float
 
 
-def _spawn(module: str, port: int) -> subprocess.Popen:
-    env = {**os.environ, "BENCH_PORT": str(port), "PYTHONUNBUFFERED": "1"}
+def _spawn(module: str, port: int, workers: int = 1) -> subprocess.Popen:
+    env = {
+        **os.environ,
+        "BENCH_PORT": str(port),
+        "BENCH_WORKERS": str(workers),
+        "PYTHONUNBUFFERED": "1",
+    }
     return subprocess.Popen(
         [sys.executable, "-m", module],
         env=env,
@@ -267,6 +307,97 @@ def fmt_mib(kib: int) -> str:
     return f"{kib / 1024:.2f} MiB"
 
 
+@dataclass
+class MultiWorkerSample:
+    workers: int
+    master_pss_kib: int
+    workers_pss_kib: int
+    n_workers_observed: int
+
+    @property
+    def total_pss_kib(self) -> int:
+        return self.master_pss_kib + self.workers_pss_kib
+
+
+def run_multi_worker_pss(workers: int, port: int = 18004) -> MultiWorkerSample:
+    """Spawn saltare with `workers` pre-fork workers, hold a probe
+    connection open, and read Pss across master + every worker. Pss
+    proportionally accounts for shared CoW pages, so the total reflects
+    the real RAM cost of the cluster — not N × the floor."""
+    proc = _spawn("benchmarks.run_saltare", port, workers=workers)
+    try:
+        wait_ready(port)
+        # Give the master time to fork all workers and let the kernel
+        # populate /proc/<pid>/smaps_rollup for everyone.
+        deadline = time.monotonic() + 3.0
+        observed = 0
+        while time.monotonic() < deadline:
+            observed = len(list_children(proc.pid))
+            if observed >= workers:
+                break
+            time.sleep(0.05)
+        # One held-open connection so the workers' accept loops are
+        # fully warm and any first-request transient state has been
+        # touched. We don't actually send a request — we want the
+        # idle-cluster footprint.
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0) as s:
+            # Hold the conn briefly so smaps stabilises.
+            time.sleep(0.5)
+            s.close()
+        # Final stabilisation pause.
+        time.sleep(0.5)
+        master_pss, workers_pss = cluster_pss_kib(proc.pid)
+        return MultiWorkerSample(
+            workers=workers,
+            master_pss_kib=master_pss,
+            workers_pss_kib=workers_pss,
+            n_workers_observed=observed,
+        )
+    finally:
+        _terminate(proc)
+
+
+def render_multi_worker(samples: list[MultiWorkerSample]) -> None:
+    if not samples:
+        return
+    print("## workload: multi-worker idle (Pss = real physical RAM)")
+    print()
+    print("| workers | observed | master Pss | sum workers Pss | total Pss | vs naive N× single |")
+    print("|---------|----------|------------|-----------------|-----------|--------------------|")
+    baseline = next((s for s in samples if s.workers == 1), None)
+    for s in samples:
+        # The naive comparison: how much RAM the cluster would need if
+        # every worker was a fresh independent process (no CoW). Using
+        # the workers=1 Pss as the per-process cost. workers=1 itself
+        # has no comparison — it IS the baseline.
+        if baseline and s.workers > 1 and baseline.total_pss_kib > 0:
+            naive_kib = baseline.total_pss_kib * s.workers
+            savings_pct = (1 - s.total_pss_kib / naive_kib) * 100
+            naive_col = f"{fmt_mib(naive_kib)} (-{savings_pct:.0f}%)"
+        else:
+            naive_col = "—"
+        print(
+            f"| {s.workers:>7d} | {s.n_workers_observed:>8d} "
+            f"| {fmt_mib(s.master_pss_kib):>10s} "
+            f"| {fmt_mib(s.workers_pss_kib):>15s} "
+            f"| {fmt_mib(s.total_pss_kib):>9s} "
+            f"| {naive_col:>18s} |"
+        )
+    print()
+    if baseline and len(samples) >= 2:
+        for s in samples:
+            if s.workers <= 1:
+                continue
+            extra = (s.total_pss_kib - baseline.total_pss_kib) / max(
+                s.workers - 1, 1
+            )
+            print(
+                f"  Extra physical RAM per worker beyond the first "
+                f"({s.workers} workers): {extra / 1024:+.2f} MiB"
+            )
+        print()
+
+
 def render(results: list[Result]) -> None:
     print()
     grouped: dict[str, list[Result]] = {}
@@ -313,11 +444,16 @@ def main() -> None:
                         help="requests per client in the concurrent workload")
     parser.add_argument("--idle-connections", type=int, default=500,
                         help="connections held open in the idle-keepalive workload")
+    parser.add_argument("--multi-worker-counts", type=str, default="1,4",
+                        help="comma-separated worker counts to measure Pss for")
     args = parser.parse_args()
+
+    worker_counts = [int(x) for x in args.multi_worker_counts.split(",") if x]
 
     print(f"\nsequential:     {args.requests} requests / 1 client")
     print(f"concurrent:     {args.concurrency} clients × {args.per_client} requests")
-    print(f"idle-keepalive: {args.idle_connections} keep-alive connections held open\n")
+    print(f"idle-keepalive: {args.idle_connections} keep-alive connections held open")
+    print(f"multi-worker:   Pss footprint with {worker_counts} workers\n")
 
     results: list[Result] = []
     for name, module in (("saltare", "benchmarks.run_saltare"),
@@ -340,6 +476,16 @@ def main() -> None:
         ))
 
     render(results)
+
+    # Multi-worker Pss measurement only makes sense for saltare (uvicorn's
+    # --workers spawns multiprocessing children with a different sharing
+    # profile; out of scope for v1.1's "did our pre-fork CoW work?" check).
+    multi_samples: list[MultiWorkerSample] = []
+    for n in worker_counts:
+        if n < 1:
+            continue
+        multi_samples.append(run_multi_worker_pss(workers=n, port=18004 + n))
+    render_multi_worker(multi_samples)
 
 
 if __name__ == "__main__":

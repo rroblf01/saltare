@@ -113,7 +113,13 @@ fn connectionTokenPresent(value: []const u8, needle: []const u8) bool {
     return false;
 }
 
-pub const max_headers = 64;
+// 32 covers virtually every real-world request (typical browsers send
+// 12–18 headers; even a heavily-cookied / JWT-laden API request rarely
+// exceeds 24). Lowered from 64 in v1.1 — saves ~1 KiB per active pool
+// buffer because the parsed-headers array lives inside the buffer
+// struct (see `pool.zig`). Requests with more than this many headers
+// still get a clean 431 via the parser's "too many headers" path.
+pub const max_headers = 32;
 
 pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
     // Locate the end of the head section. Without it the request is incomplete.
