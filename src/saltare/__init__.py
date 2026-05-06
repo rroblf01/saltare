@@ -31,6 +31,8 @@ def run(
     proxy_headers: bool = False,
     ws_keepalive_timeout: int = 20,
     workers: int = 1,
+    health_path: str | None = None,
+    cors_preflight_allow_all: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -102,6 +104,27 @@ def run(
                                Only enable behind a trusted reverse proxy
                                that strips client-supplied X-Forwarded-*
                                headers; otherwise clients can spoof.
+        health_path          — if set (e.g. "/healthz"), saltare answers
+                               that path with `200 OK\\nok\\n` directly
+                               from Zig — no Python dispatch. Useful for
+                               k8s liveness/readiness probes that fire
+                               often and don't need the full ASGI stack.
+        cors_preflight_allow_all
+                             — if True, OPTIONS requests bearing an
+                               `Origin` header are answered from Zig with
+                               permissive CORS headers (`*` origin,
+                               common methods + headers, 24 h cache).
+                               The user app never sees preflight requests.
+                               Only enable if your app's CORS policy is
+                               actually permissive — Zig doesn't read
+                               your allow-list.
+
+    Listening on IPv6: pass an IPv6 address (with or without brackets)
+    in `host`, e.g. `host="::"` to listen on all v6 interfaces or
+    `host="[::1]"` for v6 loopback. saltare auto-detects v6 by the
+    presence of a colon and creates an `AF_INET6` socket with
+    `IPV6_V6ONLY=1` set. Run a second saltare process for v4 if you
+    need both families.
     """
     # Wire Python-side proxy-headers handling. Done before _core.serve
     # because the dispatcher's scope build happens on every request.
@@ -127,4 +150,6 @@ def run(
         int(bool(access_log)),
         int(ws_keepalive_timeout),
         int(workers),
+        health_path,
+        int(bool(cors_preflight_allow_all)),
     )

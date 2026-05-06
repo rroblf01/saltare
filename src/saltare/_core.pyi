@@ -20,4 +20,6 @@ def serve(
     access_log: int = ...,
     ws_keepalive_timeout: int = ...,
     workers: int = ...,
+    health_path: str | None = ...,
+    cors_preflight_allow_all: int = ...,
 ) -> None: ...

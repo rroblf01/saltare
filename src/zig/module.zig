@@ -28,6 +28,24 @@ const c = @cImport({
 // extern reference is dead-code-eliminated on macOS / non-glibc targets and
 // the symbol is never resolved at link time on those platforms.
 extern fn malloc_trim(pad: usize) c_int;
+extern fn mallopt(param: c_int, value: c_int) c_int;
+
+// glibc <malloc.h> macros — values are stable ABI.
+const M_ARENA_MAX: c_int = -8;
+
+/// Cap glibc's per-thread malloc arenas to a single arena. saltare's I/O
+/// loop is single-threaded per worker, so multiple arenas only spread the
+/// same allocations across more pages, inflating RSS via per-arena slack.
+/// `MALLOC_ARENA_MAX=1` does the same thing via env var; calling mallopt()
+/// here means library users (saltare imported as a module) get the saving
+/// without having to set the env var before the process starts.
+/// The env var path is still recommended for production: it lands earlier
+/// (before any allocations) and a few KiB of arena state may already exist
+/// by the time PyInit__core runs.
+fn capMallocArenas() void {
+    if (comptime builtin.os.tag != .linux) return;
+    _ = mallopt(M_ARENA_MAX, 1);
+}
 
 /// Move every currently-tracked Python object to the GC's "permanent
 /// generation" so future cycles never re-trace them. This is a free CPU
@@ -92,10 +110,12 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var access_log_flag: c_int = 0;
     var ws_keepalive_to: c_uint = 20;
     var workers: c_uint = 1;
+    var health_path_z: [*c]const u8 = null;
+    var cors_preflight_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziII",
+        "Osizz|IIIIIIKIzziIIzi",
         &app,
         &host_z,
         &port,
@@ -114,6 +134,8 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &access_log_flag,
         &ws_keepalive_to,
         &workers,
+        &health_path_z,
+        &cors_preflight_flag,
     ) == 0) {
         return null;
     }
@@ -143,8 +165,10 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     };
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
+        .health_path = if (health_path_z != null) std.mem.span(health_path_z) else null,
         .access_log = access_log_flag != 0,
         .proxy_headers = false, // Python wrapper handles this; not threaded through.
+        .cors_preflight_allow_all = cors_preflight_flag != 0,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 
@@ -360,6 +384,9 @@ var methods = [_]py.PyMethodDef{
 var module_def: py.PyModuleDef = std.mem.zeroes(py.PyModuleDef);
 
 export fn PyInit__core() ?*py.PyObject {
+    // Cap glibc malloc arenas as early as possible so the Python heap
+    // stays in one arena from here on. Skips on non-glibc targets.
+    capMallocArenas();
     module_def.m_name = "_core";
     module_def.m_doc = "Saltare native core (Zig backbone).";
     module_def.m_size = -1;

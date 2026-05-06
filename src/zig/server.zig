@@ -30,6 +30,7 @@ const c = @cImport({
     @cInclude("signal.h");
     @cInclude("fcntl.h");
     @cInclude("time.h");
+    @cInclude("arpa/inet.h");
 });
 
 // accept4 is a Linux/glibc extension. Defining _GNU_SOURCE in the @cImport
@@ -84,6 +85,12 @@ pub const Observability = struct {
     /// counters. The user app never sees the request. A common choice:
     /// "/metrics".
     metrics_path: ?[]const u8 = null,
+    /// If non-null, requests whose path equals this string get a fixed
+    /// 200 OK + body "ok\n" answered entirely from Zig — no Python
+    /// dispatch, no FastAPI overhead. v1.3 addition for k8s liveness /
+    /// readiness probes that hit hard, often (every few seconds), and
+    /// don't need the full ASGI stack to serve. A common choice: "/healthz".
+    health_path: ?[]const u8 = null,
     /// If true, every completed request emits a one-line JSON record to
     /// stderr (method, path, status, bytes_sent, latency_us, user_agent).
     /// Off by default — when off, zero work happens per request.
@@ -94,6 +101,14 @@ pub const Observability = struct {
     /// that strips client-supplied X-Forwarded-* headers — otherwise
     /// clients can spoof their address.
     proxy_headers: bool = false,
+    /// If true, OPTIONS requests bearing an `Origin` header are answered
+    /// from Zig with permissive CORS headers (`Access-Control-Allow-
+    /// Origin: *`, common methods + headers). Skips Python dispatch for
+    /// preflight requests, which is useful for browser-heavy SPAs that
+    /// fire one preflight per cross-origin route. Off by default; only
+    /// enable if your app's CORS policy actually IS permissive — Zig
+    /// doesn't read your app's allow-list.
+    cors_preflight_allow_all: bool = false,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -440,6 +455,83 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
     doWrite(loop, conn);
 }
 
+/// Fixed-body 200 response intercepted in Zig — used for the health
+/// endpoint so k8s-style probes don't pay the full ASGI dispatch cost.
+/// `keep_alive` follows the request's preference; `body` is copied into
+/// the heap-allocated wire buffer along with the status line.
+fn serveFixedBody(
+    loop: *eventloop.Loop,
+    conn: *Connection,
+    status: u16,
+    reason: []const u8,
+    content_type: []const u8,
+    body: []const u8,
+    extra_headers: []const u8,
+) void {
+    const ka = conn.parsed.?.wantsKeepAlive();
+    const conn_line: []const u8 = if (ka) "keep-alive" else "close";
+    var head_buf: [512]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 {d} {s}\r\n" ++
+            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "Content-Type: {s}\r\n" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: {s}\r\n" ++
+            "{s}" ++
+            "\r\n",
+        .{ status, reason, content_type, body.len, conn_line, extra_headers },
+    ) catch {
+        sendStatus(loop, conn, 500, "Internal Server Error");
+        return;
+    };
+
+    const total_len = head.len + body.len;
+    const heap = conn.allocator.alloc(u8, total_len) catch {
+        sendStatus(loop, conn, 503, "Service Unavailable");
+        return;
+    };
+    @memcpy(heap[0..head.len], head);
+    @memcpy(heap[head.len..], body);
+
+    if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+    conn.write_buf = heap;
+    conn.write_pos = 0;
+    conn.state = .writing;
+    conn.keep_alive = ka;
+    conn.response_status = status;
+    conn.armTimer(g_timeouts.write_secs);
+
+    loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    doWrite(loop, conn);
+}
+
+/// Cheap liveness/readiness probe. Always 200, body "ok\n". The user app
+/// never sees the request — k8s `httpGet` probes that fire every few
+/// seconds don't serialise through Python at all.
+fn serveHealth(loop: *eventloop.Loop, conn: *Connection) void {
+    serveFixedBody(loop, conn, 200, "OK", "text/plain; charset=utf-8", "ok\n", "");
+}
+
+/// CORS preflight intercept. Answers OPTIONS-with-Origin from Zig with a
+/// permissive policy (`*` origins, common methods + headers, 24h cache).
+/// The user app never sees preflight requests — useful for SPA workloads
+/// where every cross-origin route triggers one. Strictly stricter
+/// allowlists must still be done in the app (we don't read its CORS
+/// config).
+fn serveCorsPreflight(loop: *eventloop.Loop, conn: *Connection) void {
+    const cors_headers =
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS\r\n" ++
+        "Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With\r\n" ++
+        "Access-Control-Max-Age: 86400\r\n";
+    serveFixedBody(loop, conn, 204, "No Content", "text/plain; charset=utf-8", "", cors_headers);
+}
+
 fn linkStalled(conn: *Connection) void {
     if (conn.stalled) return;
     conn.stalled = true;
@@ -510,6 +602,39 @@ fn parseIpv4(host: []const u8, port: u16) !c.struct_sockaddr_in {
     addr.sin_family = @intCast(c.AF_INET);
     addr.sin_port = std.mem.nativeToBig(u16, port);
     addr.sin_addr.s_addr = @bitCast(bytes);
+    return addr;
+}
+
+/// Detect IPv6 by presence of any colon. Bracketed notation (`[::1]`) is
+/// also accepted and stripped — common in Docker / reverse-proxy configs.
+inline fn isIpv6(host: []const u8) bool {
+    return std.mem.indexOfScalar(u8, host, ':') != null;
+}
+
+/// Parse a textual IPv6 address into a `sockaddr_in6`. Uses libc's
+/// `inet_pton(AF_INET6, ...)` so we get the full RFC 5952 grammar (`::`,
+/// IPv4-mapped, etc.) without reinventing it. Brackets are stripped if
+/// present.
+fn parseIpv6(host: []const u8, port: u16) !c.struct_sockaddr_in6 {
+    var stripped = host;
+    if (stripped.len >= 2 and stripped[0] == '[' and stripped[stripped.len - 1] == ']') {
+        stripped = stripped[1 .. stripped.len - 1];
+    }
+
+    // inet_pton wants a NUL-terminated string. Stack-buffer it; v6
+    // textual form is bounded at 45 chars + NUL (with a dotted-quad
+    // suffix), so a 64-byte buffer is more than enough.
+    var nul_buf: [64]u8 = undefined;
+    if (stripped.len >= nul_buf.len) return error.InvalidAddress;
+    @memcpy(nul_buf[0..stripped.len], stripped);
+    nul_buf[stripped.len] = 0;
+
+    var addr: c.struct_sockaddr_in6 = std.mem.zeroes(c.struct_sockaddr_in6);
+    addr.sin6_family = @intCast(c.AF_INET6);
+    addr.sin6_port = std.mem.nativeToBig(u16, port);
+    if (c.inet_pton(c.AF_INET6, &nul_buf[0], &addr.sin6_addr) != 1) {
+        return error.InvalidAddress;
+    }
     return addr;
 }
 
@@ -735,6 +860,8 @@ pub fn bindAndListen(host: []const u8, port: u16, uds_path: ?[]const u8) !c_int 
 }
 
 fn bindTcpSocket(host: []const u8, port: u16) !c_int {
+    if (isIpv6(host)) return bindTcpSocketV6(host, port);
+
     const addr = try parseIpv4(host, port);
     const fd = c.socket(
         c.AF_INET,
@@ -746,6 +873,31 @@ fn bindTcpSocket(host: []const u8, port: u16) !c_int {
 
     var yes: c_int = 1;
     if (c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, @ptrCast(&yes), @sizeOf(c_int)) != 0) {
+        return error.SetsockoptFailed;
+    }
+    if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    if (c.listen(fd, 256) != 0) return error.ListenFailed;
+    return fd;
+}
+
+fn bindTcpSocketV6(host: []const u8, port: u16) !c_int {
+    const addr = try parseIpv6(host, port);
+    const fd = c.socket(
+        c.AF_INET6,
+        c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC,
+        c.IPPROTO_TCP,
+    );
+    if (fd < 0) return error.SocketFailed;
+    errdefer _ = c.close(fd);
+
+    var yes: c_int = 1;
+    if (c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, @ptrCast(&yes), @sizeOf(c_int)) != 0) {
+        return error.SetsockoptFailed;
+    }
+    // IPV6_V6ONLY=0 would dual-bind v4/v6 on Linux but the kernel default
+    // varies by distro; explicit IPV6_V6ONLY=1 is safer. Users who want
+    // v4 traffic can run a second listener.
+    if (c.setsockopt(fd, c.IPPROTO_IPV6, c.IPV6_V6ONLY, @ptrCast(&yes), @sizeOf(c_int)) != 0) {
         return error.SetsockoptFailed;
     }
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
@@ -1384,6 +1536,17 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         if (std.mem.eql(u8, req.target, path)) {
             return serveMetrics(loop, conn);
         }
+    }
+    if (g_obs.health_path) |path| {
+        if (std.mem.eql(u8, req.target, path)) {
+            return serveHealth(loop, conn);
+        }
+    }
+    if (g_obs.cors_preflight_allow_all and
+        std.mem.eql(u8, req.method, "OPTIONS") and
+        req.header("origin") != null)
+    {
+        return serveCorsPreflight(loop, conn);
     }
 
     const data = conn.read_buf.?.data;

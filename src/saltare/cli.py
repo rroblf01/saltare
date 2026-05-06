@@ -123,6 +123,20 @@ def main(argv: list[str] | None = None) -> None:
         help="number of pre-fork worker processes (1 = single process)",
     )
     parser.add_argument(
+        "--health-path",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="answer GETs at PATH (e.g. '/healthz') with 200 'ok' from "
+             "Zig — no Python dispatch (k8s probe-friendly)",
+    )
+    parser.add_argument(
+        "--cors-preflight-allow-all",
+        action="store_true",
+        help="answer OPTIONS-with-Origin from Zig with permissive CORS "
+             "headers — skips Python for browser preflight",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -151,4 +165,6 @@ def main(argv: list[str] | None = None) -> None:
         proxy_headers=args.proxy_headers,
         ws_keepalive_timeout=args.ws_keepalive_timeout,
         workers=args.workers,
+        health_path=args.health_path,
+        cors_preflight_allow_all=args.cors_preflight_allow_all,
     )
