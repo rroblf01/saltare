@@ -32,11 +32,18 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     root_module.addIncludePath(.{ .cwd_relative = py_include });
-    // OpenSSL for the v0.9 TLS path. We link the system libraries: manylinux
-    // images ship a stable OpenSSL, and auditwheel will vendor libssl /
-    // libcrypto into the final wheel so users don't need them installed.
-    root_module.linkSystemLibrary("ssl", .{});
-    root_module.linkSystemLibrary("crypto", .{});
+    // v1.3: OpenSSL is no longer linked at build time. The TLS path
+    // (src/zig/tls.zig) `dlopen`s libssl on first `serve(ssl_certfile=...)`
+    // call instead, so:
+    //   1. The shared object has no DT_NEEDED entry for libssl/libcrypto,
+    //      so auditwheel doesn't vendor them — wheel size drops ~3 MiB.
+    //   2. Plain-HTTP deployments don't pay the ~2 MiB resident cost of
+    //      having libssl + libcrypto mapped into the process at startup.
+    //   3. Users who need TLS install system OpenSSL (`apt install libssl3`
+    //      or equivalent) — the same libs they'd already have for `pip`,
+    //      `requests`, and most other Python deps.
+    // libdl is needed for dlopen / dlsym on glibc.
+    root_module.linkSystemLibrary("dl", .{});
 
     const lib = b.addLibrary(.{
         .name = "saltare_core",

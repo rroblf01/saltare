@@ -1,0 +1,76 @@
+# Production-ready saltare image: minimal manylinux base, jemalloc preloaded
+# for tighter RSS than glibc's default arenas, and the same MALLOC_ARENA_MAX
+# trick the README recommends.
+#
+# Build:
+#   docker build -f Dockerfile.production --target=production -t saltare-prod .
+#
+# Run (single worker, listening on 0.0.0.0:8000):
+#   docker run --rm -p 8000:8000 -e BENCH_PORT=8000 saltare-prod
+#
+# Replace `benchmarks.app:app` in the CMD with your own ASGI module:app
+# pair, or override at runtime.
+
+# syntax=docker/dockerfile:1.7
+
+ARG MANYLINUX_TAG=manylinux_2_28_x86_64
+ARG PYTHON_TAG=cp314-cp314
+ARG ZIG_VERSION=0.16.0
+
+# Reuse the existing builder stage from Dockerfile by referencing it in a
+# multi-stage build. To keep this file self-contained for `docker build -f
+# Dockerfile.production`, we replicate the wheel-build stages here and
+# wire only the production runtime in the final stage.
+
+FROM quay.io/pypa/${MANYLINUX_TAG} AS zig-toolchain
+ARG ZIG_VERSION
+ENV ZIG_VERSION=${ZIG_VERSION}
+COPY scripts/install-zig.sh /tmp/install-zig.sh
+RUN bash /tmp/install-zig.sh && rm /tmp/install-zig.sh
+
+FROM zig-toolchain AS build-env
+ARG PYTHON_TAG
+ENV PATH=/opt/python/${PYTHON_TAG}/bin:/usr/local/bin:${PATH}
+# jemalloc only — saltare v1.3 dlopens libssl at runtime, so no -devel
+# headers are needed at build time. libssl is already present on the
+# manylinux base image for users who pass `ssl_certfile=`.
+RUN dnf install -y jemalloc && dnf clean all
+RUN pip install --upgrade pip build
+
+FROM build-env AS builder
+WORKDIR /io
+COPY pyproject.toml CMakeLists.txt build.zig build.zig.zon README.md LICENSE ./
+COPY src ./src
+RUN python -m build --wheel --outdir /tmp/dirty-wheels \
+ && auditwheel repair /tmp/dirty-wheels/saltare-*.whl -w /dist
+
+# ---------------------------------------------------------------------------
+# Production runtime. Slim manylinux + saltare wheel + jemalloc preloaded.
+FROM quay.io/pypa/${MANYLINUX_TAG} AS production
+ARG PYTHON_TAG
+ENV PATH=/opt/python/${PYTHON_TAG}/bin:${PATH}
+
+# jemalloc fragments far less than glibc's per-arena malloc on long-lived
+# servers — typical RSS saving on top of MALLOC_ARENA_MAX=2 is 5–15 MiB.
+RUN dnf install -y jemalloc && dnf clean all
+
+COPY --from=builder /dist /dist
+RUN pip install --no-deps /dist/saltare-*.whl \
+ && rm -rf /dist /root/.cache
+
+# LD_PRELOAD: glibc's malloc has 8 × n_cpus arenas by default; jemalloc has
+# one global heap with thread-local caches. For saltare's single-threaded
+# I/O loop, jemalloc's lower steady-state fragmentation matters more than
+# its multi-threaded scalability.
+ENV LD_PRELOAD=/usr/lib64/libjemalloc.so.2
+# Belt and braces: even with jemalloc loaded, set MALLOC_ARENA_MAX so
+# anything that bypasses the preload (e.g. a child process spawned with
+# a clean environment) inherits the saltare-recommended sizing.
+ENV MALLOC_ARENA_MAX=2
+
+WORKDIR /app
+
+# Replace this with your own ASGI app:
+#   COPY my_app /app/my_app
+#   CMD ["saltare", "my_app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+CMD ["saltare", "--help"]

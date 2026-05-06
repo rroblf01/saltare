@@ -36,9 +36,10 @@ RUN bash /tmp/install-zig.sh && rm /tmp/install-zig.sh
 FROM zig-toolchain AS build-env
 ARG PYTHON_TAG
 ENV PATH=/opt/python/${PYTHON_TAG}/bin:/usr/local/bin:${PATH}
-# OpenSSL headers for the v0.9 TLS link. Manylinux images ship the runtime
-# already; the -devel package adds the headers our @cImport needs.
-RUN dnf install -y openssl-devel && dnf clean all
+# v1.3: OpenSSL is `dlopen`'d at runtime, so we don't need the headers
+# (-devel) at build time anymore. The runtime libs (`libssl.so.x`) are
+# already on the manylinux image; tests + bench find them via the dlopen
+# fallback chain. Plain-HTTP deployments need no OpenSSL at all.
 RUN pip install --upgrade pip build
 
 # ---------------------------------------------------------------------------
@@ -72,15 +73,19 @@ RUN pytest -q tests
 
 # ---------------------------------------------------------------------------
 # Stage 6: RAM benchmark. Installs the saltare wheel + uvicorn (plain, no
-# [standard] extras for a fair comparison) into the test-env image and runs
-# `benchmarks.bench` to print a Markdown comparison table.
+# [standard] extras for a fair comparison) + granian (Rust-based ASGI peer)
+# into the test-env image and runs `benchmarks.bench` to print a Markdown
+# comparison table. Granian is included so saltare-vs-uvicorn isn't taken
+# in isolation; both are low-level alternatives to asyncio-based servers.
 FROM test-env AS bench
 COPY --from=builder /dist /dist
 RUN pip install --no-deps /dist/saltare-*.whl \
- && pip install uvicorn
+ && pip install uvicorn granian
 WORKDIR /work
 COPY benchmarks /work/benchmarks
-CMD ["python", "-m", "benchmarks.bench"]
+# Default invocation: --include-granian so the table has all three servers.
+# Override with `docker run ... saltare-bench python -m benchmarks.bench [flags]`.
+CMD ["python", "-m", "benchmarks.bench", "--include-granian"]
 
 # ---------------------------------------------------------------------------
 # Stage 7: Minimal export. `--output=dist` lets BuildKit copy /dist out.

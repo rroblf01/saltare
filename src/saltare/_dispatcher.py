@@ -226,7 +226,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/1.2.2"
+_SERVER_HEADER = b"saltare/1.3.0"
 
 # ASGI scope sub-dicts. These never change between requests, so caching them
 # at module level avoids one dict allocation (~200 B) per dispatch. ASGI

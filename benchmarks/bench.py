@@ -198,6 +198,36 @@ def run_sequential(name: str, module: str, port: int, n_requests: int) -> Result
         _terminate(proc)
 
 
+def run_large_response(
+    name: str, module: str, port: int, n_requests: int
+) -> Result:
+    """Fetch the /large endpoint repeatedly. Stresses per-response RAM
+    (Python bytes, write_buf in Zig). Catches regressions where a
+    tweaked dispatcher accidentally pins response bodies."""
+    proc = _spawn(module, port)
+    try:
+        wait_ready(port)
+        time.sleep(0.5)
+        idle = read_status(proc.pid)
+
+        completed = 0
+        with _PeakSampler(proc.pid) as sampler:
+            t0 = time.monotonic()
+            with httpx.Client(timeout=10.0) as client:
+                for _ in range(n_requests):
+                    r = client.get(f"http://127.0.0.1:{port}/large")
+                    if r.status_code == 200:
+                        completed += 1
+            elapsed = time.monotonic() - t0
+
+        time.sleep(0.3)
+        after = read_status(proc.pid)
+        peak = max(sampler.peak_rss_kib, after.vm_rss_kib, idle.vm_rss_kib)
+        return Result(name, "large-response", idle, after, peak, completed, elapsed)
+    finally:
+        _terminate(proc)
+
+
 def _drain_response(sock: socket.socket) -> None:
     """Read one full HTTP/1.1 response from a raw socket. Saltare and uvicorn
     both emit Content-Length, so we don't need to handle chunked here."""
@@ -221,7 +251,13 @@ def _drain_response(sock: socket.socket) -> None:
         rest += chunk
 
 
-def run_idle_keepalive(name: str, module: str, port: int, n_idle: int) -> Result:
+def run_idle_keepalive(
+    name: str,
+    module: str,
+    port: int,
+    n_idle: int,
+    workload_label: str = "idle-keepalive",
+) -> Result:
     proc = _spawn(module, port)
     try:
         wait_ready(port)
@@ -254,7 +290,7 @@ def run_idle_keepalive(name: str, module: str, port: int, n_idle: int) -> Result
                     pass
 
         peak = max(sampler.peak_rss_kib, snapshot.vm_rss_kib, idle.vm_rss_kib)
-        return Result(name, "idle-keepalive", idle, snapshot, peak, n_idle, elapsed)
+        return Result(name, workload_label, idle, snapshot, peak, n_idle, elapsed)
     finally:
         _terminate(proc)
 
@@ -444,8 +480,19 @@ def main() -> None:
                         help="requests per client in the concurrent workload")
     parser.add_argument("--idle-connections", type=int, default=500,
                         help="connections held open in the idle-keepalive workload")
+    parser.add_argument("--high-conc-idle", type=int, default=0,
+                        help="if >0, also run idle-keepalive with this many "
+                             "connections (e.g. 5000). Off by default because "
+                             "it requires `ulimit -n` headroom.")
+    parser.add_argument("--large-requests", type=int, default=0,
+                        help="if >0, run a `large-response` workload of this "
+                             "many GETs against /large (size controlled by "
+                             "BENCH_LARGE_BYTES env, default 100 KiB).")
     parser.add_argument("--multi-worker-counts", type=str, default="1,4",
                         help="comma-separated worker counts to measure Pss for")
+    parser.add_argument("--include-granian", action="store_true",
+                        help="also run granian as a third comparison point. "
+                             "Requires granian installed in the bench env.")
     args = parser.parse_args()
 
     worker_counts = [int(x) for x in args.multi_worker_counts.split(",") if x]
@@ -455,25 +502,44 @@ def main() -> None:
     print(f"idle-keepalive: {args.idle_connections} keep-alive connections held open")
     print(f"multi-worker:   Pss footprint with {worker_counts} workers\n")
 
+    servers: list[tuple[str, str]] = [
+        ("saltare", "benchmarks.run_saltare"),
+        ("uvicorn", "benchmarks.run_uvicorn"),
+    ]
+    if args.include_granian:
+        servers.append(("granian", "benchmarks.run_granian"))
+
     results: list[Result] = []
-    for name, module in (("saltare", "benchmarks.run_saltare"),
-                         ("uvicorn", "benchmarks.run_uvicorn")):
+    for name, module in servers:
         results.append(run_sequential(
             name, module, port=18001, n_requests=args.requests,
         ))
-    for name, module in (("saltare", "benchmarks.run_saltare"),
-                         ("uvicorn", "benchmarks.run_uvicorn")):
+    for name, module in servers:
         results.append(run_concurrent(
             name, module, port=18002,
             concurrency=args.concurrency,
             requests_per_client=args.per_client,
         ))
-    for name, module in (("saltare", "benchmarks.run_saltare"),
-                         ("uvicorn", "benchmarks.run_uvicorn")):
+    for name, module in servers:
         results.append(run_idle_keepalive(
             name, module, port=18003,
             n_idle=args.idle_connections,
         ))
+
+    if args.large_requests > 0:
+        for name, module in servers:
+            results.append(run_large_response(
+                name, module, port=18010,
+                n_requests=args.large_requests,
+            ))
+
+    if args.high_conc_idle > 0:
+        for name, module in servers:
+            results.append(run_idle_keepalive(
+                name, module, port=18020,
+                n_idle=args.high_conc_idle,
+                workload_label=f"idle-keepalive-{args.high_conc_idle}",
+            ))
 
     render(results)
 

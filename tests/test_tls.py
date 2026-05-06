@@ -102,7 +102,9 @@ def test_https_get(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert b"saltare parsed: GET /some/path" in response.content
     assert b"scheme=https" in response.content
-    assert response.headers["server"] == "saltare/1.2.0"
+    # Don't pin the version; just require the Server header to be present
+    # and correctly prefixed. Exact-match versions rot every release.
+    assert response.headers["server"].startswith("saltare/")
 
 
 def test_https_keep_alive(tmp_path: Path) -> None:

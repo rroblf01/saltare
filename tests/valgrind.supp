@@ -1,0 +1,53 @@
+# Valgrind suppressions for `make valgrind`.
+#
+# CPython is known to leak interpreter-state allocations on shutdown — these
+# are not bugs, they're the cost of skipping `Py_FinalizeEx` cleanup paths
+# that the test runner doesn't exercise. We suppress them by category so
+# real leaks (in src/zig/bridge.zig or our Python dispatcher) still surface.
+#
+# Add new suppressions cautiously — each one widens the blind spot.
+
+{
+    cpython-init-static-allocs
+    Memcheck:Leak
+    match-leak-kinds: definite,indirect,possible,reachable
+    fun:malloc
+    ...
+    fun:_PyRuntimeState_Init*
+}
+
+{
+    cpython-import-machinery
+    Memcheck:Leak
+    match-leak-kinds: reachable,possible
+    fun:malloc
+    ...
+    fun:_PyImport_LoadDynamicModule*
+}
+
+{
+    cpython-thread-state
+    Memcheck:Leak
+    match-leak-kinds: reachable
+    fun:malloc
+    ...
+    fun:PyThreadState_New*
+}
+
+{
+    glibc-tls-init
+    Memcheck:Leak
+    match-leak-kinds: reachable
+    fun:malloc
+    ...
+    fun:_dl_allocate_tls*
+}
+
+{
+    glibc-locale
+    Memcheck:Leak
+    match-leak-kinds: reachable
+    fun:malloc
+    ...
+    fun:__nl_intern_locale_data
+}
