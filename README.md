@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: pre-alpha (v0.15.0).** HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, resource caps, graceful shutdown, **observability hooks**, and **Unix domain sockets** are all in. v0.15 adds an opt-in Prometheus `/metrics` endpoint served straight from Zig (no Python overhead per scrape), an opt-in JSON access log straight to stderr, opt-in `X-Forwarded-For/Proto` parsing for deployments behind a trusted proxy, and `--uds PATH` to bind a Unix socket instead of `host:port`. All four are off by default — the v0.14 RAM and throughput numbers are unchanged when you don't ask for them. Production-readiness gap remaining for v1.0: multi-worker.
+> **Status: pre-alpha (v0.16.0).** All the production-readiness essentials are in: HTTP/1.1 (chunked, keep-alive, pipelining), ASGI lifespan, TLS, WebSockets, streaming responses, idle timeouts, resource caps, graceful shutdown, observability hooks, Unix domain sockets. v0.16 finishes the RAM polish track: read buffers are now adaptive (4 KiB primary / 16 KiB overflow), so a typical request that fits in 4 KiB doesn't reserve the full 16 KiB; long-idle pool buffers are hinted to the kernel via `MADV_DONTNEED` so RSS recovers after traffic peaks. The only roadmap item left for v1.0 is multi-worker (`fork` + `SO_REUSEPORT`).
 
 ---
 
@@ -48,28 +48,28 @@ Python only wakes up to dispatch a request to the user's ASGI app.
 
 Run with `make bench` (Docker; no Zig or Python needed on the host). The harness boots each server with the same FastAPI app, takes a `/proc/<pid>/status` reading at idle, drives a load with `httpx`, and samples VmRSS every 10 ms during the load to capture peaks.
 
-Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.15.0:
+Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, uvicorn 0.46 plain — no `[standard]` extras), v0.16.0:
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.32 MiB |      43.46 MiB | 43.46 MiB |    1000 | 2340 |
-| uvicorn | 44.92 MiB |      44.96 MiB | 44.96 MiB |    1000 | 2921 |
+| saltare | 43.30 MiB |      43.44 MiB | 43.44 MiB |    1000 | 2316 |
+| uvicorn | 44.88 MiB |      44.91 MiB | 44.91 MiB |    1000 | 2873 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 41.78 MiB |      42.06 MiB | 42.08 MiB |    2000 | 3815 |
-| uvicorn | 44.89 MiB |      45.34 MiB | 45.34 MiB |    2000 | 3966 |
+| saltare | 42.04 MiB |      42.29 MiB | 42.29 MiB |    2000 | 3875 |
+| uvicorn | 44.82 MiB |      45.26 MiB | 45.26 MiB |    2000 | 3998 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 41.95 MiB |      42.08 MiB | 42.08 MiB |     500 | 2069      |
-| uvicorn | 44.87 MiB |      50.25 MiB | 50.25 MiB |     500 | 2894      |
+| saltare | 41.62 MiB |      41.76 MiB | 41.76 MiB |     500 | 2142      |
+| uvicorn | 44.83 MiB |      50.21 MiB | 50.21 MiB |     500 | 2964      |
 
 **Read this honestly:**
 
@@ -77,7 +77,8 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - The reason: saltare's `pool.zig` bundles the 16 KiB read buffer *and* the per-request headers array into a single pool node, returned to a free list as soon as a keep-alive connection goes idle. uvicorn's asyncio Transport keeps its per-connection buffers and Protocol/Task state alive for the lifetime of the socket.
 - **The floor dropped ~2 MiB** between v0.12.0 and v0.12.1 thanks to a `malloc_trim(0)` call after lifespan startup — glibc returns the fragmented heap left over from the FastAPI/Pydantic import chain to the OS in one syscall. Sequential idle went from 45.56 MiB to 43.15 MiB.
 - **Throughput parity (concurrent):** saltare 3790 rps vs uvicorn 3951 rps — within ~4%. The remaining gap is primarily `httptools` (uvicorn's tuned C parser) and uvicorn's tighter asyncio integration vs the bridge-driven dispatch.
-- **Streaming dispatch (v0.12) cost a few percent on sequential** because every HTTP request now runs as a long-lived asyncio Task with a per-request `recv_queue` and `outgoing` list. Sequential RPS sits at 2271 (was 2599 pre-streaming); concurrent and idle-keepalive workloads were largely unaffected because they were already gated by other costs. The new architecture pays off as soon as response sizes go up: a streaming endpoint that emits 10 MiB across 100 chunks now keeps RSS flat instead of buffering the whole 10 MiB in Python `bytes` — a saving the bench harness above doesn't measure (its FastAPI app returns ~30 bytes).
+- **Streaming dispatch (v0.12) cost a few percent on sequential** because every HTTP request now runs as a long-lived asyncio Task with a per-request `recv_queue` and `outgoing` list. Sequential RPS sits at ~2316 (was 2599 pre-streaming); concurrent and idle-keepalive workloads were largely unaffected because they were already gated by other costs. The new architecture pays off as soon as response sizes go up: a streaming endpoint that emits 10 MiB across 100 chunks now keeps RSS flat instead of buffering the whole 10 MiB in Python `bytes` — a saving the bench harness above doesn't measure (its FastAPI app returns ~30 bytes).
+- **v0.16 buffer adaptivity is also bench-invisible.** Read buffers shrink from 16 KiB → 4 KiB for the typical short request, saving ~12 KiB per in-flight request — but the bench's FastAPI app receives sub-1 KiB requests, so even the v0.15 16 KiB buffer was nearly empty. Wins show up in: services with high concurrency of small requests (savings compound across hundreds in-flight) and bursty traffic with valleys (`MADV_DONTNEED` returns long-idle committed pages to the kernel after 30 s, so RSS shrinks back toward the floor instead of staying at peak forever).
 - The remaining ~42 MiB floor is Python + FastAPI itself. No userland server can shrink that without changing what the user app loads. Python 3.14 raises this floor a few MiB versus 3.12 because 3.14 imports more stdlib eagerly. Setting `MALLOC_ARENA_MAX=2` in the environment shaves another 5–15 MiB on multi-threaded glibc systems (see Production deployment).
 
 **Where saltare's architectural win shows up most:** long-lived idle connections (the WebSocket and keep-alive workloads above), very high concurrency (10k+ open sockets), and large streamed responses (file downloads, SSE, JSON over MB).
@@ -100,7 +101,7 @@ Results on Apple Silicon (manylinux_2_28_aarch64, CPython 3.14, FastAPI 0.115+, 
 - [x] **v0.13.0** — Resource caps + `Expect: 100-continue`. New `Limits` struct (`max_request_body`, `max_concurrent_connections`, `max_keepalive_requests`) wired into `serve()` and the CLI. Body cap fires 413 on declared `Content-Length` overflow and on incremental chunked-decode growth. Connection cap accepts overflow sockets (to drain the listen backlog) and immediately closes them. Keepalive-requests cap forces `Connection: close` on the Nth response, recycling pymalloc arenas. `Expect: 100-continue` writes the interim response before reading the body, except when the declared body would exceed the cap (in which case the client gets a 413 directly). Caps add zero RAM cost in benign workloads; under adversarial load they convert the architectural advantage into a **hard guarantee**.
 - [x] **v0.14.0** — Graceful shutdown + ASGI exception isolation. New `g_draining` atomic flag; the SIGTERM/SIGINT handler sets it (and a second signal promotes to immediate force-exit). Main loop, on first observing drain mode, removes the listen fd from epoll (stops accepting), stamps a deadline, and continues processing in-flight requests — exit happens when `g_active_conns` reaches zero or `shutdown_timeout` (default 30 s) elapses. Idle keep-alive connections drain naturally via `keep_alive_timeout`. After the loop exits, `lifespan.shutdown` runs as before, then the process exits 0. App exceptions during dispatch are caught at the bridge: pre-headers raises produce a synthesized 500, mid-stream raises close the connection — server keeps serving subsequent requests. Tests now 44/44 (5 new in `test_shutdown.py`, 3 of which exercise real SIGTERM via `subprocess`).
 - [x] **v0.15.0** — Observability + UDS. `Observability` struct (`metrics_path`, `access_log`, `proxy_headers`) all opt-in. `metrics_path` (e.g. `/metrics`) intercepts requests in Zig and serves Prometheus text from atomic counters (`saltare_open_connections`, `saltare_in_flight_requests`, `saltare_requests_total`, `saltare_responses_4xx_total` / `_5xx_total`, `saltare_bytes_sent_total` / `_received_total`, `saltare_process_resident_memory_bytes` from `/proc/self/status` on Linux). `access_log` emits a JSON line per completed request to stderr from a 4 KiB stack-buffered writer (status line parsed once from the wire bytes; bytes/latency tracked in `Connection`); a single `write(2)` keeps lines atomic. `proxy_headers` lets the dispatcher read `X-Forwarded-For` (leftmost IP into `scope["client"]`) and `X-Forwarded-Proto` (into `scope["scheme"]`); only enable behind a trusted proxy. `uds_path` makes `serve()` bind an `AF_UNIX` socket instead of TCP — the bind path is unlinked on shutdown so restarts don't fail with `EADDRINUSE`. All four off by default; bench numbers indistinguishable from v0.14. Tests now 50/50 (6 new in `test_observability.py`).
-- [ ] **v0.16.0** — RAM polish: adaptive read buffer (4 KiB primary / 16 KiB overflow), `MADV_DONTNEED` on long-idle pool buffers, compressed `Header` to u16 offsets.
+- [x] **v0.16.0** — Adaptive read buffer + `MADV_DONTNEED`. The single 16 KiB pool from v0.6–v0.15 splits into two free lists: a 4 KiB primary covering the typical short request, and a 16 KiB overflow used either as the initial buffer for big payloads or as the upgrade target when a partial parse fills the small one (in-flight bytes are memcpy'd across; `parsed.headers` is invalidated and re-parsed because it pointed into the small buffer's headers array). `Buffer.data` becomes a `[]u8` slice (page-allocated via mmap so the OS can later reclaim its pages); `Buffer.released_at_ns` records when a buffer entered the free list. Each main-loop iteration calls `pool.sweepIdle(monoNs())`, which walks both free lists and issues `MADV_DONTNEED` for any block idle >30 s — page-aligned mmaps mean the kernel actually drops the physical pages. Linux only; macOS short-circuits the sweep. Bench numbers are within noise of v0.15 (the FastAPI bench app sends sub-1 KiB requests, so even the v0.15 16 KiB buffer was nearly empty); the wins manifest in real-world bursty traffic and high-concurrency-low-payload services. `Header` offset compression deferred — too much API churn for the marginal saving.
 - [ ] **v1.0.0** — Multi-worker (fork / `SO_REUSEPORT`) + production deployment guide.
 
 ## Install (once published)
@@ -260,14 +261,30 @@ Internally, saltare already calls `malloc_trim(0)` once after `lifespan.startup`
 
 ### Local development with Zig
 
-Easiest dev loop. Install Zig 0.16+ on your machine:
+Easiest dev loop. saltare's build pipeline (scikit-build-core → CMake → Zig) needs three things on your machine:
+
+1. **Zig 0.16+**
+2. **Python development headers** (`Python.h`)
+3. **OpenSSL development headers** (`<openssl/ssl.h>`, used by [src/zig/tls.zig](src/zig/tls.zig))
+
+#### Linux (x86_64 or aarch64)
 
 ```bash
-# macOS
-brew install zig
+# Debian/Ubuntu
+sudo apt install python3-dev libssl-dev cmake build-essential
 
-# Or grab a tarball
+# Fedora/RHEL/Rocky
+sudo dnf install python3-devel openssl-devel cmake gcc
+
+# Zig: pinned 0.16.0 tarball, both archs handled
 bash scripts/install-zig.sh
+```
+
+#### macOS
+
+```bash
+brew install zig openssl@3
+# Python headers come with Homebrew Python or python.org installers.
 ```
 
 Then:
@@ -277,6 +294,8 @@ uv sync                # or: pip install -e ".[dev]"
 pip install -e .       # builds the extension in place
 pytest -q
 ```
+
+If `pip install -e .` errors with `zig was not found on PATH`, your Zig install didn't end up in PATH — `bash scripts/install-zig.sh` symlinks `/usr/local/bin/zig` for you. If it errors with `openssl/ssl.h: No such file or directory`, the OpenSSL dev headers are missing (see the OS commands above). Both errors apply equally on x86_64 and aarch64; the Docker pipeline (`make build`) sidesteps them entirely by running everything inside the manylinux container.
 
 ### Docker (no Zig on host)
 

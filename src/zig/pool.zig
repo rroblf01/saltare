@@ -1,75 +1,161 @@
-// Read-buffer + headers-storage pool.
+// Adaptive read-buffer + headers-storage pool (v0.16).
 //
-// Each accepted connection used to hold a permanent 16 KiB read buffer for
-// its lifetime. With keep-alive (v0.5), idle connections sat with their
-// buffers reserved for seconds or minutes, so RSS scaled with *open
-// connections*, not with *in-flight requests*. The pool was introduced in
-// v0.6 to release the read buffer back to a free list as soon as a
-// connection went idle.
+// Per-connection buffer history:
+//   - v0.5: 16 KiB inline `[16384]u8` per Connection, lifetime-bound.
+//   - v0.6: pulled into a single free-list pool — released on idle keep-
+//           alive so RSS scales with in-flight, not open, connections.
+//   - v0.12.1: bundled the parsed-`Header` array into the same node so
+//              both release atomically (idle cost dropped to ~390 B/conn).
+//   - v0.16: split the data block into two sizes (4 KiB primary, 16 KiB
+//            overflow) with separate free lists, and hint long-idle
+//            blocks to the kernel via `MADV_DONTNEED` so RSS recovers
+//            after traffic peaks.
 //
-// v0.12.1 extends this to the headers slice array. Previously
-// `Connection.headers_storage: [64]Header` (~2 KiB inline) lived for the
-// connection's entire lifetime, even when idle — only the read buffer was
-// pooled. Now the headers array is bundled into the same `Buffer` and
-// released atomically with the read data, dropping idle-connection cost
-// from ~2 KiB to ~250 B.
+// Most HTTP requests fit comfortably in 4 KiB of headers + small body.
+// Connections start with a small buffer; if a partial parse fills it, the
+// caller upgrades to the large size (copying the in-flight bytes across).
+// Per-active-request RAM drops from 16 KiB → 4 KiB for the typical case.
 //
-// Caller contract: the `headers` slice is valid as long as the buffer is
-// held (i.e. until the next `release`). `Connection.parsed` references
-// must be cleared before releasing.
+// Caller contract: `headers` and `data` are valid as long as the buffer is
+// held; `Connection.parsed` references both, so `parsed = null` before the
+// matching `release()`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const http = @import("http.zig");
 
-/// Number of bytes available for raw socket reads. Same as the historical
-/// total buffer size — keeping it at 16 KiB preserves request capacity;
-/// the headers array now lives next to it, increasing the per-active-buffer
-/// allocation by ~2 KiB (net-zero vs the v0.6–v0.12 layout, where the
-/// headers were in the Connection struct anyway).
-pub const READ_DATA_SIZE: usize = 16 * 1024;
+const c = @cImport({
+    @cInclude("sys/mman.h");
+});
 
-/// A pool node. Callers receive `*Buffer` and read/write via the `data`
-/// field, parse into the `headers` field; the `next` field is for the
-/// pool's intrusive free-list and is ignored while the buffer is in use.
+/// Bytes available for socket reads in the small (default) buffer.
+pub const SMALL_DATA_SIZE: usize = 4 * 1024;
+/// Bytes available for socket reads in the overflow buffer. Same value as
+/// the historical (v0.5–v0.12) fixed buffer — request capacity unchanged.
+pub const LARGE_DATA_SIZE: usize = 16 * 1024;
+
+/// Buffers idle in the free list past this many nanoseconds get hinted to
+/// the kernel via `MADV_DONTNEED`. Re-using costs a soft fault
+/// (microseconds); in exchange RSS drops back toward the floor after a
+/// traffic peak ends. 30 s strikes a balance: short-lived dips are
+/// tolerated without the soft-fault tax, longer idle periods give the OS
+/// pages back. Linux only — macOS skips the call.
+pub const IDLE_ADVISE_NS: i64 = 30 * std.time.ns_per_s;
+
+/// A pool node. `data` is a slice (not an inline array) so the same
+/// `Buffer` type can hold either a 4 KiB or a 16 KiB block.
 pub const Buffer = struct {
     next: ?*Buffer,
     headers: [http.max_headers]http.Header,
-    data: [READ_DATA_SIZE]u8,
+    data: []u8,
+    /// CLOCK_MONOTONIC ns when this buffer entered the free list. 0 while
+    /// the buffer is in use.
+    released_at_ns: i64,
+    /// True if `MADV_DONTNEED` has been called for `data` since release.
+    /// Cleared on the next acquire so the next idle period can re-advise.
+    advised: bool,
 };
 
 pub const Pool = struct {
-    free_list: ?*Buffer,
+    /// Free list of buffers with `data.len == SMALL_DATA_SIZE`.
+    small_free: ?*Buffer,
+    /// Free list of buffers with `data.len == LARGE_DATA_SIZE`.
+    large_free: ?*Buffer,
+    /// Used to allocate / free `Buffer` structs (small fixed-size).
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) Pool {
-        return .{ .free_list = null, .allocator = allocator };
+        return .{
+            .small_free = null,
+            .large_free = null,
+            .allocator = allocator,
+        };
     }
 
-    /// Frees every buffer still in the free list. Buffers in use by live
-    /// connections are not tracked here — they're released by Connection
-    /// destructors and walk back through `release`.
     pub fn deinit(self: *Pool) void {
-        var current = self.free_list;
+        freeList(self.small_free, self.allocator);
+        freeList(self.large_free, self.allocator);
+        self.small_free = null;
+        self.large_free = null;
+    }
+
+    fn freeList(head: ?*Buffer, struct_alloc: std.mem.Allocator) void {
+        var current = head;
         while (current) |b| {
             const next = b.next;
-            self.allocator.destroy(b);
+            std.heap.page_allocator.free(b.data);
+            struct_alloc.destroy(b);
             current = next;
         }
-        self.free_list = null;
     }
 
+    /// Acquire a small (4 KiB) buffer. Most connections start here.
     pub fn acquire(self: *Pool) !*Buffer {
-        if (self.free_list) |b| {
-            self.free_list = b.next;
+        return self.acquireSize(SMALL_DATA_SIZE, &self.small_free);
+    }
+
+    /// Acquire a large (16 KiB) buffer. Used either as the initial buffer
+    /// for connections expected to handle big payloads, or as the upgrade
+    /// target when a small buffer fills before parsing succeeds.
+    pub fn acquireLarge(self: *Pool) !*Buffer {
+        return self.acquireSize(LARGE_DATA_SIZE, &self.large_free);
+    }
+
+    fn acquireSize(self: *Pool, size: usize, list: *?*Buffer) !*Buffer {
+        if (list.*) |b| {
+            list.* = b.next;
+            b.next = null;
+            b.released_at_ns = 0;
+            b.advised = false;
             return b;
         }
-        const new_buf = try self.allocator.create(Buffer);
-        new_buf.next = null;
-        return new_buf;
+        const buf = try self.allocator.create(Buffer);
+        // Page allocator → mmap → page-aligned. Required for MADV_DONTNEED
+        // to actually release the underlying physical pages.
+        buf.data = std.heap.page_allocator.alloc(u8, size) catch |err| {
+            self.allocator.destroy(buf);
+            return err;
+        };
+        buf.next = null;
+        buf.released_at_ns = 0;
+        buf.advised = false;
+        return buf;
     }
 
-    pub fn release(self: *Pool, buf: *Buffer) void {
-        buf.next = self.free_list;
-        self.free_list = buf;
+    /// Return a buffer to the free list. `now_ns` is the moment the
+    /// connection went idle, used by `sweepIdle` to decide when to advise.
+    /// If the caller doesn't track time, passing 0 keeps the buffer
+    /// resident indefinitely.
+    pub fn release(self: *Pool, buf: *Buffer, now_ns: i64) void {
+        buf.released_at_ns = now_ns;
+        if (buf.data.len == LARGE_DATA_SIZE) {
+            buf.next = self.large_free;
+            self.large_free = buf;
+        } else {
+            buf.next = self.small_free;
+            self.small_free = buf;
+        }
+    }
+
+    /// Walk the free lists and call `madvise(MADV_DONTNEED)` on every
+    /// buffer that has been idle longer than `IDLE_ADVISE_NS`. The page-
+    /// aligned data block is released to the kernel; subsequent re-use
+    /// costs a soft fault per page touched (microseconds). No-op outside
+    /// Linux.
+    pub fn sweepIdle(self: *Pool, now_ns: i64) void {
+        if (comptime builtin.os.tag != .linux) return;
+        adviseList(self.small_free, now_ns);
+        adviseList(self.large_free, now_ns);
+    }
+
+    fn adviseList(head: ?*Buffer, now_ns: i64) void {
+        var node = head;
+        while (node) |b| {
+            if (!b.advised and b.released_at_ns != 0 and (now_ns - b.released_at_ns) > IDLE_ADVISE_NS) {
+                _ = c.madvise(b.data.ptr, b.data.len, c.MADV_DONTNEED);
+                b.advised = true;
+            }
+            node = b.next;
+        }
     }
 };

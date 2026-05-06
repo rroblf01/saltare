@@ -43,7 +43,7 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-const SERVER_HEADER = "saltare/0.15.0";
+const SERVER_HEADER = "saltare/0.16.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -665,7 +665,7 @@ const Connection = struct {
             self.dispatch_handle = 0;
         }
         if (self.ssl) |s| tls.freeSsl(s);
-        if (self.read_buf) |b| self.pool.release(b);
+        if (self.read_buf) |b| self.pool.release(b, monoNs());
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
         _ = c.close(self.fd);
         // Pair with the increment in acceptAll. Subtract before destroying
@@ -690,9 +690,25 @@ const Connection = struct {
 
     fn releaseBuffer(self: *Connection) void {
         if (self.read_buf) |b| {
-            self.pool.release(b);
+            self.pool.release(b, monoNs());
             self.read_buf = null;
         }
+    }
+
+    /// Swap the connection's small buffer for a large one, copying the
+    /// in-flight read bytes across. Called from `doReadHttp` when a small
+    /// buffer fills before the headers fit, and from `dispatch()` when
+    /// `body_offset + body_len` would overflow the small data block but
+    /// fits in the large one. The caller must not have called `parse()`
+    /// successfully yet — `parsed.headers` would otherwise dangle (the
+    /// headers array lives inside the buffer struct).
+    fn upgradeBuffer(self: *Connection) !void {
+        const old = self.read_buf orelse return;
+        if (old.data.len == pool_mod.LARGE_DATA_SIZE) return; // already large
+        const large = try self.pool.acquireLarge();
+        @memcpy(large.data[0..self.read_total], old.data[0..self.read_total]);
+        self.pool.release(old, monoNs());
+        self.read_buf = large;
     }
 };
 
@@ -863,6 +879,11 @@ pub fn run(
         // case lag past a 1 s deadline is one bucket; granularity of all
         // four configurable timeouts is therefore ±1 s.
         wheel.tick(wheel.nowSec(), tick_ctx, fireExpired);
+
+        // Hint long-idle pool buffers to the kernel via MADV_DONTNEED so
+        // RSS recovers after a traffic peak. Cost: O(free_list_size)
+        // pointer-chase per loop iteration. Linux only; macOS no-ops.
+        rb_pool.sweepIdle(monoNs());
 
         // Drive any stalled HTTP dispatches forward. One global asyncio
         // pump advances every parked Task by one step; we then walk the
@@ -1129,11 +1150,22 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
-    const data = &conn.read_buf.?.data;
+    var data = conn.read_buf.?.data;
 
     while (true) {
         const remaining = data[conn.read_total..];
         if (remaining.len == 0) {
+            // Buffer full and we still don't have a complete head. If we're
+            // on the small buffer, upgrade to the large one and keep going;
+            // otherwise the headers genuinely don't fit (431).
+            if (conn.parsed == null and data.len < pool_mod.LARGE_DATA_SIZE) {
+                conn.upgradeBuffer() catch {
+                    sendStatus(loop, conn, 503, "Service Unavailable");
+                    return;
+                };
+                data = conn.read_buf.?.data;
+                continue;
+            }
             sendStatus(loop, conn, 431, "Request Header Fields Too Large");
             return;
         }
@@ -1172,8 +1204,36 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                         return;
                     }
                     if (conn.body_offset + conn.body_len > data.len) {
-                        sendStatus(loop, conn, 413, "Content Too Large");
-                        return;
+                        // The declared body doesn't fit the current buffer.
+                        // If we're still on small and the large would
+                        // accommodate it, upgrade. Otherwise 413.
+                        if (data.len < pool_mod.LARGE_DATA_SIZE and
+                            conn.body_offset + conn.body_len <= pool_mod.LARGE_DATA_SIZE)
+                        {
+                            // parsed.headers points into the small buffer's
+                            // headers array; clear it before swapping
+                            // buffers so we don't keep a dangling slice.
+                            // We re-parse against the new buffer below.
+                            conn.parsed = null;
+                            conn.upgradeBuffer() catch {
+                                sendStatus(loop, conn, 503, "Service Unavailable");
+                                return;
+                            };
+                            data = conn.read_buf.?.data;
+                            // Re-parse into the new (large) buffer's headers
+                            // array. The bytes are already there from the
+                            // upgrade copy.
+                            const reparsed = http.parse(data[0..conn.read_total], &conn.read_buf.?.headers) catch {
+                                sendStatus(loop, conn, 400, "Bad Request");
+                                return;
+                            };
+                            conn.parsed = reparsed;
+                            conn.body_offset = reparsed.body_offset;
+                            conn.body_len = reparsed.content_length orelse 0;
+                        } else {
+                            sendStatus(loop, conn, 413, "Content Too Large");
+                            return;
+                        }
                     }
                 }
                 // Honour `Expect: 100-continue` by writing the interim
@@ -1278,7 +1338,7 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         }
     }
 
-    const data = &conn.read_buf.?.data;
+    const data = conn.read_buf.?.data;
     const body = data[conn.body_offset .. conn.body_offset + conn.body_len];
     var keep_alive = req.wantsKeepAlive();
     // Recycle the connection once we've served `max_keepalive_requests` on
@@ -1522,7 +1582,7 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
 // response frames are queued on `write_buf` for doWrite to drain.
 
 fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
-    const data = &conn.read_buf.?.data;
+    const data = conn.read_buf.?.data;
 
     while (true) {
         // Try to parse a frame from what's already buffered.
@@ -1704,7 +1764,7 @@ fn wsAfterWrite(loop: *eventloop.Loop, conn: *Connection) void {
     // here on the non-first path or we'll re-process the same frame.
     const first_call = conn.parsed != null;
     if (first_call) {
-        const data = &conn.read_buf.?.data;
+        const data = conn.read_buf.?.data;
         const consumed_end = conn.body_offset + conn.body_len;
         const leftover = conn.read_total - consumed_end;
         if (leftover > 0) {
@@ -1784,7 +1844,7 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
     conn.chunk_decoded = 0;
 
     if (leftover > 0) {
-        const data = &conn.read_buf.?.data;
+        const data = conn.read_buf.?.data;
         // Forward in-place copy: dest_start (0) < src_start (consumed_end),
         // so a left-to-right loop handles overlap correctly.
         var i: usize = 0;
@@ -1847,7 +1907,7 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
-    const data = &conn.read_buf.?.data;
+    const data = conn.read_buf.?.data;
     if (http.parse(data[0..conn.read_total], &conn.read_buf.?.headers)) |req| {
         conn.parsed = req;
         conn.body_offset = req.body_offset;
@@ -1890,8 +1950,27 @@ fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
                 return;
             }
             if (conn.body_offset + conn.body_len > data.len) {
-                sendStatus(loop, conn, 413, "Content Too Large");
-                return;
+                if (data.len < pool_mod.LARGE_DATA_SIZE and
+                    conn.body_offset + conn.body_len <= pool_mod.LARGE_DATA_SIZE)
+                {
+                    // Same upgrade dance as in doReadHttp.
+                    conn.parsed = null;
+                    conn.upgradeBuffer() catch {
+                        sendStatus(loop, conn, 503, "Service Unavailable");
+                        return;
+                    };
+                    const big = conn.read_buf.?.data;
+                    const reparsed = http.parse(big[0..conn.read_total], &conn.read_buf.?.headers) catch {
+                        sendStatus(loop, conn, 400, "Bad Request");
+                        return;
+                    };
+                    conn.parsed = reparsed;
+                    conn.body_offset = reparsed.body_offset;
+                    conn.body_len = reparsed.content_length orelse 0;
+                } else {
+                    sendStatus(loop, conn, 413, "Content Too Large");
+                    return;
+                }
             }
             if (wantsExpectContinue(req)) {
                 if (!sendContinue(conn)) {
