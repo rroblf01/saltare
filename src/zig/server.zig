@@ -45,6 +45,10 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
+// glibc-only — guarded with `if (builtin.os.tag == .linux)` at every
+// call site so the extern stays cold on macOS / non-glibc builds.
+extern fn malloc_trim(pad: usize) c_int;
+
 const SERVER_HEADER = "saltare/1.3.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
@@ -118,6 +122,15 @@ pub const Observability = struct {
     /// enable if your app's CORS policy actually IS permissive — Zig
     /// doesn't read your app's allow-list.
     cors_preflight_allow_all: bool = false,
+    /// If true, the first line of every accepted connection is parsed
+    /// as a HAProxy PROXY-protocol v1 header (`PROXY TCP4 src dst sport
+    /// dport\r\n`). The src address replaces the TCP peer for rate
+    /// limiting + access logging — required when saltare sits behind a
+    /// L4 load balancer (AWS NLB, HAProxy v1, GCP TCP LB) that won't
+    /// add HTTP headers like `X-Forwarded-For`. Connections that don't
+    /// start with a valid header get closed immediately. v1 only
+    /// (text); v2 (binary) is the next step but seldom needed.
+    proxy_protocol: bool = false,
     /// If non-null, requests to this path return a top-N tracemalloc
     /// dump (Python heap allocations grouped by source line). Setting
     /// this also auto-enables `tracemalloc.start()` at startup so the
@@ -165,6 +178,21 @@ pub const Limits = struct {
     /// per-IP table is shared with the rate limiter; both share the
     /// 4096-entry cap.
     max_connections_per_ip: u32 = 0,
+    /// `listen(2)` backlog. Default 256 covers most setups; bursty
+    /// public-facing servers behind no L4 LB may want 1024+ to absorb
+    /// SYN bursts without dropping. Capped by `net.core.somaxconn` —
+    /// the kernel silently truncates if you ask for more.
+    listen_backlog: c_int = 256,
+    /// TCP keepalive cadence (seconds). All zero-or-negative values
+    /// fall back to the kernel default (usually 7200/75/9 — way too
+    /// long for mobile clients). Setting them tightens dead-conn
+    /// detection: idle conns send the first probe after `tcp_keepidle`
+    /// seconds, then a probe every `tcp_keepintvl`, and give up after
+    /// `tcp_keepcnt` unanswered probes. `SO_KEEPALIVE` is set
+    /// unconditionally on every accepted socket.
+    tcp_keepidle: i32 = 0,
+    tcp_keepintvl: i32 = 0,
+    tcp_keepcnt: i32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -371,6 +399,23 @@ fn rateLimitAllow(peer: *const [16]u8, now_ns: i64) bool {
     };
     return true;
 }
+
+// SIGUSR1 stats-dump request flag. The signal handler sets it; the main
+// loop polls it once per iteration and emits a one-line JSON record on
+// stderr. Operational diagnostic — `kill -USR1 $(pidof saltare)` to
+// snapshot connection / RAM state without an HTTP probe.
+var g_dump_stats: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+// SIGHUP request flag for run-time config reopen — reserved for v1.4.
+// Currently unused; setting it does nothing.
+
+// Counters driven by the maintenance tick (idle GC + malloc_trim).
+var g_idle_ticks: u32 = 0;
+const IDLE_GC_TICKS: u32 = 30; // 30 × 100 ms = 3 s of zero events
+// Once this many consecutive idle ticks have passed since the last
+// maintenance pass, run a GC + malloc_trim to recover heap fragmentation
+// accumulated during the previous burst. Re-armed after each maintenance.
+// Cheap when triggered (a few hundred microseconds for a small heap);
+// skipped when traffic is steady so we never pay it on the hot path.
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
@@ -846,11 +891,34 @@ fn onSignal(_: c_int) callconv(.c) void {
 
 fn ignoreSignal(_: c_int) callconv(.c) void {}
 
+fn onUsr1(_: c_int) callconv(.c) void {
+    g_dump_stats.store(true, .seq_cst);
+}
+
 fn installSignalHandlers() void {
     // Translate-c rejects SIG_ERR / SIG_IGN sentinel values; see memory note.
     _ = c.signal(c.SIGINT, &onSignal);
     _ = c.signal(c.SIGTERM, &onSignal);
     _ = c.signal(c.SIGPIPE, &ignoreSignal);
+    _ = c.signal(c.SIGUSR1, &onUsr1);
+}
+
+/// Emit a one-line JSON snapshot of saltare's runtime state on stderr.
+/// Triggered by `SIGUSR1`; never throws (best-effort `write(2)`).
+/// Format: `{"event":"saltare.stats","open_conns":N,"in_flight":M,...}`.
+fn dumpStats() void {
+    const open_conns = g_active_conns.load(.seq_cst);
+    const in_flight = g_in_flight.load(.seq_cst);
+    const total_reqs = g_total_requests.load(.seq_cst);
+    const rss_kib: u64 = if (comptime builtin.os.tag == .linux) (readVmRssBytes() / 1024) else 0;
+    var buf: [512]u8 = undefined;
+    const out = std.fmt.bufPrint(
+        &buf,
+        "{{\"event\":\"saltare.stats\",\"open_conns\":{d},\"in_flight\":{d}," ++
+            "\"requests_total\":{d},\"rss_kib\":{d},\"rl_table_size\":{d}}}\n",
+        .{ open_conns, in_flight, total_reqs, rss_kib, g_rl_count },
+    ) catch return;
+    _ = c.write(2, out.ptr, out.len);
 }
 
 fn parseIpv4(host: []const u8, port: u16) !c.struct_sockaddr_in {
@@ -905,6 +973,10 @@ fn parseIpv6(host: []const u8, port: u16) !c.struct_sockaddr_in6 {
 }
 
 const ConnState = enum {
+    /// PROXY-protocol v1 line still being read. Only entered when
+    /// `proxy_protocol=True`; transitions to `.handshaking` (TLS) or
+    /// `.reading` (plain) once the line is fully parsed.
+    proxy_pending,
     /// TLS handshake in progress. Plaintext connections start in `.reading`.
     handshaking,
     reading,
@@ -1140,6 +1212,37 @@ const Connection = struct {
     }
 };
 
+/// Detect systemd socket activation per the `sd_listen_fds(3)`
+/// protocol. Returns `fd 3` (the first inherited socket) when:
+///   1. `LISTEN_PID` env equals our pid (so we don't pick up a fd
+///      meant for a parent that re-execed us);
+///   2. `LISTEN_FDS` is set to a positive number (we use the first).
+/// On match, the env vars are cleared so children we fork later don't
+/// inherit them and re-resolve the same fd. Returns null when not
+/// running under systemd socket activation.
+fn detectSystemdSocket() ?c_int {
+    const pid_z = std.c.getenv("LISTEN_PID") orelse return null;
+    const fds_z = std.c.getenv("LISTEN_FDS") orelse return null;
+    const pid_str = std.mem.span(@as([*:0]const u8, @ptrCast(pid_z)));
+    const fds_str = std.mem.span(@as([*:0]const u8, @ptrCast(fds_z)));
+    const expected_pid = std.fmt.parseInt(c.pid_t, pid_str, 10) catch return null;
+    if (expected_pid != c.getpid()) return null;
+    const n_fds = std.fmt.parseInt(c_int, fds_str, 10) catch return null;
+    if (n_fds < 1) return null;
+    // sd_listen_fds reserves fds [3, 3 + n_fds). We accept the first.
+    const fd: c_int = 3;
+    // Best-effort: clear so forked workers don't re-detect.
+    _ = unsetenvC("LISTEN_PID");
+    _ = unsetenvC("LISTEN_FDS");
+    _ = unsetenvC("LISTEN_FDNAMES");
+    return fd;
+}
+
+extern fn unsetenv(name: [*:0]const u8) c_int;
+inline fn unsetenvC(name: [*:0]const u8) c_int {
+    return unsetenv(name);
+}
+
 /// Public wrapper used by the multi-worker master to bind the listen
 /// socket once before forking. Workers later receive this fd via
 /// `run(..., inherited_listen_fd=fd)`.
@@ -1165,7 +1268,7 @@ fn bindTcpSocket(host: []const u8, port: u16) !c_int {
         return error.SetsockoptFailed;
     }
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
-    if (c.listen(fd, 256) != 0) return error.ListenFailed;
+    if (c.listen(fd, g_limits.listen_backlog) != 0) return error.ListenFailed;
     return fd;
 }
 
@@ -1190,7 +1293,7 @@ fn bindTcpSocketV6(host: []const u8, port: u16) !c_int {
         return error.SetsockoptFailed;
     }
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
-    if (c.listen(fd, 256) != 0) return error.ListenFailed;
+    if (c.listen(fd, g_limits.listen_backlog) != 0) return error.ListenFailed;
     return fd;
 }
 
@@ -1222,7 +1325,7 @@ fn bindUnixSocket(path: []const u8) !c_int {
     }
 
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
-    if (c.listen(fd, 256) != 0) return error.ListenFailed;
+    if (c.listen(fd, g_limits.listen_backlog) != 0) return error.ListenFailed;
     return fd;
 }
 
@@ -1280,8 +1383,20 @@ pub fn run(
     // skip bind/listen and use that fd directly. UDS unlink on shutdown
     // is the master's responsibility, not the worker's — workers shouldn't
     // remove the socket the master also serves.
-    const owns_listen_fd = inherited_listen_fd == null;
+    //
+    // v1.3: also detect systemd socket activation. systemd's
+    // `sd_listen_fds` protocol passes inherited sockets via fd 3..3+N
+    // and signals it via `LISTEN_PID=<our_pid>` + `LISTEN_FDS=N`. We
+    // accept exactly one socket; multiple fds is out of scope here.
+    // The fd is treated as already-bound + listening; we don't try to
+    // re-bind it. Skipped when `inherited_listen_fd` is set (multi-
+    // worker master already bound) or `uds_path` is supplied (explicit
+    // UDS path takes precedence).
+    const sd_fd: ?c_int = if (inherited_listen_fd != null or uds_path != null) null else detectSystemdSocket();
+    const owns_listen_fd = inherited_listen_fd == null and sd_fd == null;
     const listen_fd: c_int = if (inherited_listen_fd) |fd|
+        fd
+    else if (sd_fd) |fd|
         fd
     else if (uds_path) |path|
         try bindUnixSocket(path)
@@ -1361,8 +1476,10 @@ pub fn run(
         // requests would each take 100 ms per await to unblock.
         const wait_timeout: c_int = if (g_stalled_head != null) 0 else 100;
         const events = loop.wait(wait_timeout);
+        var saw_event = false;
         for (events) |ev| {
             if (g_should_stop.load(.seq_cst)) break;
+            saw_event = true;
             if (isListenerEvent(ev.data)) {
                 // Skip listener events while draining — we already removed
                 // it from epoll above; this is just paranoia for any final
@@ -1375,6 +1492,11 @@ pub fn run(
                 handleConnEvent(&loop, conn, ev);
             }
         }
+
+        // SIGUSR1 stats dump — triggered by the operator via `kill -USR1`.
+        // Single-line JSON to stderr; never throws.
+        if (g_dump_stats.swap(false, .seq_cst)) dumpStats();
+
         // Sweep expired connections. With a 100 ms epoll poll, the worst-
         // case lag past a 1 s deadline is one bucket; granularity of all
         // four configurable timeouts is therefore ±1 s.
@@ -1384,6 +1506,25 @@ pub fn run(
         // RSS recovers after a traffic peak. Cost: O(free_list_size)
         // pointer-chase per loop iteration. Linux only; macOS no-ops.
         rb_pool.sweepIdle(monoNs());
+
+        // Idle maintenance: when the loop has been quiet for ~3 seconds
+        // (30 ticks of 100 ms with no events and nothing in-flight),
+        // run a Python `gc.collect(2)` + `malloc_trim(0)` to release
+        // fragmentation accumulated during the previous burst. Cheap
+        // when nothing's accumulated, expensive enough during a peak
+        // that gating it on idle-only matters. Skipped during graceful
+        // drain so we don't spend time GC'ing on the way out.
+        if (saw_event or g_in_flight.load(.seq_cst) > 0 or drain_started_sec >= 0) {
+            g_idle_ticks = 0;
+        } else {
+            g_idle_ticks += 1;
+            if (g_idle_ticks == IDLE_GC_TICKS) {
+                bridge.idleMaintenance();
+                if (comptime builtin.os.tag == .linux) {
+                    _ = malloc_trim(0);
+                }
+            }
+        }
 
         // Drive any stalled HTTP dispatches forward. One global asyncio
         // pump advances every parked Task by one step; we then walk the
@@ -1497,13 +1638,18 @@ fn acceptAll(
             conn.has_peer_key = true;
             // Per-IP connection cap. Decision is taken now, before
             // SSL handshake or any Python work — over-cap peers pay
-            // the cheapest possible cost (a TCP RST).
-            const acq = perIpConnAcquire(&conn.peer_key, monoNs());
-            if (acq.over_cap) {
-                conn.destroy();
-                continue;
+            // the cheapest possible cost (a TCP RST). Skipped when
+            // `proxy_protocol` is on — the real client IP isn't
+            // known yet (TCP peer is the proxy); the cap is re-checked
+            // after the PROXY header is parsed.
+            if (!g_obs.proxy_protocol) {
+                const acq = perIpConnAcquire(&conn.peer_key, monoNs());
+                if (acq.over_cap) {
+                    conn.destroy();
+                    continue;
+                }
+                conn.rl_entry_idx = acq.entry_idx;
             }
-            conn.rl_entry_idx = acq.entry_idx;
         }
         // Disable Nagle: most ASGI responses are a single small chunk,
         // so coalescing 40 ms before flushing only adds latency. Best-
@@ -1530,6 +1676,22 @@ fn acceptAll(
             @ptrCast(&tcp_nodelay),
             @sizeOf(c_int),
         );
+        // Tunable keepalive cadence — only set the values the operator
+        // explicitly opted into. Kernel defaults (7200 s idle, 75 s
+        // interval, 9 probes) are usually fine for LAN traffic but too
+        // generous for mobile / NAT-heavy fronts.
+        if (g_limits.tcp_keepidle > 0) {
+            var v = g_limits.tcp_keepidle;
+            _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPIDLE, @ptrCast(&v), @sizeOf(c_int));
+        }
+        if (g_limits.tcp_keepintvl > 0) {
+            var v = g_limits.tcp_keepintvl;
+            _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPINTVL, @ptrCast(&v), @sizeOf(c_int));
+        }
+        if (g_limits.tcp_keepcnt > 0) {
+            var v = g_limits.tcp_keepcnt;
+            _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPCNT, @ptrCast(&v), @sizeOf(c_int));
+        }
 
         // For TLS: attach a fresh SSL session to the new fd and start the
         // handshake on the next event. SSL_accept will signal WANT_READ on
@@ -1542,6 +1704,14 @@ fn acceptAll(
                 conn.destroy();
                 continue;
             }
+        }
+
+        // PROXY protocol v1 handshake. Read the line plaintext from
+        // the socket BEFORE TLS is started (the LB sends it as the
+        // first thing after the TCP handshake). State transitions to
+        // .handshaking / .reading once parsed.
+        if (g_obs.proxy_protocol) {
+            conn.state = .proxy_pending;
         }
 
         loop.add(client, @ptrCast(conn), true, false) catch {
@@ -1570,9 +1740,124 @@ fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event
     // which event woke us — the connRead / connWrite helpers map back to
     // EPOLL interest after each call.
     switch (conn.state) {
+        .proxy_pending => if (ev.readable or ev.writable) doProxyV1(loop, conn),
         .handshaking => doHandshake(loop, conn),
         .reading => if (ev.readable or ev.writable) doRead(loop, conn),
         .writing => if (ev.readable or ev.writable) doWrite(loop, conn),
+    }
+}
+
+/// Read + parse the PROXY-protocol v1 line. Called repeatedly from the
+/// main loop until the line completes. Once parsed, replaces
+/// `conn.peer_key` with the source-side address from the header,
+/// re-checks the per-IP connection cap, and transitions to
+/// `.handshaking` (TLS) or `.reading` (plain). Bytes received past
+/// the PROXY line are kept in `read_buf` for the HTTP parser to
+/// consume on the next iteration. We use the regular `read_buf` pool
+/// rather than a per-conn dedicated buffer so a connection that never
+/// sends the PROXY line costs no extra RAM.
+fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
+    conn.ensureBuffer() catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    const data = conn.read_buf.?.data;
+
+    // Read more if needed. Bound by the protocol max (107 bytes).
+    while (true) {
+        if (conn.read_total >= 107) break; // already enough; might still need parse
+        const remaining = data[conn.read_total..@min(data.len, 108)];
+        if (remaining.len == 0) break;
+        const cret = c.read(conn.fd, @ptrCast(remaining.ptr), remaining.len);
+        if (cret == 0) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        if (cret < 0) {
+            // EAGAIN — wait for next read event.
+            return;
+        }
+        conn.read_total += @intCast(cret);
+        if (std.mem.indexOfPos(u8, data[0..conn.read_total], 0, "\r\n") != null) break;
+    }
+
+    const buf = data[0..conn.read_total];
+    const crlf = std.mem.indexOfPos(u8, buf, 0, "\r\n") orelse {
+        // No CRLF yet and we haven't hit the cap → keep reading.
+        if (conn.read_total < 107) return;
+        // 107 bytes without CRLF = malformed.
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    const line = buf[0..crlf];
+
+    // Parse: PROXY <TCP4|TCP6|UNKNOWN> <src> <dst> <sport> <dport>
+    if (line.len < 5 or !std.mem.eql(u8, line[0..6], "PROXY ")) {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    }
+
+    var it = std.mem.tokenizeScalar(u8, line[6..], ' ');
+    const family = it.next() orelse {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    if (std.mem.eql(u8, family, "UNKNOWN")) {
+        // No reliable client IP; keep the TCP peer (already populated).
+    } else if (std.mem.eql(u8, family, "TCP4") or std.mem.eql(u8, family, "TCP6")) {
+        const src_str = it.next() orelse {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
+        // We don't care about dst / sport / dport for rate limiting.
+        if (parseFirstForwardedIp(src_str)) |key| {
+            conn.peer_key = key;
+            conn.has_peer_key = true;
+        }
+    } else {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    }
+
+    // Re-check the per-IP connection cap now that we know the real
+    // client. Skipped at accept-time when proxy_protocol is on.
+    if (g_limits.max_connections_per_ip > 0 and conn.has_peer_key) {
+        const acq = perIpConnAcquire(&conn.peer_key, monoNs());
+        if (acq.over_cap) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        conn.rl_entry_idx = acq.entry_idx;
+    }
+
+    // Compact the read buffer past the PROXY line. Subsequent bytes
+    // (the HTTP request, if any has arrived already) start at index 0.
+    const consumed = crlf + 2;
+    const leftover = conn.read_total - consumed;
+    if (leftover > 0) {
+        std.mem.copyForwards(u8, data[0..leftover], data[consumed .. consumed + leftover]);
+    }
+    conn.read_total = leftover;
+
+    // Transition to the next phase. TLS connections do the handshake
+    // first; plaintext go straight to reading HTTP.
+    if (conn.ssl != null) {
+        conn.state = .handshaking;
+        doHandshake(loop, conn);
+    } else {
+        conn.state = .reading;
+        // If the HTTP request arrived in the same packet as the PROXY
+        // line, kick the parser immediately — there's no edge-trigger
+        // event coming.
+        if (leftover > 0) doReadHttp(loop, conn);
     }
 }
 
@@ -1872,6 +2157,19 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
 fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     const req = conn.parsed.?;
 
+    // RFC 7230 §5.4: HTTP/1.1 requests MUST carry a non-empty Host
+    // header. A missing or empty value is a 400. HTTP/1.0 has no such
+    // requirement (predates virtual hosting). Cheap check here so user
+    // apps don't have to defend against malformed requests.
+    if (req.version_minor >= 1) {
+        const host = req.header("host") orelse {
+            return sendStatus(loop, conn, 400, "Bad Request");
+        };
+        if (std.mem.trim(u8, host, " \t").len == 0) {
+            return sendStatus(loop, conn, 400, "Bad Request");
+        }
+    }
+
     if (req.isWebSocketUpgrade()) {
         return startWebSocket(loop, conn);
     }
@@ -1930,10 +2228,20 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         var rl_key: [16]u8 = undefined;
         var rl_have_key = false;
         if (g_obs.proxy_headers) {
-            if (req.header("x-forwarded-for")) |xff| {
-                if (parseFirstForwardedIp(xff)) |xff_key| {
-                    rl_key = xff_key;
+            // X-Real-IP (single IP) wins over X-Forwarded-For (chain),
+            // matching the Python-side ASGI scope-build precedence.
+            if (req.header("x-real-ip")) |xri| {
+                if (parseFirstForwardedIp(xri)) |xri_key| {
+                    rl_key = xri_key;
                     rl_have_key = true;
+                }
+            }
+            if (!rl_have_key) {
+                if (req.header("x-forwarded-for")) |xff| {
+                    if (parseFirstForwardedIp(xff)) |xff_key| {
+                        rl_key = xff_key;
+                        rl_have_key = true;
+                    }
                 }
             }
         }

@@ -32,19 +32,31 @@ extern fn mallopt(param: c_int, value: c_int) c_int;
 
 // glibc <malloc.h> macros — values are stable ABI.
 const M_ARENA_MAX: c_int = -8;
+const M_TRIM_THRESHOLD: c_int = -1;
+const M_TOP_PAD: c_int = -2;
+const M_MMAP_THRESHOLD: c_int = -3;
 
-/// Cap glibc's per-thread malloc arenas to a single arena. saltare's I/O
-/// loop is single-threaded per worker, so multiple arenas only spread the
-/// same allocations across more pages, inflating RSS via per-arena slack.
-/// `MALLOC_ARENA_MAX=1` does the same thing via env var; calling mallopt()
-/// here means library users (saltare imported as a module) get the saving
-/// without having to set the env var before the process starts.
-/// The env var path is still recommended for production: it lands earlier
-/// (before any allocations) and a few KiB of arena state may already exist
-/// by the time PyInit__core runs.
+/// Tighten glibc's malloc tuning for our workload — single-threaded I/O
+/// loop with bursty allocations and idle valleys. We ask for:
+///   - `M_ARENA_MAX = 1`        : one arena (no per-thread spread).
+///   - `M_TRIM_THRESHOLD 64K`   : trim heap top to OS as soon as 64 KiB
+///     of contiguous free space accumulates (default 128 KiB). Returns
+///     pages to the OS aggressively so RSS drops back to floor between
+///     bursts.
+///   - `M_TOP_PAD 64K`          : keep at most 64 KiB of slack at heap
+///     top after each trim (default 128 KiB). Smaller floor at idle.
+///   - `M_MMAP_THRESHOLD 64K`   : route allocs ≥ 64 KiB through `mmap`
+///     instead of the heap (default 128 KiB). Free returns the pages
+///     to the OS immediately rather than parking them in the arena.
+///     Trade: a few extra `mmap`/`munmap` syscalls per request peak.
+/// All of these are no-ops on non-glibc targets — the extern reference
+/// stays cold and the call is dead-code-eliminated under `if (linux)`.
 fn capMallocArenas() void {
     if (comptime builtin.os.tag != .linux) return;
     _ = mallopt(M_ARENA_MAX, 1);
+    _ = mallopt(M_TRIM_THRESHOLD, 64 * 1024);
+    _ = mallopt(M_TOP_PAD, 64 * 1024);
+    _ = mallopt(M_MMAP_THRESHOLD, 64 * 1024);
 }
 
 /// Move every currently-tracked Python object to the GC's "permanent
@@ -119,10 +131,15 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var favicon_204_flag: c_int = 0;
     var max_conn_per_ip: c_uint = 0;
     var access_log_path_z: [*c]const u8 = null;
+    var listen_backlog: c_int = 256;
+    var tcp_keepidle: c_int = 0;
+    var tcp_keepintvl: c_int = 0;
+    var tcp_keepcnt: c_int = 0;
+    var proxy_protocol_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIz",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiii",
         &app,
         &host_z,
         &port,
@@ -150,6 +167,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &favicon_204_flag,
         &max_conn_per_ip,
         &access_log_path_z,
+        &listen_backlog,
+        &tcp_keepidle,
+        &tcp_keepintvl,
+        &tcp_keepcnt,
+        &proxy_protocol_flag,
     ) == 0) {
         return null;
     }
@@ -179,6 +201,10 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .rate_limit_per_sec = @intCast(rate_limit_per_sec),
         .rate_limit_burst = @intCast(rate_limit_burst),
         .max_connections_per_ip = @intCast(max_conn_per_ip),
+        .listen_backlog = listen_backlog,
+        .tcp_keepidle = tcp_keepidle,
+        .tcp_keepintvl = tcp_keepintvl,
+        .tcp_keepcnt = tcp_keepcnt,
     };
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
@@ -193,6 +219,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .proxy_headers = proxy_headers_flag != 0,
         .cors_preflight_allow_all = cors_preflight_flag != 0,
         .favicon_204 = favicon_204_flag != 0,
+        .proxy_protocol = proxy_protocol_flag != 0,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 

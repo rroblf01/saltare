@@ -29,4 +29,9 @@ def serve(
     favicon_204: int = ...,
     max_connections_per_ip: int = ...,
     access_log_path: str | None = ...,
+    listen_backlog: int = ...,
+    tcp_keepidle: int = ...,
+    tcp_keepintvl: int = ...,
+    tcp_keepcnt: int = ...,
+    proxy_protocol: int = ...,
 ) -> None: ...

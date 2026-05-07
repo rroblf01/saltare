@@ -361,6 +361,31 @@ pub fn httpGlobalPump() void {
     py.Py_DecRef(result);
 }
 
+/// Run `gc.collect(2)` + `gc.freeze()` once. The server calls this from
+/// its idle-maintenance tick to release reference cycles accumulated
+/// during the previous traffic burst, then re-freezes the surviving
+/// objects so the next cyclic-GC sweep doesn't dirty CoW pages in
+/// multi-worker setups. Best-effort — any error clears.
+pub fn idleMaintenance() void {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+    const gc_module = py.PyImport_ImportModule("gc") orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    defer py.Py_DecRef(gc_module);
+    if (py.PyObject_CallMethod(gc_module, "collect", "i", @as(c_int, 2))) |result| {
+        py.Py_DecRef(result);
+    } else {
+        py.PyErr_Clear();
+    }
+    if (py.PyObject_CallMethod(gc_module, "freeze", null)) |result| {
+        py.Py_DecRef(result);
+    } else {
+        py.PyErr_Clear();
+    }
+}
+
 /// Start Python's tracemalloc tracker. Called once at server startup
 /// when `tracemalloc_path` is configured. Idempotent — safe to call
 /// even if tracemalloc was already started by something else.

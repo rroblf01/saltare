@@ -268,6 +268,32 @@ def main(argv: list[str] | None = None) -> None:
         help="emit `Server-Timing: total;dur=<ms>` on every response",
     )
     parser.add_argument(
+        "--listen-backlog",
+        type=int,
+        default=256,
+        metavar="N",
+        help="`listen(2)` backlog (default 256). Capped by /proc/sys/net/core/somaxconn.",
+    )
+    parser.add_argument(
+        "--tcp-keepidle", type=int, default=0, metavar="SEC",
+        help="seconds idle before kernel sends first keepalive probe "
+             "(0 = kernel default, usually 7200)",
+    )
+    parser.add_argument(
+        "--tcp-keepintvl", type=int, default=0, metavar="SEC",
+        help="seconds between keepalive probes (0 = kernel default, usually 75)",
+    )
+    parser.add_argument(
+        "--tcp-keepcnt", type=int, default=0, metavar="N",
+        help="unanswered probes before connection is dropped (0 = kernel default, usually 9)",
+    )
+    parser.add_argument(
+        "--proxy-protocol",
+        action="store_true",
+        help="parse HAProxy PROXY-protocol v1 line at every accept "
+             "(required behind L4 LBs like AWS NLB / HAProxy)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -306,4 +332,9 @@ def main(argv: list[str] | None = None) -> None:
         access_log_path=args.access_log_path,
         request_id_header=args.request_id_header,
         server_timing=args.server_timing,
+        listen_backlog=args.listen_backlog,
+        tcp_keepidle=args.tcp_keepidle,
+        tcp_keepintvl=args.tcp_keepintvl,
+        tcp_keepcnt=args.tcp_keepcnt,
+        proxy_protocol=args.proxy_protocol,
     )

@@ -41,6 +41,11 @@ def run(
     access_log_path: str | None = None,
     request_id_header: str | None = None,
     server_timing: bool = False,
+    listen_backlog: int = 256,
+    tcp_keepidle: int = 0,
+    tcp_keepintvl: int = 0,
+    tcp_keepcnt: int = 0,
+    proxy_protocol: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -183,4 +188,9 @@ def run(
         int(bool(favicon_204)),
         int(max_connections_per_ip),
         access_log_path,
+        int(listen_backlog),
+        int(tcp_keepidle),
+        int(tcp_keepintvl),
+        int(tcp_keepcnt),
+        int(bool(proxy_protocol)),
     )

@@ -1080,23 +1080,37 @@ def http_dispatch_start(
     effective_client: tuple[str, int] | None = None
 
     if _proxy_headers_enabled:
+        # nginx convention: `X-Real-IP` carries a single client IP,
+        # whereas `X-Forwarded-For` is the comma-separated chain. If
+        # both are present, X-Real-IP wins (most-specific). When only
+        # one is set, that one is used.
+        x_real_ip: bytes | None = None
+        x_forwarded_for: bytes | None = None
         for name, value in headers:
-            if name == b"x-forwarded-for":
-                # Convention: leftmost IP is the original client; entries
-                # to the right are intermediate proxies. We trust the
-                # whole chain here — saltare assumes the immediate peer
-                # is a trusted proxy that already filtered spoofed values.
-                first = value.split(b",", 1)[0].strip()
-                if first:
-                    try:
-                        ip = first.decode("ascii")
-                        effective_client = (ip, 0)
-                    except UnicodeDecodeError:
-                        pass
+            if name == b"x-real-ip":
+                x_real_ip = value
+            elif name == b"x-forwarded-for":
+                x_forwarded_for = value
             elif name == b"x-forwarded-proto":
                 proto = value.strip().lower()
                 if proto in (b"http", b"https"):
                     effective_scheme = proto.decode("ascii")
+        # Pick the more-specific source.
+        client_raw: bytes | None = None
+        if x_real_ip is not None:
+            client_raw = x_real_ip.strip()
+        elif x_forwarded_for is not None:
+            # Convention: leftmost IP is the original client; entries
+            # to the right are intermediate proxies. We trust the
+            # whole chain here — saltare assumes the immediate peer
+            # is a trusted proxy that already filtered spoofed values.
+            client_raw = x_forwarded_for.split(b",", 1)[0].strip()
+        if client_raw:
+            try:
+                ip = client_raw.decode("ascii")
+                effective_client = (ip, 0)
+            except UnicodeDecodeError:
+                pass
 
     # v1.3: synthesise the request ID up front so the app sees it in
     # scope (as `scope["x-request-id"]`) AND `_emit_headers` can echo
