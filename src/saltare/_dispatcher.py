@@ -1720,7 +1720,15 @@ def http_dispatch_start(
     if _traceparent_propagation:
         for name, value in headers:
             if name == b"traceparent":
-                traceparent_bytes = value
+                # W3C says traceparent is a fixed 55 chars
+                # (`00-<32hex>-<16hex>-<2hex>`). Length cap defends
+                # the response-header echo path against an
+                # adversarial client trying to bloat the response or
+                # smuggle bytes — anything past 256 B we still
+                # surface on `scope` for the app to inspect, but
+                # we don't echo it back.
+                if len(value) <= 256:
+                    traceparent_bytes = value
                 try:
                     scope["traceparent"] = value.decode("ascii")
                 except UnicodeDecodeError:
@@ -1814,10 +1822,25 @@ def http_dispatch_start(
                     _release_http_state(s)
                     return (handle, chunks, True)
         chunks += _finalize_if_needed(handle, s)
+        # Stash any sendfile request before releasing the state — the
+        # bridge calls `http_dispatch_pop_sendfile(handle)` AFTER the
+        # state has been released back to the pool. Pool reset would
+        # otherwise zero `_sendfile_path` and the bridge would see an
+        # empty path → fall through to the normal write path → close
+        # without writing anything.
+        if s._sendfile_path:
+            _pending_sendfiles[handle] = (s._sendfile_path, s.status, s.out_headers, bool(s.ka))
         state_obj.http_states.pop(handle, None)
         _release_http_state(s)
 
     return (handle, chunks, done)
+
+
+# v1.4 sendfile stash. `http_dispatch_pop_sendfile` is called AFTER
+# the state has been released to the pool; the path needs to live
+# somewhere keyed by handle. Plain dict (handle → tuple); cleared by
+# the pop fn so it doesn't grow unbounded.
+_pending_sendfiles: dict[int, tuple[str, int, list[tuple[bytes, bytes]], bool]] = {}
 
 
 def http_dispatch_push_body(
@@ -1899,11 +1922,7 @@ def http_dispatch_pop_sendfile(handle: int) -> tuple[str, int, list[tuple[bytes,
     for sendfile — caller should fall back to the normal write path.
     Called by the bridge once after `http_dispatch_start`/`drain`
     returned `done=True`."""
-    state_obj = _ensure_state()
-    s = state_obj.http_states.get(handle)
-    if s is None or not s._sendfile_path:
-        return ("", 0, [], False)
-    return (s._sendfile_path, s.status, s.out_headers, bool(s.ka))
+    return _pending_sendfiles.pop(handle, ("", 0, [], False))
 
 
 def http_dispatch_abort(handle: int) -> None:

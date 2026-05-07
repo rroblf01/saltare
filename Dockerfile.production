@@ -54,8 +54,13 @@ ENV PATH=/opt/python/${PYTHON_TAG}/bin:${PATH}
 # (better gen-0 churn handling for short-lived alloc patterns); set
 # `LD_PRELOAD=/usr/lib64/libjemalloc.so.2` to switch back if your
 # workload prefers jemalloc's fragmentation curve.
-RUN dnf install -y jemalloc mimalloc && dnf clean all || \
-    dnf install -y jemalloc && dnf clean all
+#
+# v1.4 also ships brotli + zstd as response-encoding options (lazy
+# dlopen-only — only loaded when `--response-brotli` / `--response-zstd`
+# are on, so the floor RAM is unaffected). Including the runtime libs
+# here means production users can flip the flags without rebuilding.
+RUN dnf install -y jemalloc mimalloc brotli libzstd && dnf clean all || \
+    dnf install -y jemalloc brotli libzstd && dnf clean all
 
 COPY --from=builder /dist /dist
 RUN pip install --no-deps /dist/saltare-*.whl \

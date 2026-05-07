@@ -191,6 +191,31 @@ def run(
     )
     _dispatcher.set_response_brotli(bool(response_brotli), int(response_brotli_quality))
     _dispatcher.set_response_zstd(bool(response_zstd), int(response_zstd_level))
+    # v1.4: probe each enabled codec once at startup. If `--response-brotli`
+    # / `--response-zstd` is on but the system shared library is absent
+    # (musl base, slim images), the dispatcher would silently fall back
+    # to identity per-request — operator wouldn't know their flag is a
+    # no-op. Emit a single-line stderr warning so the misconfiguration
+    # is visible in container logs.
+    import sys as _sys
+    if response_brotli:
+        if _core.brotli_encode(b"probe", int(response_brotli_quality)) is None:
+            _sys.stderr.write(
+                "saltare: warning: --response-brotli is on but libbrotlienc.so.1 "
+                "could not be dlopen'd; falling back to gzip / identity\n"
+            )
+    if response_zstd:
+        if _core.zstd_encode(b"probe", int(response_zstd_level)) is None:
+            _sys.stderr.write(
+                "saltare: warning: --response-zstd is on but libzstd.so.1 "
+                "could not be dlopen'd; falling back to gzip / identity\n"
+            )
+    if response_gzip or request_decompression:
+        if _core.gzip_encode(b"probe", int(response_gzip_level)) is None:
+            _sys.stderr.write(
+                "saltare: warning: --response-gzip / --request-decompression is on "
+                "but libz.so.1 could not be dlopen'd; compression is a no-op\n"
+            )
     _dispatcher.set_request_decompression(
         bool(request_decompression),
         int(max_request_body),
