@@ -46,6 +46,12 @@ def run(
     tcp_keepintvl: int = 0,
     tcp_keepcnt: int = 0,
     proxy_protocol: bool = False,
+    tcp_user_timeout_ms: int = 0,
+    auto_raise_nofile: bool = False,
+    max_connection_lifetime: int = 0,
+    tls_session_cache_size: int = 0,
+    startup_request: bool = False,
+    server_header: str | None = None,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -159,6 +165,16 @@ def run(
     _dispatcher.set_proxy_headers(bool(proxy_headers))
     _dispatcher.set_request_id_header(request_id_header)
     _dispatcher.set_server_timing(bool(server_timing))
+    _dispatcher.set_server_header(server_header)
+
+    # `workers=0` is shorthand for "use what the kernel says we have,
+    # capped at 4". Multi-worker past 4 hits diminishing returns under
+    # CPython's GIL-locked dispatch and inflates the Pss floor with no
+    # gain on RAM-budget workloads. Set explicitly for finer control.
+    if int(workers) <= 0:
+        import os as _os
+        cpu = _os.cpu_count() or 1
+        workers = min(cpu, 4)
 
     _core.serve(
         app,
@@ -193,4 +209,10 @@ def run(
         int(tcp_keepintvl),
         int(tcp_keepcnt),
         int(bool(proxy_protocol)),
+        int(tcp_user_timeout_ms),
+        int(bool(auto_raise_nofile)),
+        int(max_connection_lifetime),
+        int(tls_session_cache_size),
+        int(bool(startup_request)),
+        server_header,
     )

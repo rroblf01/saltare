@@ -22,8 +22,19 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
-import traceback
 from typing import Any
+
+# v1.3: `traceback` is imported lazily inside the exception-handling
+# paths below. The module is ~150 KiB resident once imported (it pulls
+# `linecache`, `re`, `tokenize`, and a chunk of stdlib glue). Most
+# requests never hit those paths, so deferring trims the idle floor by
+# the same margin.
+def _print_exception_lazy(exc_type, exc, tb=None) -> None:
+    import traceback as _tb
+    if tb is not None:
+        _tb.print_exception(exc_type, exc, tb, file=sys.stderr)
+    else:
+        _tb.print_exc(file=sys.stderr)
 
 # v1.3: percent-decoding moved to Zig (`http.urlDecode` in src/zig/http.zig).
 # We used to import `urllib.parse.unquote_to_bytes` here; dropping the
@@ -274,6 +285,76 @@ def init_tracemalloc() -> None:
         tracemalloc.start(25)
 
 
+def prewarm_app(app: Any) -> None:
+    """Issue an internal `GET /` against the user app once lifespan
+    startup has finished. Warms FastAPI route compilation, pydantic
+    validators, etc., so the first real client request doesn't pay
+    the cold-start latency cliff.
+
+    Best-effort: any exception is swallowed (we don't want a buggy
+    app to fail server startup over a warmup). Output bytes are
+    discarded — the goal is purely to drive the import / JIT paths."""
+    loop = _ensure_loop()
+    asgi_sub = _ASGI_HTTP_SUB
+    scope = {
+        "type": "http",
+        "asgi": asgi_sub,
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/",
+        "raw_path": b"/",
+        "query_string": b"",
+        "headers": [(b"host", b"saltare-prewarm")],
+        "server": ("127.0.0.1", 0),
+        "client": None,
+        "root_path": "",
+    }
+
+    received = False
+    finished = False
+
+    async def receive():
+        nonlocal received
+        if not received:
+            received = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(_message):
+        return None
+
+    async def driver():
+        try:
+            await app(scope, receive, send)
+        except BaseException:
+            pass
+        nonlocal finished
+        finished = True
+
+    task = loop.create_task(driver())
+    # Pump until the task finishes or we hit a deadline. The dummy
+    # request should complete in a single tick for non-async apps and
+    # within a few hundred ms for FastAPI cold start.
+    deadline = 50  # ticks of 1 ms each = 50 ms ceiling
+    asyncio.events._set_running_loop(loop)
+    try:
+        for _ in range(deadline):
+            if task.done():
+                break
+            loop.call_soon(_no_op)
+            try:
+                loop._run_once()
+            except BaseException:
+                break
+            if finished:
+                break
+    finally:
+        asyncio.events._set_running_loop(None)
+    if not task.done():
+        task.cancel()
+
+
 def dump_tracemalloc(top_n: int = 30) -> bytes:
     """Return a top-N tracemalloc snapshot as bytes (text/plain). Each
     line is `<size_kib> KiB  <count> blocks  <traceback-summary>`.
@@ -316,7 +397,24 @@ _ASGI_WS_SUB = {"version": "3.0", "spec_version": "2.3"}
 # transient `bytes` allocations per response — especially noticeable in
 # concurrent bursts where the GC churn from those tiny strings used to
 # dominate the per-response Python work.
+#
+# v1.3: `_SERVER_LINE` is now mutable via `set_server_header()` so the
+# Python-side response builder (chunked-encoded streaming responses go
+# through `_build_wire` and `_emit_headers`) honors the same override
+# the Zig fast-paths apply via `g_server_line`.
 _SERVER_LINE = b"server: " + _SERVER_HEADER + b"\r\n"
+
+
+def set_server_header(value: str | None) -> None:
+    """Override the `Server:` response header. None keeps default;
+    empty string omits the line entirely."""
+    global _SERVER_LINE
+    if value is None:
+        _SERVER_LINE = b"server: " + _SERVER_HEADER + b"\r\n"
+    elif value == "":
+        _SERVER_LINE = b""
+    else:
+        _SERVER_LINE = b"server: " + value.encode("ascii", errors="replace") + b"\r\n"
 _CONNECTION_KEEPALIVE_LINE = b"connection: keep-alive\r\n"
 _CONNECTION_CLOSE_LINE = b"connection: close\r\n"
 _TRANSFER_ENCODING_CHUNKED_LINE = b"transfer-encoding: chunked\r\n"
@@ -559,7 +657,7 @@ def ws_open(
     try:
         _pump_once()
     except BaseException:
-        traceback.print_exc(file=sys.stderr)
+        _print_exception_lazy(*sys.exc_info())
 
     return (
         handle,
@@ -592,7 +690,7 @@ def ws_event(handle: int, opcode: int, payload: bytes) -> tuple[bytes, bool]:
     try:
         _pump_once()
     except BaseException:
-        traceback.print_exc(file=sys.stderr)
+        _print_exception_lazy(*sys.exc_info())
 
     return (ws_state.drain(), ws_state.task.done())
 
@@ -611,7 +709,7 @@ def ws_disconnect(handle: int, code: int) -> bytes:
         try:
             _pump_once()
         except BaseException:
-            traceback.print_exc(file=sys.stderr)
+            _print_exception_lazy(*sys.exc_info())
 
     if not ws_state.task.done():
         ws_state.task.cancel()
@@ -747,6 +845,9 @@ class _HttpState:
         # (and stay zero-cost when disabled at the module level).
         "_request_id",
         "_start_ns",
+        # v1.3: HEAD requests get the same headers as GET but the body
+        # is suppressed (RFC 7230 §3.3.3). Set in `http_dispatch_start`.
+        "_is_head",
     )
 
     def __init__(
@@ -771,6 +872,7 @@ class _HttpState:
         self._trailer_started: bool = False
         self._request_id: bytes = b""
         self._start_ns: int = 0
+        self._is_head: bool = False
         # Filled in when http.response.start arrives.
         self.status: int = 500
         self.out_headers: list[tuple[bytes, bytes]] = []
@@ -861,12 +963,22 @@ class _HttpState:
             if not self.headers_sent:
                 if not self.headers_done:
                     return  # ASGI violation; bail without crashing
-                self._emit_headers(
-                    streaming=more,
-                    complete_body_len=None if more else len(chunk),
-                )
+                # HEAD: same headers as GET but no body. Force single-
+                # shot mode (no chunked) and use the first chunk's
+                # length as Content-Length unless the app explicitly
+                # declared one.
+                if self._is_head:
+                    self._emit_headers(
+                        streaming=False,
+                        complete_body_len=len(chunk) if not self.explicit_cl else None,
+                    )
+                else:
+                    self._emit_headers(
+                        streaming=more,
+                        complete_body_len=None if more else len(chunk),
+                    )
                 self.headers_sent = True
-            if chunk:
+            if chunk and not self._is_head:
                 if self.chunked:
                     framed = _encode_chunk(chunk)
                     self.outgoing.append(framed)
@@ -875,7 +987,10 @@ class _HttpState:
                     self.outgoing.append(chunk)
                     self._outgoing_bytes += len(chunk)
             if not more:
-                if self.chunked:
+                if self._is_head:
+                    # HEAD: no body, no chunked terminator.
+                    self.body_done = True
+                elif self.chunked:
                     if self.wants_trailers:
                         # Defer the chunked terminator until the app
                         # emits `http.response.trailers` (or finishes
@@ -925,6 +1040,7 @@ class _HttpState:
         self._trailer_started = False
         self._request_id = b""
         self._start_ns = 0
+        self._is_head = False
         self.status = 500
         self.out_headers = []
         self.headers_sent = False
@@ -1146,6 +1262,7 @@ def http_dispatch_start(
 
     s = _acquire_http_state(app, scope, initial_body, bool(more_body), bool(keep_alive))
     s._request_id = req_id_bytes
+    s._is_head = (method == "HEAD")
     if _server_timing_enabled:
         import time as _time
         s._start_ns = _time.monotonic_ns()
@@ -1154,7 +1271,7 @@ def http_dispatch_start(
     try:
         _pump_once()
     except BaseException:
-        traceback.print_exc(file=sys.stderr)
+        _print_exception_lazy(*sys.exc_info())
 
     chunks = s.drain()
     done = s.task.done()
@@ -1164,7 +1281,7 @@ def http_dispatch_start(
         if not s.task.cancelled():
             exc = s.task.exception()
             if exc is not None:
-                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+                _print_exception_lazy(type(exc), exc, exc.__traceback__)
                 # If we never emitted a response, give the client a 500.
                 if not s.headers_sent:
                     chunks = chunks + _build_wire(
@@ -1198,7 +1315,7 @@ def http_dispatch_push_body(
     try:
         _pump_once()
     except BaseException:
-        traceback.print_exc(file=sys.stderr)
+        _print_exception_lazy(*sys.exc_info())
 
     chunks = s.drain()
     done = s.task.done()
@@ -1207,7 +1324,7 @@ def http_dispatch_push_body(
         if not s.task.cancelled():
             exc = s.task.exception()
             if exc is not None:
-                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+                _print_exception_lazy(type(exc), exc, exc.__traceback__)
         chunks += _finalize_if_needed(handle, s)
         state_obj.http_states.pop(handle, None)
         _release_http_state(s)
@@ -1233,7 +1350,7 @@ def http_dispatch_drain(handle: int) -> tuple[bytes, bool]:
             if not s.task.cancelled():
                 exc = s.task.exception()
                 if exc is not None:
-                    traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+                    _print_exception_lazy(type(exc), exc, exc.__traceback__)
             chunks += _finalize_if_needed(handle, s)
             state_obj.http_states.pop(handle, None)
             _release_http_state(s)
@@ -1247,7 +1364,7 @@ def http_dispatch_drain(handle: int) -> tuple[bytes, bool]:
         if not s.task.cancelled():
             exc = s.task.exception()
             if exc is not None:
-                traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
+                _print_exception_lazy(type(exc), exc, exc.__traceback__)
         chunks += _finalize_if_needed(handle, s)
         state_obj.http_states.pop(handle, None)
         _release_http_state(s)

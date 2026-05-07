@@ -34,4 +34,10 @@ def serve(
     tcp_keepintvl: int = ...,
     tcp_keepcnt: int = ...,
     proxy_protocol: int = ...,
+    tcp_user_timeout_ms: int = ...,
+    auto_raise_nofile: int = ...,
+    max_connection_lifetime: int = ...,
+    tls_session_cache_size: int = ...,
+    startup_request: int = ...,
+    server_header: str | None = ...,
 ) -> None: ...

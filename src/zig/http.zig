@@ -165,6 +165,17 @@ pub inline fn needsUrlDecode(s: []const u8) bool {
     return std.mem.indexOfScalar(u8, s, '%') != null;
 }
 
+/// RFC 7230 §3.2.6 token character — header field-names are made of
+/// these. Anything outside this set in a header name is a parse error
+/// and we fail the whole request rather than risk header smuggling.
+inline fn isTchar(b: u8) bool {
+    return switch (b) {
+        '0'...'9', 'A'...'Z', 'a'...'z' => true,
+        '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+        else => false,
+    };
+}
+
 pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
     // Locate the end of the head section. Without it the request is incomplete.
     const head_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.Incomplete;
@@ -205,6 +216,15 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
         if (colon == 0) return error.BadHeader;
         const name = line[0..colon];
+        // RFC 7230 §3.2.6 — header names are `tchar*`, i.e. ASCII
+        // alphanumerics plus the punctuation set
+        // `!#$%&'*+-.^_` `|~`. Reject any byte outside that set so a
+        // malformed `Header\0Smuggled: x` can't slip through to the
+        // user app and a downstream proxy reading it back as two
+        // separate headers.
+        for (name) |b| {
+            if (!isTchar(b)) return error.BadHeader;
+        }
 
         // Trim OWS (space + tab) from both ends of the value.
         var v_start = colon + 1;

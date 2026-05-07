@@ -27,6 +27,7 @@ const c = @cImport({
     @cInclude("netinet/in.h");
     @cInclude("netinet/tcp.h");
     @cInclude("sys/un.h");
+    @cInclude("sys/resource.h");
     @cInclude("unistd.h");
     @cInclude("signal.h");
     @cInclude("fcntl.h");
@@ -124,13 +125,28 @@ pub const Observability = struct {
     cors_preflight_allow_all: bool = false,
     /// If true, the first line of every accepted connection is parsed
     /// as a HAProxy PROXY-protocol v1 header (`PROXY TCP4 src dst sport
-    /// dport\r\n`). The src address replaces the TCP peer for rate
+    /// dport\r\n`) OR a v2 binary header (`\r\n\r\n\0\r\nQUIT\n` +
+    /// 12-byte signature + variable payload). Auto-detects via the
+    /// first 12 bytes. The src address replaces the TCP peer for rate
     /// limiting + access logging — required when saltare sits behind a
-    /// L4 load balancer (AWS NLB, HAProxy v1, GCP TCP LB) that won't
-    /// add HTTP headers like `X-Forwarded-For`. Connections that don't
-    /// start with a valid header get closed immediately. v1 only
-    /// (text); v2 (binary) is the next step but seldom needed.
+    /// L4 load balancer (AWS NLB / ALB, HAProxy, GCP TCP LB) that
+    /// won't add HTTP headers like `X-Forwarded-For`. Connections
+    /// that don't start with a valid header get closed immediately.
     proxy_protocol: bool = false,
+    /// Optional override for the `Server:` response header. `null`
+    /// keeps the saltare default (`saltare/<version>`); empty string
+    /// omits the header entirely (useful for white-label deployments
+    /// or to hide the server identity). The override is built once
+    /// at server start and stored in `g_server_line`; per-response
+    /// cost is a single `{s}` substitution.
+    server_header: ?[]const u8 = null,
+    /// If true, saltare issues an internal `GET /` to the user app
+    /// after `lifespan.startup` completes — warms FastAPI route
+    /// compilation, pydantic validators, etc. — so the first real
+    /// client request doesn't pay the cold-start cost. Skipped if
+    /// the app responds non-2xx (we don't want a buggy startup to
+    /// look like a successful warm).
+    startup_request: bool = false,
     /// If non-null, requests to this path return a top-N tracemalloc
     /// dump (Python heap allocations grouped by source line). Setting
     /// this also auto-enables `tracemalloc.start()` at startup so the
@@ -193,6 +209,24 @@ pub const Limits = struct {
     tcp_keepidle: i32 = 0,
     tcp_keepintvl: i32 = 0,
     tcp_keepcnt: i32 = 0,
+    /// `TCP_USER_TIMEOUT` (Linux). Maximum milliseconds an in-flight
+    /// write can stay un-acked before the kernel tears the connection
+    /// down. More aggressive than keepalive: keepalive only fires on
+    /// idle conns, USER_TIMEOUT also caps stuck writes. Zero =
+    /// kernel default (effectively infinite). Recommended on flaky
+    /// network paths (mobile, satellite).
+    tcp_user_timeout_ms: i32 = 0,
+    /// If true, raise the soft `RLIMIT_NOFILE` to the hard limit at
+    /// startup so saltare can saturate `max_concurrent_connections`
+    /// without fighting the user's default-1024 fd cap. No-op on macOS.
+    auto_raise_nofile: bool = false,
+    /// Hard ceiling on a single connection's wall-clock lifetime, in
+    /// seconds. Zero disables. When set, a connection past this age
+    /// is closed at the start of its next request — protects against
+    /// long-lived connections accumulating per-conn state in the
+    /// app or pinning Python heap fragments. Stricter than
+    /// `max_keepalive_requests`, which is request-count based.
+    max_connection_lifetime_secs: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -442,6 +476,14 @@ var g_obs: Observability = .{};
 /// run() open()'s the file and stores the fd here. Reset back to 2 on
 /// run() exit so a follow-up serve() call doesn't write to a freed fd.
 var g_access_log_fd: c_int = 2;
+
+/// Pre-formatted `Server:` line emitted on every response. Default is
+/// `"Server: saltare/<version>\r\n"`. Setting `obs.server_header` at
+/// run() time replaces it (empty string → omit). Stored as a slice
+/// into either the comptime default literal or a heap allocation
+/// owned by run(); the latter is freed at run() exit.
+var g_server_line: []const u8 = "Server: " ++ SERVER_HEADER ++ "\r\n";
+var g_server_line_owned: ?[]u8 = null;
 
 /// Number of accepted connections currently alive (i.e. created but not
 /// yet destroyed). Atomic for paranoia even though the I/O loop is
@@ -705,16 +747,16 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         rss_bytes,
     });
 
-    var head_buf: [256]u8 = undefined;
+    var head_buf: [512]u8 = undefined;
     const head = std.fmt.bufPrint(
         &head_buf,
         "HTTP/1.1 200 OK\r\n" ++
-            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "{s}" ++
             "Content-Type: text/plain; version=0.0.4\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Connection: keep-alive\r\n" ++
             "\r\n",
-        .{body_len},
+        .{ g_server_line, body_len },
     ) catch {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
@@ -759,17 +801,17 @@ fn serveFixedBody(
 ) void {
     const ka = conn.parsed.?.wantsKeepAlive();
     const conn_line: []const u8 = if (ka) "keep-alive" else "close";
-    var head_buf: [512]u8 = undefined;
+    var head_buf: [768]u8 = undefined;
     const head = std.fmt.bufPrint(
         &head_buf,
         "HTTP/1.1 {d} {s}\r\n" ++
-            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "{s}" ++
             "Content-Type: {s}\r\n" ++
             "Content-Length: {d}\r\n" ++
             "Connection: {s}\r\n" ++
             "{s}" ++
             "\r\n",
-        .{ status, reason, content_type, body.len, conn_line, extra_headers },
+        .{ status, reason, g_server_line, content_type, body.len, conn_line, extra_headers },
     ) catch {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
@@ -1101,6 +1143,12 @@ const Connection = struct {
     /// ping or tear down a silently-dead connection.
     last_activity_ns: i64,
 
+    /// CLOCK_MONOTONIC ns at accept time. Used by `max_connection_lifetime_secs`
+    /// to force-close connections past their wall-clock budget — protects
+    /// against per-conn state accumulation in long-lived clients beyond
+    /// what `max_keepalive_requests` (request-count based) catches.
+    accepted_ns: i64,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -1143,6 +1191,7 @@ const Connection = struct {
             .request_start_ns = 0,
             .request_in_flight = false,
             .last_activity_ns = 0,
+            .accepted_ns = monoNs(),
         };
         return conn;
     }
@@ -1347,6 +1396,41 @@ pub fn run(
     defer g_limits = .{};
     g_obs = obs;
     defer g_obs = .{};
+
+    // v1.3: optionally raise the fd soft limit to the hard limit so
+    // saltare can saturate `max_concurrent_connections` without
+    // bumping into the user's default 1024 fd cap. No-op on
+    // non-Linux.
+    if (limits.auto_raise_nofile and comptime builtin.os.tag == .linux) {
+        var rl: c.struct_rlimit = undefined;
+        if (c.getrlimit(c.RLIMIT_NOFILE, &rl) == 0) {
+            if (rl.rlim_cur < rl.rlim_max) {
+                rl.rlim_cur = rl.rlim_max;
+                _ = c.setrlimit(c.RLIMIT_NOFILE, &rl);
+            }
+        }
+    }
+
+    // v1.3: optional `Server:` header override. Empty string omits
+    // the header entirely. Default null = comptime saltare/<ver> line.
+    if (obs.server_header) |sh| {
+        if (sh.len == 0) {
+            g_server_line = "";
+        } else {
+            const total = sh.len + "Server: \r\n".len;
+            const buf = std.heap.c_allocator.alloc(u8, total) catch unreachable;
+            const written = std.fmt.bufPrint(buf, "Server: {s}\r\n", .{sh}) catch unreachable;
+            g_server_line_owned = buf;
+            g_server_line = written;
+        }
+    }
+    defer {
+        g_server_line = "Server: " ++ SERVER_HEADER ++ "\r\n";
+        if (g_server_line_owned) |b| {
+            std.heap.c_allocator.free(b);
+            g_server_line_owned = null;
+        }
+    }
 
     // Access log fd. Default = stderr. If a path was supplied, open()
     // it append-mode and route writes there. Failure falls back to
@@ -1692,6 +1776,10 @@ fn acceptAll(
             var v = g_limits.tcp_keepcnt;
             _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPCNT, @ptrCast(&v), @sizeOf(c_int));
         }
+        if (g_limits.tcp_user_timeout_ms > 0) {
+            var v: c_uint = @intCast(g_limits.tcp_user_timeout_ms);
+            _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_USER_TIMEOUT, @ptrCast(&v), @sizeOf(c_uint));
+        }
 
         // For TLS: attach a fresh SSL session to the new fd and start the
         // handshake on the next event. SSL_accept will signal WANT_READ on
@@ -1747,15 +1835,20 @@ fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event
     }
 }
 
-/// Read + parse the PROXY-protocol v1 line. Called repeatedly from the
-/// main loop until the line completes. Once parsed, replaces
-/// `conn.peer_key` with the source-side address from the header,
-/// re-checks the per-IP connection cap, and transitions to
-/// `.handshaking` (TLS) or `.reading` (plain). Bytes received past
-/// the PROXY line are kept in `read_buf` for the HTTP parser to
-/// consume on the next iteration. We use the regular `read_buf` pool
-/// rather than a per-conn dedicated buffer so a connection that never
-/// sends the PROXY line costs no extra RAM.
+/// PROXY-protocol v2 binary signature: 12 bytes the LB sends before
+/// any other byte. Lets us auto-detect v1 (text) vs v2 from the first
+/// 12 bytes — v1 starts `"PROXY "`, v2 starts with this signature.
+const PROXY_V2_SIG = "\r\n\r\n\x00\r\nQUIT\n";
+
+/// Read + parse the PROXY-protocol v1 (text) or v2 (binary) header.
+/// Called repeatedly from the main loop until the header completes.
+/// Once parsed, replaces `conn.peer_key` with the source-side address
+/// from the header, re-checks the per-IP connection cap, and
+/// transitions to `.handshaking` (TLS) or `.reading` (plain). Bytes
+/// received past the PROXY header are kept in `read_buf` for the HTTP
+/// parser to consume on the next iteration. We use the regular
+/// `read_buf` pool rather than a per-conn dedicated buffer so a
+/// connection that never sends the PROXY line costs no extra RAM.
 fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
     conn.ensureBuffer() catch {
         loop.remove(conn.fd);
@@ -1764,10 +1857,11 @@ fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
     };
     const data = conn.read_buf.?.data;
 
-    // Read more if needed. Bound by the protocol max (107 bytes).
-    while (true) {
-        if (conn.read_total >= 107) break; // already enough; might still need parse
-        const remaining = data[conn.read_total..@min(data.len, 108)];
+    // Read more if needed. v1 max = 107 bytes; v2 = 16 + payload (max
+    // 255 + extras). Read up to 256 bytes and parse what we have.
+    const READ_CAP: usize = 256;
+    while (conn.read_total < READ_CAP) {
+        const remaining = data[conn.read_total..@min(data.len, READ_CAP)];
         if (remaining.len == 0) break;
         const cret = c.read(conn.fd, @ptrCast(remaining.ptr), remaining.len);
         if (cret == 0) {
@@ -1775,55 +1869,121 @@ fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
             conn.destroy();
             return;
         }
-        if (cret < 0) {
-            // EAGAIN — wait for next read event.
+        if (cret < 0) return; // EAGAIN
+        conn.read_total += @intCast(cret);
+        // Stop reading early when we have a complete header.
+        if (conn.read_total >= PROXY_V2_SIG.len and
+            std.mem.eql(u8, data[0..PROXY_V2_SIG.len], PROXY_V2_SIG))
+        {
+            // v2 — need 16 header bytes + payload length.
+            if (conn.read_total < 16) continue;
+            const len_hi: usize = data[14];
+            const len_lo: usize = data[15];
+            const total = 16 + (len_hi << 8) + len_lo;
+            if (conn.read_total >= total) break;
+            if (total > READ_CAP) {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            }
+        } else {
+            // v1 — terminator is \r\n.
+            if (std.mem.indexOfPos(u8, data[0..conn.read_total], 0, "\r\n") != null) break;
+            if (conn.read_total >= 108) break;
+        }
+    }
+
+    var consumed: usize = 0;
+    if (conn.read_total >= PROXY_V2_SIG.len and
+        std.mem.eql(u8, data[0..PROXY_V2_SIG.len], PROXY_V2_SIG))
+    {
+        // PROXY v2 binary header: 12-byte sig, ver+cmd byte, fam+proto
+        // byte, 2-byte length, then variable-length address block.
+        if (conn.read_total < 16) {
+            loop.remove(conn.fd);
+            conn.destroy();
             return;
         }
-        conn.read_total += @intCast(cret);
-        if (std.mem.indexOfPos(u8, data[0..conn.read_total], 0, "\r\n") != null) break;
-    }
-
-    const buf = data[0..conn.read_total];
-    const crlf = std.mem.indexOfPos(u8, buf, 0, "\r\n") orelse {
-        // No CRLF yet and we haven't hit the cap → keep reading.
-        if (conn.read_total < 107) return;
-        // 107 bytes without CRLF = malformed.
-        loop.remove(conn.fd);
-        conn.destroy();
-        return;
-    };
-    const line = buf[0..crlf];
-
-    // Parse: PROXY <TCP4|TCP6|UNKNOWN> <src> <dst> <sport> <dport>
-    if (line.len < 5 or !std.mem.eql(u8, line[0..6], "PROXY ")) {
-        loop.remove(conn.fd);
-        conn.destroy();
-        return;
-    }
-
-    var it = std.mem.tokenizeScalar(u8, line[6..], ' ');
-    const family = it.next() orelse {
-        loop.remove(conn.fd);
-        conn.destroy();
-        return;
-    };
-    if (std.mem.eql(u8, family, "UNKNOWN")) {
-        // No reliable client IP; keep the TCP peer (already populated).
-    } else if (std.mem.eql(u8, family, "TCP4") or std.mem.eql(u8, family, "TCP6")) {
-        const src_str = it.next() orelse {
+        const ver_cmd = data[12];
+        const fam_proto = data[13];
+        const len_hi: usize = data[14];
+        const len_lo: usize = data[15];
+        const payload_len = (len_hi << 8) + len_lo;
+        const total = 16 + payload_len;
+        if (conn.read_total < total) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        // ver_cmd: high nibble = version (must be 2), low = command
+        // (0 LOCAL — health-check, ignore addr; 1 PROXY).
+        if ((ver_cmd >> 4) != 2) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        const cmd = ver_cmd & 0x0F;
+        const family = fam_proto >> 4;
+        if (cmd == 1) {
+            // Real PROXY connection. Decode src by family.
+            // family 1 = AF_INET, 2 = AF_INET6.
+            if (family == 1 and payload_len >= 12) {
+                var key: [16]u8 = std.mem.zeroes([16]u8);
+                key[10] = 0xff;
+                key[11] = 0xff;
+                @memcpy(key[12..16], data[16..20]); // src IPv4
+                conn.peer_key = key;
+                conn.has_peer_key = true;
+            } else if (family == 2 and payload_len >= 36) {
+                var key: [16]u8 = undefined;
+                @memcpy(&key, data[16..32]); // src IPv6
+                conn.peer_key = key;
+                conn.has_peer_key = true;
+            }
+            // family 0 (UNSPEC) or 3 (AF_UNIX): keep TCP peer.
+        }
+        consumed = total;
+    } else {
+        // PROXY v1 text format.
+        const buf = data[0..conn.read_total];
+        const crlf = std.mem.indexOfPos(u8, buf, 0, "\r\n") orelse {
+            if (conn.read_total < 107) return; // keep reading
             loop.remove(conn.fd);
             conn.destroy();
             return;
         };
-        // We don't care about dst / sport / dport for rate limiting.
-        if (parseFirstForwardedIp(src_str)) |key| {
-            conn.peer_key = key;
-            conn.has_peer_key = true;
+        const line = buf[0..crlf];
+
+        if (line.len < 6 or !std.mem.eql(u8, line[0..6], "PROXY ")) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
         }
-    } else {
-        loop.remove(conn.fd);
-        conn.destroy();
-        return;
+
+        var it = std.mem.tokenizeScalar(u8, line[6..], ' ');
+        const family = it.next() orelse {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
+        if (std.mem.eql(u8, family, "UNKNOWN")) {
+            // No reliable client IP; keep TCP peer.
+        } else if (std.mem.eql(u8, family, "TCP4") or std.mem.eql(u8, family, "TCP6")) {
+            const src_str = it.next() orelse {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            if (parseFirstForwardedIp(src_str)) |key| {
+                conn.peer_key = key;
+                conn.has_peer_key = true;
+            }
+        } else {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        consumed = crlf + 2;
     }
 
     // Re-check the per-IP connection cap now that we know the real
@@ -1838,9 +1998,8 @@ fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
         conn.rl_entry_idx = acq.entry_idx;
     }
 
-    // Compact the read buffer past the PROXY line. Subsequent bytes
+    // Compact the read buffer past the PROXY header. Subsequent bytes
     // (the HTTP request, if any has arrived already) start at index 0.
-    const consumed = crlf + 2;
     const leftover = conn.read_total - consumed;
     if (leftover > 0) {
         std.mem.copyForwards(u8, data[0..leftover], data[consumed .. consumed + leftover]);
@@ -2266,6 +2425,14 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     if (conn.keepalive_request_count + 1 >= g_limits.max_keepalive_requests) {
         keep_alive = false;
     }
+    // Wall-clock connection lifetime cap. Stricter than the request-
+    // count cap above — bounds RAM held by per-conn state in
+    // pathological clients that hold a connection open for hours.
+    if (g_limits.max_connection_lifetime_secs > 0) {
+        const age_ns = monoNs() - conn.accepted_ns;
+        const cap_ns = @as(i64, @intCast(g_limits.max_connection_lifetime_secs)) * std.time.ns_per_s;
+        if (age_ns >= cap_ns) keep_alive = false;
+    }
 
     // v0.12 narrows scope to fully-buffered request bodies → more_body=false.
     // Streaming requests will lift this constraint in a follow-up; the
@@ -2355,9 +2522,9 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
                 "Connection: Upgrade\r\n" ++
                 "Sec-WebSocket-Accept: {s}\r\n" ++
                 "Sec-WebSocket-Protocol: {s}\r\n" ++
-                "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+                "{s}" ++
                 "\r\n",
-            .{ accept, opened.subprotocol },
+            .{ accept, opened.subprotocol, g_server_line },
         ) catch {
             if (opened.frames.len > 0) conn.allocator.free(opened.frames);
             loop.remove(conn.fd);
@@ -2371,9 +2538,9 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
                 "Upgrade: websocket\r\n" ++
                 "Connection: Upgrade\r\n" ++
                 "Sec-WebSocket-Accept: {s}\r\n" ++
-                "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+                "{s}" ++
                 "\r\n",
-            .{accept},
+            .{ accept, g_server_line },
         ) catch {
             if (opened.frames.len > 0) conn.allocator.free(opened.frames);
             loop.remove(conn.fd);
@@ -2937,15 +3104,15 @@ fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn sendStatus(loop: *eventloop.Loop, conn: *Connection, code: u16, reason: []const u8) void {
-    var stack_buf: [256]u8 = undefined;
+    var stack_buf: [512]u8 = undefined;
     const formatted = std.fmt.bufPrint(
         &stack_buf,
         "HTTP/1.1 {d} {s}\r\n" ++
-            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+            "{s}" ++
             "Content-Length: 0\r\n" ++
             "Connection: close\r\n" ++
             "\r\n",
-        .{ code, reason },
+        .{ code, reason, g_server_line },
     ) catch {
         loop.remove(conn.fd);
         conn.destroy();

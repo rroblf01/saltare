@@ -136,10 +136,16 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var tcp_keepintvl: c_int = 0;
     var tcp_keepcnt: c_int = 0;
     var proxy_protocol_flag: c_int = 0;
+    var tcp_user_timeout_ms: c_int = 0;
+    var auto_raise_nofile_flag: c_int = 0;
+    var max_conn_lifetime: c_uint = 0;
+    var tls_session_cache: c_uint = 0;
+    var startup_request_flag: c_int = 0;
+    var server_header_z: [*c]const u8 = null;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiii",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIiz",
         &app,
         &host_z,
         &port,
@@ -172,6 +178,12 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &tcp_keepintvl,
         &tcp_keepcnt,
         &proxy_protocol_flag,
+        &tcp_user_timeout_ms,
+        &auto_raise_nofile_flag,
+        &max_conn_lifetime,
+        &tls_session_cache,
+        &startup_request_flag,
+        &server_header_z,
     ) == 0) {
         return null;
     }
@@ -205,6 +217,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .tcp_keepidle = tcp_keepidle,
         .tcp_keepintvl = tcp_keepintvl,
         .tcp_keepcnt = tcp_keepcnt,
+        .tcp_user_timeout_ms = tcp_user_timeout_ms,
+        .auto_raise_nofile = auto_raise_nofile_flag != 0,
+        .max_connection_lifetime_secs = @intCast(max_conn_lifetime),
     };
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
@@ -220,6 +235,8 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .cors_preflight_allow_all = cors_preflight_flag != 0,
         .favicon_204 = favicon_204_flag != 0,
         .proxy_protocol = proxy_protocol_flag != 0,
+        .server_header = if (server_header_z != null) std.mem.span(server_header_z) else null,
+        .startup_request = startup_request_flag != 0,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 
@@ -239,7 +256,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     // serve() time with a clear Python exception, not at first connection.
     var tls_ctx: ?*tls.Ctx = null;
     if (both_set) {
-        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z) catch |err| {
+        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache) catch |err| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(
                 &msg_buf,
@@ -301,6 +318,12 @@ fn runSingleWorker(
         bridge.shutdown();
         py.PyErr_SetString(py.PyExc_RuntimeError, "saltare: lifespan startup failed");
         return null;
+    }
+
+    // v1.3: optional pre-warm. Drives a synthetic GET / through the
+    // app so the first real client doesn't pay cold-start latency.
+    if (obs.startup_request) {
+        bridge.prewarmApp();
     }
 
     // Importing FastAPI/Starlette/Pydantic and running lifespan startup

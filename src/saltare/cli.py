@@ -290,8 +290,39 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--proxy-protocol",
         action="store_true",
-        help="parse HAProxy PROXY-protocol v1 line at every accept "
-             "(required behind L4 LBs like AWS NLB / HAProxy)",
+        help="parse HAProxy PROXY-protocol v1 (text) or v2 (binary) "
+             "header at every accept (required behind L4 LBs like AWS "
+             "NLB/ALB, HAProxy, GCP TCP LB)",
+    )
+    parser.add_argument(
+        "--tcp-user-timeout-ms", type=int, default=0, metavar="MS",
+        help="TCP_USER_TIMEOUT in milliseconds — caps unacked write "
+             "windows for sub-second failure detection (Linux only)",
+    )
+    parser.add_argument(
+        "--auto-raise-nofile",
+        action="store_true",
+        help="raise the soft RLIMIT_NOFILE to the hard limit at startup",
+    )
+    parser.add_argument(
+        "--max-connection-lifetime", type=int, default=0, metavar="SEC",
+        help="hard cap on a single connection's wall-clock lifetime "
+             "(seconds; 0 = disabled)",
+    )
+    parser.add_argument(
+        "--tls-session-cache-size", type=int, default=0, metavar="N",
+        help="OpenSSL session cache size (0 = disabled). "
+             "~20 KiB resident per cached session at peak.",
+    )
+    parser.add_argument(
+        "--startup-request",
+        action="store_true",
+        help="issue an internal GET / after lifespan startup to warm "
+             "FastAPI route compilation / pydantic validators",
+    )
+    parser.add_argument(
+        "--server-header", type=str, default=None, metavar="VALUE",
+        help="override the `Server:` response header (empty string omits it entirely)",
     )
     parser.add_argument(
         "--version",
@@ -337,4 +368,10 @@ def main(argv: list[str] | None = None) -> None:
         tcp_keepintvl=args.tcp_keepintvl,
         tcp_keepcnt=args.tcp_keepcnt,
         proxy_protocol=args.proxy_protocol,
+        tcp_user_timeout_ms=args.tcp_user_timeout_ms,
+        auto_raise_nofile=args.auto_raise_nofile,
+        max_connection_lifetime=args.max_connection_lifetime,
+        tls_session_cache_size=args.tls_session_cache_size,
+        startup_request=args.startup_request,
+        server_header=args.server_header,
     )

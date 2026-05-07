@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.3.0 — lazy TLS + ~25 Zig-side / dispatcher knobs, leanest of three.** Production target is **Linux x86_64**. v1.3 lands more than 20 orthogonal features in three groups. **RAM-floor cuts (default-on)**: lazy OpenSSL via `dlopen`, `mallopt(M_ARENA_MAX=1, M_TRIM_THRESHOLD=64K, M_TOP_PAD=64K, M_MMAP_THRESHOLD=64K)` (aggressive heap return), `MALLOC_ARENA_MAX=1` in the CLI re-exec env, gated `PYTHONOPTIMIZE=2` auto re-exec, URL decode moved to Zig (drops `urllib.parse` import), `TCP_NODELAY` + `SO_KEEPALIVE` on every accepted socket, periodic `gc.collect(2)` + `malloc_trim(0)` after 3 s of idle, `gc.freeze()` re-trigger inside the idle-maintenance pass. **Operational knobs (opt-in, zero RAM when off)**: `health_path`, `cors_preflight_allow_all`, IPv6 listen (auto-detect from `host`), per-IP rate limiter (`rate_limit_per_sec`, `rate_limit_burst`, honors `proxy_headers` and `X-Real-IP`), `max_connections_per_ip`, `tracemalloc_path`, `favicon_204`, `access_log_path` (file via `O_APPEND | O_CLOEXEC`), `request_id_header` (auto-gen 8-byte hex + scope key + response header), `server_timing` (`Server-Timing: total;dur=<ms>`), `listen_backlog`, `tcp_keepidle`/`tcp_keepintvl`/`tcp_keepcnt` (tunable keepalive cadence), `proxy_protocol` (HAProxy v1 line at every accept — required behind L4 LBs), systemd socket activation (`LISTEN_FDS=1` auto-detect, fd 3 inherited), `SIGUSR1` JSON stats dump on stderr. **Bug fixes**: WebSocket subprotocol (`Sec-WebSocket-Protocol` was always being dropped), HTTP trailers (`http.response.trailers` was silently ignored), HTTP/1.1 mandatory `Host` header validation. Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.5 / 45.5 / 45.5 MiB**, vs uvicorn 48.95 / 49.85 / 54.46 MiB and Granian 56.05–57.42 MiB on the same host. Tests **66 passing** core + 10 new in `tests/test_v13.py`. Most v1.3 features are opt-in: defaults match v1.2.2 behaviour at zero RAM cost.
+> **Status: 1.3.0 — lazy TLS + ~30 operational knobs, leanest of three.** Production target is **Linux x86_64**. v1.3 lands ~30 orthogonal features. **RAM-floor cuts (default-on)**: lazy OpenSSL via `dlopen`, `mallopt(M_ARENA_MAX=1, M_TRIM_THRESHOLD=64K, M_TOP_PAD=64K, M_MMAP_THRESHOLD=64K)`, `MALLOC_ARENA_MAX=1` in the CLI re-exec env, gated `PYTHONOPTIMIZE=2` auto re-exec, URL decode moved to Zig (drops `urllib.parse` import), `traceback` lazy-imported (drops ~150 KiB), `TCP_NODELAY` + `SO_KEEPALIVE` on every accepted socket, periodic `gc.collect(2)` + `malloc_trim(0)` after 3 s of idle, `gc.freeze()` re-trigger inside the idle-maintenance pass. **Operational knobs (opt-in, zero RAM when off)**: `health_path`, `cors_preflight_allow_all`, IPv6 listen (auto-detect from `host`), per-IP rate limiter, `max_connections_per_ip`, `max_connection_lifetime`, `tracemalloc_path`, `favicon_204`, `access_log_path`, `request_id_header`, `server_timing`, `listen_backlog`, `tcp_keepidle`/`tcp_keepintvl`/`tcp_keepcnt`, `tcp_user_timeout_ms`, `auto_raise_nofile`, `tls_session_cache_size`, `startup_request` (warm app), `server_header` (white-label / hide identity), `proxy_protocol` (v1 + v2 binary auto-detect — required behind L4 LBs), systemd socket activation (`LISTEN_FDS=1`), `SIGUSR1` JSON stats dump, `workers=0` auto-detects `cpu_count()`. **Bug fixes / RFC compliance**: WebSocket subprotocol (`Sec-WebSocket-Protocol` was always being dropped), HTTP trailers (`http.response.trailers` was silently ignored), HTTP/1.1 mandatory `Host` validation, header-name `tchar` validation (RFC 7230 §3.2.6 — defends against `\0`/CRLF smuggling), HEAD method body strip (RFC 7230 §3.3.3 — same headers as GET, no body). Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.4 / 45.4 / 45.4 MiB**, vs uvicorn 49.30 / 49.51 / 54.68 MiB and Granian 57.18–57.71 MiB on the same host. Tests **66 passing** core + 10 new in `tests/test_v13.py`. Most v1.3 features are opt-in: defaults match v1.2.2 behaviour at zero RAM cost.
 
 ---
 
@@ -66,32 +66,32 @@ Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 46.32 MiB |      46.45 MiB | **46.46 MiB** |    1000 | 1030 |
-| uvicorn | 48.90 MiB |      48.95 MiB | 48.95 MiB |    1000 | 1262 |
-| granian | 57.07 MiB |      57.07 MiB | 57.07 MiB |    1000 | 1169 |
+| saltare | 46.34 MiB |      46.43 MiB | **46.43 MiB** |    1000 |  964 |
+| uvicorn | 49.25 MiB |      49.30 MiB | 49.30 MiB |    1000 | 1251 |
+| granian | 57.71 MiB |      57.71 MiB | 57.71 MiB |    1000 | 1165 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.07 MiB |      45.44 MiB | **45.45 MiB** |    2000 | 1898 |
-| uvicorn | 48.73 MiB |      49.85 MiB | 49.85 MiB |    2000 | 1879 |
-| granian | 56.05 MiB |      56.05 MiB | 56.05 MiB |    2000 | 1886 |
+| saltare | 45.04 MiB |      45.38 MiB | **45.41 MiB** |    2000 | 1912 |
+| uvicorn | 48.56 MiB |      49.51 MiB | 49.51 MiB |    2000 | 1893 |
+| granian | 57.48 MiB |      57.48 MiB | 57.48 MiB |    2000 | 1893 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 45.21 MiB |      45.45 MiB | **45.45 MiB** |     500 | 1346      |
-| uvicorn | 49.09 MiB |      54.46 MiB | 54.46 MiB |     500 | 1276      |
-| granian | 57.42 MiB |      57.42 MiB | 57.42 MiB |     500 | 1377      |
+| saltare | 45.08 MiB |      45.39 MiB | **45.39 MiB** |     500 | 1383      |
+| uvicorn | 49.30 MiB |      54.68 MiB | 54.68 MiB |     500 | 1511      |
+| granian | 57.18 MiB |      57.18 MiB | 57.18 MiB |     500 | 1274      |
 
 ### Multi-worker idle — Pss across the whole cluster (saltare only)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
 |       1 |        — |  39.84 MiB |      0.00 MiB | 39.84 MiB |                 —  |
-|       4 |        4 |  14.41 MiB |     39.78 MiB | 54.19 MiB |  159.36 MiB (−66%) |
+|       4 |        4 |  14.36 MiB |     39.55 MiB | 53.90 MiB |  159.37 MiB (−66%) |
 
 `Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.85 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
 
@@ -259,6 +259,84 @@ saltare.run(
 
 CLI flags: `--max-concurrent-connections`, `--max-keepalive-requests`, `--max-request-body`. Defaults match the values above. `Expect: 100-continue` is honoured automatically (the interim response is written before the body is read, except when the declared `Content-Length` already exceeds `max_request_body` — in which case the client gets a 413 directly). In v0.13 the read buffer (16 KiB) is the practical hard ceiling for `max_request_body`; request-body streaming for larger bodies lands in a follow-up.
 
+### Connection lifecycle caps
+
+```python
+saltare.run(
+    app,
+    max_connections_per_ip=50,        # TCP-RST over-cap peers (defends DDoS)
+    max_connection_lifetime=3600,     # force-close after N seconds
+    rate_limit_per_sec=100,           # per-IP token bucket (0 = disabled)
+    rate_limit_burst=200,
+)
+```
+
+`max_connections_per_ip` shares the per-IP table with the rate limiter (4096-entry LRU); over-cap peers get a TCP-level RST at accept time before any HTTP work happens. `max_connection_lifetime` (seconds) is a wall-clock cap — stricter than `max_keepalive_requests` for clients that keep a connection open for hours. Both default to 0 (disabled). When `proxy_headers=True`, the rate limiter uses `X-Real-IP` / `X-Forwarded-For` instead of the TCP peer; when `proxy_protocol=True`, it uses the source from the PROXY header.
+
+### TCP tuning
+
+```python
+saltare.run(
+    app,
+    listen_backlog=1024,         # listen(2) backlog (default 256)
+    tcp_keepidle=60,             # seconds idle before first probe
+    tcp_keepintvl=10,            # seconds between probes
+    tcp_keepcnt=4,               # unanswered probes = drop
+    tcp_user_timeout_ms=30000,   # max in-flight unacked write window
+)
+```
+
+`listen_backlog` is capped by `/proc/sys/net/core/somaxconn`. The keepalive trio tightens dead-connection detection past the kernel default (~2 hours idle); typical mobile-friendly setting is `60 / 10 / 4`. `tcp_user_timeout_ms` (Linux only) is more aggressive than keepalive — it caps stuck WRITE windows too, useful on flaky network paths.
+
+### File descriptor limit
+
+```python
+saltare.run(app, auto_raise_nofile=True)
+```
+
+Raises the soft `RLIMIT_NOFILE` to the hard limit at startup so `max_concurrent_connections` isn't bottlenecked by the user's default 1024 fd cap. Linux only. Equivalent to `ulimit -n $(ulimit -Hn)` before invoking saltare.
+
+### Pre-warming the user app
+
+```python
+saltare.run(app, startup_request=True)
+```
+
+After `lifespan.startup` finishes, saltare issues an internal `GET /` against the app to warm route compilation, pydantic validators, and JIT caches. The first real client request then doesn't pay the cold-start cliff (typically 50-200 ms drop to 1-5 ms). Skipped if your app's `/` route does work that's expensive or has side effects — design `startup_request` accordingly. Best-effort: any exception during warmup is swallowed.
+
+### TLS session cache
+
+```python
+saltare.run(
+    app,
+    ssl_certfile="...", ssl_keyfile="...",
+    tls_session_cache_size=1024,   # OpenSSL server-side cache (0 = disabled)
+)
+```
+
+When set, OpenSSL caches up to N completed TLS sessions; repeat clients negotiating a session resumption skip the full handshake (~3 RTTs → 1 RTT). Cost: ~20 KiB resident per cached session at peak. `1024` ≈ 20 MiB ceiling, fine for production. `0` (default) keeps the floor low; flip on once your TLS workload warrants it.
+
+### Customising / hiding the `Server:` header
+
+```python
+saltare.run(app, server_header="my-api/2.1")  # white-label
+saltare.run(app, server_header="")            # omit the line entirely
+```
+
+The default is `Server: saltare/1.3.0`. Setting an explicit value overrides it (built once at start; per-response cost is one `{s}` substitution). Empty string omits the header. Useful behind a reverse proxy that already advertises a server line, or for hiding the saltare identity for security-by-obscurity.
+
+### HEAD requests
+
+`HEAD /path` returns the same headers as `GET /path` but no response body, per RFC 7230 §3.3.3. saltare detects HEAD in the dispatcher and suppresses body bytes the app emits (the app itself doesn't have to special-case HEAD). `Transfer-Encoding: chunked` is forced off for HEAD (no body to chunk). Working as expected — no flag.
+
+### Auto worker count
+
+```python
+saltare.run(app, workers=0)   # min(cpu_count, 4)
+```
+
+`workers=0` (and `--workers 0`) reads `os.cpu_count()` and caps at 4 — past 4 the GIL-locked dispatch sees diminishing returns under saltare's architecture. Set explicitly when you know better.
+
 ### Observability and deployment knobs
 
 ```python
@@ -283,9 +361,14 @@ saltare.run(
 
 CLI flags: `--metrics-path`, `--health-path`, `--favicon-204`, `--cors-preflight-allow-all`, `--rate-limit-per-sec`, `--rate-limit-burst`, `--max-connections-per-ip`, `--tracemalloc-path`, `--access-log`, `--access-log-path`, `--proxy-headers`, `--request-id-header`, `--server-timing`, `--uds PATH`, `--listen-backlog`, `--tcp-keepidle`, `--tcp-keepintvl`, `--tcp-keepcnt`, `--proxy-protocol`. All off by default. The Zig-side intercepts (metrics, health, favicon, CORS preflight, tracemalloc) skip the Python dispatch entirely.
 
-### PROXY protocol v1 (L4 load balancers)
+### PROXY protocol v1 + v2 (L4 load balancers)
 
-When saltare sits behind an L4 LB that won't add HTTP headers (AWS NLB, GCP TCP LB, HAProxy `mode tcp`), the TCP peer is the LB, not the real client — `X-Forwarded-For` doesn't exist at this layer. Pass `proxy_protocol=True` (`--proxy-protocol`) and saltare will read the HAProxy PROXY-protocol v1 line at every accept (`PROXY <TCP4|TCP6|UNKNOWN> <src> <dst> <sport> <dport>\r\n`), use the source as the rate-limit / access-log key, and only then proceed to TLS or HTTP. Connections that don't begin with a valid PROXY line are closed.
+When saltare sits behind an L4 LB that won't add HTTP headers (AWS NLB / ALB, GCP TCP LB, HAProxy `mode tcp`), the TCP peer is the LB, not the real client — `X-Forwarded-For` doesn't exist at this layer. Pass `proxy_protocol=True` (`--proxy-protocol`) and saltare auto-detects either:
+
+- **v1 (text)**: `PROXY <TCP4|TCP6|UNKNOWN> <src> <dst> <sport> <dport>\r\n` — what HAProxy 1.x emits.
+- **v2 (binary)**: 12-byte signature `\r\n\r\n\0\r\nQUIT\n` + 4-byte header + variable address block — what AWS NLB/ALB and modern HAProxy emit by default.
+
+Saltare reads the appropriate header at every accept, uses the source as the rate-limit / access-log key, then proceeds to TLS or HTTP. Connections that don't begin with a valid PROXY header are closed.
 
 ### systemd socket activation
 
@@ -367,7 +450,73 @@ Access log format (one JSON line per completed request, to stderr):
 
 Stack-buffered, JSON-escaped, single `write(2)` per line so concurrent workers don't interleave.
 
-Proxy headers: `X-Forwarded-For` (leftmost address → `scope["client"]`) and `X-Forwarded-Proto` (`http`/`https` → `scope["scheme"]`). Only enable behind a proxy that strips client-supplied `X-Forwarded-*` headers, otherwise clients can spoof their identity.
+Proxy headers: `X-Real-IP` (single client IP, nginx convention; takes precedence) or `X-Forwarded-For` (comma-separated chain; leftmost address) → `scope["client"]`, plus `X-Forwarded-Proto` (`http`/`https` → `scope["scheme"]`). Only enable behind a proxy that strips client-supplied `X-Forwarded-*` headers, otherwise clients can spoof their identity.
+
+### CLI reference
+
+```
+saltare APP [options]
+
+ASGI app target as 'module:attr' (e.g. 'main:app').
+
+Network
+  --host HOST                   bind address (default 127.0.0.1; use :: or [::1] for v6)
+  --port PORT                   bind port (default 8000)
+  --uds PATH                    bind a Unix domain socket instead
+  --listen-backlog N            listen(2) backlog (default 256)
+  --workers N                   number of pre-fork workers (0 = auto-cpu-count, capped at 4)
+
+TLS (lazy-loaded — system libssl needed only when these are passed)
+  --ssl-certfile PATH           TLS certificate (PEM)
+  --ssl-keyfile PATH            TLS private key (PEM)
+  --tls-session-cache-size N    OpenSSL session cache size (0 = disabled)
+
+Timeouts (seconds)
+  --header-timeout SECS         accept → headers parsed (default 5)
+  --keep-alive-timeout SECS     idle keepalive (default 5)
+  --body-timeout SECS           headers → body fully received (default 30)
+  --write-timeout SECS          maximum time in writing state (default 30)
+  --shutdown-timeout SECS       graceful drain ceiling on SIGTERM (default 30)
+  --ws-keepalive-timeout SECS   WebSocket ping interval (default 20)
+
+TCP tuning
+  --tcp-keepidle SECS           seconds idle before kernel keepalive probe
+  --tcp-keepintvl SECS          seconds between keepalive probes
+  --tcp-keepcnt N               unanswered probes before drop
+  --tcp-user-timeout-ms MS      TCP_USER_TIMEOUT (Linux)
+
+Resource caps
+  --max-concurrent-connections N    accepted sockets held open (default 1024)
+  --max-keepalive-requests N        requests per connection before close (default 1000)
+  --max-request-body BYTES          oversize body → 413 (default 1 MiB)
+  --max-connections-per-ip N        per-IP open connection cap (0 = disabled)
+  --max-connection-lifetime SECS    wall-clock connection age cap (0 = disabled)
+  --rate-limit-per-sec N            per-IP token-bucket rate (0 = disabled)
+  --rate-limit-burst N              burst ceiling (default 100)
+  --auto-raise-nofile               raise soft RLIMIT_NOFILE to hard at startup
+
+Observability + Zig-side intercepts (no Python dispatch when matched)
+  --metrics-path PATH               Prometheus text from Zig counters
+  --health-path PATH                k8s-style probe → 200 'ok' from Zig
+  --tracemalloc-path PATH           top-30 Python alloc dump (Linux/CPython)
+  --favicon-204                     GET /favicon.ico → 204 from Zig
+  --cors-preflight-allow-all        OPTIONS+Origin → permissive CORS from Zig
+
+Request / response shaping
+  --access-log                      one JSON line per request to stderr
+  --access-log-path FILE            route the JSON log to a file instead
+  --proxy-headers                   parse X-Forwarded-* / X-Real-IP into scope + rate-limit
+  --proxy-protocol                  HAProxy PROXY-protocol v1 + v2 at every accept
+  --request-id-header NAME          auto-generate request ID + scope key + response header
+  --server-timing                   emit `Server-Timing: total;dur=<ms>` per response
+  --server-header VALUE             override `Server:` (empty string omits the header)
+
+Operational
+  --startup-request                 issue an internal GET / after lifespan startup (warm app)
+  --version                         print saltare version
+```
+
+Same flags are available on the `saltare.run()` Python API — the kwarg names match the CLI flags with hyphens replaced by underscores.
 
 ## Production deployment
 

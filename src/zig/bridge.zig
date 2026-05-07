@@ -361,6 +361,30 @@ pub fn httpGlobalPump() void {
     py.Py_DecRef(result);
 }
 
+/// Issue an internal `GET /` against the user app once lifespan startup
+/// finished. Warms FastAPI route compilation / pydantic validators /
+/// JIT caches so the first real client request doesn't pay the cold-
+/// start cliff. Best-effort — any exception in the app is swallowed.
+pub fn prewarmApp() void {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+    const mod = py.PyImport_ImportModule("saltare._dispatcher") orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    defer py.Py_DecRef(mod);
+    const fn_obj = py.PyObject_GetAttrString(mod, "prewarm_app") orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    defer py.Py_DecRef(fn_obj);
+    const result = py.PyObject_CallFunction(fn_obj, "O", g_app.?) orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    py.Py_DecRef(result);
+}
+
 /// Run `gc.collect(2)` + `gc.freeze()` once. The server calls this from
 /// its idle-maintenance tick to release reference cycles accumulated
 /// during the previous traffic burst, then re-freezes the surviving

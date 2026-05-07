@@ -29,6 +29,9 @@ const Method = opaque {};
 const SSL_FILETYPE_PEM: c_int = 1;
 const TLS1_2_VERSION: c_int = 0x0303;
 const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
+const SSL_CTRL_SET_SESS_CACHE_MODE: c_int = 44;
+const SSL_CTRL_SET_SESS_CACHE_SIZE: c_int = 42;
+const SSL_SESS_CACHE_SERVER: c_long = 0x0002;
 const SSL_ERROR_WANT_READ: c_int = 2;
 const SSL_ERROR_WANT_WRITE: c_int = 3;
 const SSL_ERROR_SYSCALL: c_int = 5;
@@ -112,7 +115,15 @@ pub const InitError = error{
 ///
 /// Returns `LibSslNotFound` if libssl can't be `dlopen`'d. Plain-HTTP
 /// deployments never call this, so the lib is never loaded.
-pub fn newContext(cert_file: [*c]const u8, key_file: [*c]const u8) InitError!*Ctx {
+///
+/// `session_cache_size` configures OpenSSL's server-side session cache.
+/// Zero disables caching (every connection negotiates from scratch).
+/// Non-zero enables it; ~20 KiB resident per cached session at peak.
+pub fn newContext(
+    cert_file: [*c]const u8,
+    key_file: [*c]const u8,
+    session_cache_size: u32,
+) InitError!*Ctx {
     if (!loadFuncs()) return InitError.LibSslNotFound;
     const f = funcs.?;
 
@@ -124,6 +135,11 @@ pub fn newContext(cert_file: [*c]const u8, key_file: [*c]const u8) InitError!*Ct
     // SSL_CTX_set_min_proto_version is a macro in the headers; the actual
     // ABI call is SSL_CTX_ctrl with cmd=SET_MIN_PROTO_VERSION.
     _ = f.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, null);
+
+    if (session_cache_size > 0) {
+        _ = f.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_MODE, SSL_SESS_CACHE_SERVER, null);
+        _ = f.SSL_CTX_ctrl(ctx, SSL_CTRL_SET_SESS_CACHE_SIZE, @intCast(session_cache_size), null);
+    }
 
     if (f.SSL_CTX_use_certificate_chain_file(ctx, cert_file) != 1) {
         return InitError.LoadCert;
