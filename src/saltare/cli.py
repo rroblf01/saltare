@@ -422,6 +422,10 @@ def main(argv: list[str] | None = None) -> None:
         help="key=value file re-read on SIGHUP to hot-update rate limits / access log",
     )
     parser.add_argument(
+        "--dispatch-token", type=str, default=None, metavar="TOKEN",
+        help="shared-secret Bearer token gating /debug/dispatch (401 without)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -494,4 +498,5 @@ def main(argv: list[str] | None = None) -> None:
         reload_poll_secs=args.reload_poll_secs,
         dispatch_path=args.dispatch_path,
         runtime_config_path=args.runtime_config_path,
+        dispatch_token=args.dispatch_token,
     )

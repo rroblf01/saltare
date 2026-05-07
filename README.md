@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.5.0 — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
+> **Status: 1.5.0 — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL) with **Bearer-token gate** (`--dispatch-token`), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **`process_*` Prometheus metrics** (`process_open_fds`, `process_cpu_seconds_total`, `process_start_time_seconds` — Grafana / Prom-client conventions), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip), **production runbook + day-2 ops table** in README, **`make smoke-alpine`** (real Alpine container smoke test against the freshly-built musllinux wheel), **`make soak`** (sustained-load RSS-drift gate, defaults 1800 s @ 200 rps). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
 
 > **Status: 1.4.0 (historical entry) — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. **Dev autoreload**: `--reload` watches code and `SIGTERM`s + respawns the child on change (poll-based, no `inotify` dep — works inside containers / overlayfs / NFS). Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
 
@@ -860,6 +860,7 @@ Development (v1.4)
 
 Operational depth (v1.5)
   --dispatch-path PATH              JSON dispatch-state snapshot endpoint
+  --dispatch-token TOKEN            Bearer-token gate on --dispatch-path (401 without)
   --runtime-config-path FILE        key=value file re-read on SIGHUP for hot config swap
 
 Compression (v1.4; lazy dlopen — libs only loaded when flags are on)
@@ -885,6 +886,61 @@ Same flags are available on the `saltare.run()` Python API — the kwarg names m
 
 ## Production deployment
 
+### Pre-deploy checklist (v1.5)
+
+Before pointing real traffic at saltare, walk this list:
+
+- [ ] **Soak**: run the bench harness with your real ASGI app for ≥ 30 min at expected concurrency. RSS should stabilise within a few MiB of the idle baseline. Drift > 10 MiB/h = leak.
+- [ ] **Memory leak check**: `make valgrind` builds the tester image and runs pytest under `valgrind --leak-check=full`. CI doesn't gate this — run it locally before tagging.
+- [ ] **Connection cap**: pick `max_concurrent_connections` that fits your container memory budget. Saltare auto-tunes from the cgroup limit if you don't set it (~50 KiB/conn budget after a 64 MiB Python floor).
+- [ ] **TLS**: if terminating TLS in saltare (vs nginx in front), set `ssl_certfile` + `ssl_keyfile` and verify cert chain via `openssl s_client -connect host:port`.
+- [ ] **Rate limit**: enable `--rate-limit-per-sec` matched to your downstream-service capacity, not your saltare capacity. Saltare's bucket is the **last** rate limit before the app.
+- [ ] **Access log**: enable `--access-log` (stderr) or `--access-log-path` (file). Without it, post-mortems on individual requests are impossible.
+- [ ] **`/metrics` + alerting**: scrape `--metrics-path` from Prometheus and set alerts on `saltare_responses_5xx_total` rate, `process_resident_memory_bytes` ceiling, and `saltare_health_state` (= 1 means draining).
+- [ ] **`/debug/dispatch` token**: when exposing the dispatch endpoint outside the pod's network namespace, set `--dispatch-token` to a long random string.
+- [ ] **`SIGHUP` config**: if you'll need to tune rate limits without restart, set `--runtime-config-path` and document the file in your runbook.
+- [ ] **Shutdown grace**: `--shutdown-timeout` should match k8s `terminationGracePeriodSeconds` minus a few seconds. Default 30 s.
+- [ ] **`MALLOC_ARENA_MAX`**: set to `1` (single worker) or `2` (multi). Already in `Dockerfile.production`.
+- [ ] **Workers count**: start with `min(cpu_count, 4)`. Higher inflates per-conn Pss without throughput gain under GIL-locked dispatch.
+
+### Recommended starting flags
+
+For a typical FastAPI deployment behind a reverse proxy:
+
+```bash
+saltare myapp:app \
+    --host 0.0.0.0 --port 8000 \
+    --workers 4 \
+    --proxy-headers \
+    --shutdown-timeout 25 \
+    --max-keepalive-requests 10000 \
+    --max-connection-lifetime 3600 \
+    --tcp-keepidle 60 --tcp-keepintvl 30 --tcp-keepcnt 4 \
+    --metrics-path /metrics --access-log \
+    --health-path /healthz \
+    --rate-limit-per-sec 200 --rate-limit-burst 400 \
+    --max-request-uri 8192 --max-request-head-bytes 32768 \
+    --latency-histogram \
+    --traceparent-propagation \
+    --response-gzip
+```
+
+For an Alpine / distroless container, swap `Dockerfile.production` for one based on `python:3.14-alpine` — saltare ships musllinux wheels.
+
+### Day-2 operations
+
+| Symptom | First check | Likely fix |
+|---------|-------------|-----------|
+| RSS growing unbounded | `curl /debug/dispatch` — `in_flight` ≫ `open_conns`? | dispatcher backlog; check `--max-concurrent-connections`, look at app's downstream call latency |
+| 5xx spike | `saltare_responses_5xx_total` rate; recent deploy? | rollback or check app exception logs (saltare prints exceptions via `_print_exception_lazy`) |
+| Latency p99 spike | `saltare_request_duration_seconds_bucket` (needs `--latency-histogram`) | which bucket? > 1 s typically a downstream stall, not saltare |
+| `Connection refused` from clients | `saltare_open_connections` near `max_concurrent_connections` | bump cap or scale horizontally |
+| Slow shutdown | logs show `saltare draining` for tens of seconds | `--shutdown-timeout` lower, or app `lifespan.shutdown` hook is blocking |
+| Compression doing nothing | `saltare_response_compression_total{encoding="gzip"}` near 0; `..._skipped_total{reason="non_compressible"}` high | check Content-Type whitelist; PNG/MP4/WOFF2 bodies don't compress |
+| `kill -HUP` does nothing | stderr should print `saltare: SIGHUP: applied N key(s)` | check `--runtime-config-path` is set; check file permissions |
+
+
+
 ### Workers and CPU
 
 `workers=1` (the default) is one process serving all traffic. For multi-core machines, set `workers` to roughly **`min(cpu_count, 4)`** as a starting point. Pre-fork CoW + `gc.freeze()` mean each additional worker costs only ~5 MiB of physical RAM on top of the single-worker baseline — measured at 4 workers = 51 MiB Pss, vs ~150 MiB if every worker were independent (see Benchmarks).
@@ -897,26 +953,35 @@ The master process binds + listens once and forks the workers; the kernel load-b
 
 ### Environment
 
+The recommended production image is the v1.5 Alpine variant — see
+[`Dockerfile.production`](Dockerfile.production) (`make production-image`).
+It uses `python:3.14-alpine`, installs the saltare musllinux wheel,
+preloads mimalloc, and runs under `tini` for clean signal forwarding.
+Image size lands around 60 MiB total.
+
+If you need to run saltare on a glibc base instead (CentOS / RHEL /
+manylinux-style), the pre-Alpine knobs still apply:
+
 ```bash
-# Bound glibc's per-thread malloc arenas. saltare runs single-threaded per
-# worker; default arenas (~8 × n_cpus on 64-bit) inflate RSS gratuitously.
-# Typical saving: 5–15 MiB per worker.
+# glibc-only: cap per-thread malloc arenas. musl ignores this.
 export MALLOC_ARENA_MAX=2
 
-# Optional, additive to MALLOC_ARENA_MAX. jemalloc has one global heap with
-# thread-local caches and fragments far less than glibc on long-lived
-# servers. Typical extra saving on top of MALLOC_ARENA_MAX=2: 5–15 MiB.
-# Provided pre-baked in `Dockerfile.production` (`make production-image`).
-export LD_PRELOAD=/usr/lib64/libjemalloc.so.2
+# Both libc flavours: preload an alternative malloc. Typical extra
+# saving on top of glibc default + arena cap: 5–15 MiB.
+#   Alpine (musl) path:   /usr/lib/libmimalloc.so.2
+#   glibc/manylinux path: /usr/lib64/libmimalloc.so.2
+export LD_PRELOAD=/usr/lib/libmimalloc.so.2
 
-# Conservative fd limit if you're not behind a reverse proxy that already
-# rate-limits accept().
+# Conservative fd limit if you're not behind a reverse proxy that
+# already rate-limits accept(). Alpine's default ulimit is usually
+# already 1024 — bump explicitly.
 ulimit -n 65535
 ```
 
-A ready-made production image with both knobs applied lives in
-[`Dockerfile.production`](Dockerfile.production); build it with
-`make production-image`, then layer your ASGI app on top.
+The Alpine production image bakes the LD_PRELOAD line. `MALLOC_ARENA_MAX`
+is **not** set in the Alpine image because musl libc has no per-thread
+arenas to cap — it's a glibc-specific knob. If you switch the image to a
+glibc base, re-add it.
 
 ### Eager imports under multi-worker
 

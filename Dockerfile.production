@@ -1,42 +1,58 @@
-# Production-ready saltare image: minimal manylinux base, jemalloc preloaded
-# for tighter RSS than glibc's default arenas, and the same MALLOC_ARENA_MAX
-# trick the README recommends.
+# v1.5: Alpine-based production image. Builder stage uses the
+# musllinux_1_2_x86_64 toolchain (Alpine + multiple Python versions
+# pre-installed) to produce a musllinux wheel; runtime stage is a
+# slim `python:3.14-alpine` with the wheel installed and mimalloc
+# preloaded. Final image is ~5× smaller than the manylinux variant
+# this replaces.
 #
 # Build:
 #   docker build -f Dockerfile.production --target=production -t saltare-prod .
 #
-# Run (single worker, listening on 0.0.0.0:8000):
-#   docker run --rm -p 8000:8000 -e BENCH_PORT=8000 saltare-prod
+# Run:
+#   docker run --rm -p 8000:8000 saltare-prod \
+#       saltare myapp:app --host 0.0.0.0 --port 8000 --workers 4
 #
-# Replace `benchmarks.app:app` in the CMD with your own ASGI module:app
-# pair, or override at runtime.
+# Replace `benchmarks.app:app` in the CMD with your own ASGI
+# module:app pair, or override at runtime.
+#
+# musl-libc note (vs the previous glibc image): MALLOC_ARENA_MAX +
+# `mallopt(M_ARENA_MAX, ...)` are glibc-specific. musl's malloc has
+# no per-thread arenas to cap, so the env var is silently ignored
+# and the in-process `mallopt` calls are no-ops. mimalloc preload
+# still works and is the recommended allocator on Alpine for ASGI
+# workloads — the v1.4 mallopt thresholds we leaned on for glibc
+# don't translate, so mimalloc / jemalloc do the heavy lifting.
 
 # syntax=docker/dockerfile:1.7
 
-ARG MANYLINUX_TAG=manylinux_2_28_x86_64
+ARG MUSLLINUX_TAG=musllinux_1_2_x86_64
 ARG PYTHON_TAG=cp314-cp314
+ARG PYTHON_ALPINE_TAG=3.14-alpine
 ARG ZIG_VERSION=0.16.0
 
-# Reuse the existing builder stage from Dockerfile by referencing it in a
-# multi-stage build. To keep this file self-contained for `docker build -f
-# Dockerfile.production`, we replicate the wheel-build stages here and
-# wire only the production runtime in the final stage.
-
-FROM quay.io/pypa/${MANYLINUX_TAG} AS zig-toolchain
+# ---------------------------------------------------------------------------
+# Stage 1: Zig toolchain on the musllinux builder.
+FROM quay.io/pypa/${MUSLLINUX_TAG} AS zig-toolchain
 ARG ZIG_VERSION
 ENV ZIG_VERSION=${ZIG_VERSION}
 COPY scripts/install-zig.sh /tmp/install-zig.sh
 RUN bash /tmp/install-zig.sh && rm /tmp/install-zig.sh
 
+# ---------------------------------------------------------------------------
+# Stage 2: Python build env. Alpine uses apk (not dnf) and the
+# OpenSSL package is `openssl-dev` (no -devel suffix). saltare's
+# tls.zig dlopens libssl at runtime, so the headers are only needed
+# at compile time.
 FROM zig-toolchain AS build-env
 ARG PYTHON_TAG
 ENV PATH=/opt/python/${PYTHON_TAG}/bin:/usr/local/bin:${PATH}
-# jemalloc only — saltare v1.3 dlopens libssl at runtime, so no -devel
-# headers are needed at build time. libssl is already present on the
-# manylinux base image for users who pass `ssl_certfile=`.
-RUN dnf install -y jemalloc && dnf clean all
+RUN apk add --no-cache openssl-dev
 RUN pip install --upgrade pip build
 
+# ---------------------------------------------------------------------------
+# Stage 3: Build the musllinux wheel + auditwheel-repair it so
+# auditwheel pins the manylinux/musllinux platform tag and copies
+# any vendored shared libs into the wheel.
 FROM build-env AS builder
 WORKDIR /io
 COPY pyproject.toml CMakeLists.txt build.zig build.zig.zon README.md LICENSE ./
@@ -45,44 +61,44 @@ RUN python -m build --wheel --outdir /tmp/dirty-wheels \
  && auditwheel repair /tmp/dirty-wheels/saltare-*.whl -w /dist
 
 # ---------------------------------------------------------------------------
-# Production runtime. Slim manylinux + saltare wheel + jemalloc preloaded.
-FROM quay.io/pypa/${MANYLINUX_TAG} AS production
-ARG PYTHON_TAG
-ENV PATH=/opt/python/${PYTHON_TAG}/bin:${PATH}
+# Stage 4: Production runtime. python:3.14-alpine ships glibc-free
+# Python 3.14 + apk + minimal /usr — typical image size ~50 MiB
+# before saltare. Add the runtime libs saltare's lazy dlopen path
+# expects so users can flip --response-brotli / --response-zstd
+# without rebuilding.
+FROM python:${PYTHON_ALPINE_TAG} AS production
 
-# jemalloc + mimalloc both available. v1.4 ships mimalloc as default
-# (better gen-0 churn handling for short-lived alloc patterns); set
-# `LD_PRELOAD=/usr/lib64/libjemalloc.so.2` to switch back if your
-# workload prefers jemalloc's fragmentation curve.
-#
-# v1.4 also ships brotli + zstd as response-encoding options (lazy
-# dlopen-only — only loaded when `--response-brotli` / `--response-zstd`
-# are on, so the floor RAM is unaffected). Including the runtime libs
-# here means production users can flip the flags without rebuilding.
-RUN dnf install -y jemalloc mimalloc brotli libzstd && dnf clean all || \
-    dnf install -y jemalloc brotli libzstd && dnf clean all
+# - libssl3 / libcrypto3 — TLS via dlopen
+# - zlib                 — gzip via dlopen
+# - brotli-libs          — brotli encoder/decoder via dlopen
+# - libzstd              — zstd via dlopen
+# - mimalloc2            — primary malloc choice on Alpine (musl's mallocng
+#                         is fine but mimalloc still trims gen-0 churn better
+#                         on bursty ASGI patterns). jemalloc is a fallback —
+#                         install both so operators can flip via LD_PRELOAD.
+# - tini                 — minimal init so signals propagate cleanly under
+#                         `docker run` without --init.
+RUN apk add --no-cache \
+        libssl3 libcrypto3 zlib brotli-libs zstd-libs \
+        mimalloc2 jemalloc \
+        tini
 
 COPY --from=builder /dist /dist
-RUN pip install --no-deps /dist/saltare-*.whl \
+RUN pip install --no-deps --no-cache-dir /dist/saltare-*.whl \
  && rm -rf /dist /root/.cache
 
-# LD_PRELOAD: glibc's malloc has 8 × n_cpus arenas by default. mimalloc
-# does well on the gen-0 short-lived churn typical of an ASGI request,
-# while jemalloc tends to win on long-running services with steady-state
-# fragmentation. Both beat glibc default; pick by measuring under your
-# workload.
-#
-# Default: mimalloc if the package was installable above, jemalloc
-# otherwise. Override at `docker run -e LD_PRELOAD=...`.
-ENV LD_PRELOAD=/usr/lib64/libmimalloc.so.2
-# Belt and braces: even with the preload, set MALLOC_ARENA_MAX so
-# child processes spawned with a clean env (subprocesses, healthchecks)
-# inherit the saltare-recommended sizing.
-ENV MALLOC_ARENA_MAX=1
+# Default allocator: mimalloc. Override at `docker run -e LD_PRELOAD=...`
+# for jemalloc (path: /usr/lib/libjemalloc.so.2). The Alpine package ships
+# the lib at /usr/lib/libmimalloc.so.2 (no /lib64 on musl).
+ENV LD_PRELOAD=/usr/lib/libmimalloc.so.2
+
+# tini reaps zombies + forwards SIGTERM to saltare without needing
+# `docker run --init`. Saltare's drain logic does the rest.
+ENTRYPOINT ["/sbin/tini", "--"]
 
 WORKDIR /app
 
-# Replace this with your own ASGI app:
+# Replace with your own ASGI app:
 #   COPY my_app /app/my_app
 #   CMD ["saltare", "my_app:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
 CMD ["saltare", "--help"]

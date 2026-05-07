@@ -26,7 +26,7 @@ DOCKER_BUILD_ARGS = \
     --build-arg MANYLINUX_TAG=$(MANYLINUX_TAG) \
     --build-arg ZIG_VERSION=$(ZIG_VERSION)
 
-.PHONY: help build test bench benchmark valgrind production-image build-local install-zig clean
+.PHONY: help build test bench benchmark valgrind production-image install-zig clean smoke-alpine soak
 
 help:
 	@echo "Targets (no Zig on host):"
@@ -35,12 +35,11 @@ help:
 	@echo "  bench              Build wheel, install it + uvicorn + granian, run RAM benchmark"
 	@echo "  valgrind           Run pytest under valgrind --leak-check=full"
 	@echo "  production-image   Build saltare-prod (jemalloc + MALLOC_ARENA_MAX=2)"
-	@echo ""
-	@echo "Targets (Zig on host):"
-	@echo "  build-local        pip install -e '.[dev]'"
+	@echo "  smoke-alpine       Verify the most-recent musllinux wheel boots on real Alpine"
+	@echo "  soak               Sustained 30-min load against bench app to catch slow leaks"
 	@echo ""
 	@echo "Other:"
-	@echo "  install-zig        Download pinned Zig into /opt/zig"
+	@echo "  install-zig        Download pinned Zig into /opt/zig (host install — only needed by CI)"
 	@echo "  clean              Remove build artifacts"
 	@echo ""
 	@echo "Defaults: PYTHON_TAG=$(PYTHON_TAG)  MANYLINUX_TAG=$(MANYLINUX_TAG)  PLATFORM=$(DOCKER_PLATFORM)"
@@ -103,8 +102,35 @@ production-image:
 		$(DOCKER_BUILD_ARGS) \
 		.
 
-build-local:
-	pip install -e ".[dev]"
+# Build a musllinux wheel + run it on a fresh Alpine container. Catches
+# regressions where the wheel compiles under cibuildwheel but trips on
+# a libc / dynamic-linker difference at first import.
+smoke-alpine:
+	DOCKER_BUILDKIT=1 docker build \
+		--target=export \
+		--output=dist \
+		--build-arg PYTHON_TAG=$(PYTHON_TAG) \
+		--build-arg MANYLINUX_TAG=musllinux_1_2_x86_64 \
+		--build-arg ZIG_VERSION=$(ZIG_VERSION) \
+		--platform=linux/amd64 \
+		.
+	bash scripts/smoke-alpine.sh dist/saltare-*-musllinux*.whl
+
+# Sustained load against the bench app. Used pre-tag to catch slow
+# leaks the 1000-request bench can't see. Honours the same DOCKER /
+# PYTHON tags as `bench`. Override SOAK_SECS / SOAK_RPS for longer or
+# heavier runs.
+SOAK_SECS ?= 1800
+SOAK_RPS  ?= 200
+soak:
+	DOCKER_BUILDKIT=1 docker build \
+		--target=bench \
+		--tag=saltare-soak \
+		--load \
+		$(DOCKER_BUILD_ARGS) \
+		.
+	docker run --rm --platform=$(DOCKER_PLATFORM) saltare-soak \
+		python -m benchmarks.soak --duration=$(SOAK_SECS) --rps=$(SOAK_RPS)
 
 install-zig:
 	./scripts/install-zig.sh

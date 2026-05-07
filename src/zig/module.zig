@@ -47,8 +47,32 @@ fn setProcName(name: []const u8) void {
 // glibc-only. We guard the call site with `builtin.os.tag == .linux` so the
 // extern reference is dead-code-eliminated on macOS / non-glibc targets and
 // the symbol is never resolved at link time on those platforms.
-extern fn malloc_trim(pad: usize) c_int;
-extern fn mallopt(param: c_int, value: c_int) c_int;
+//
+// musl libc is the special case: musllinux wheels are linked against musl,
+// which doesn't ship `mallopt` / `malloc_trim`. The extern fn declaration
+// would still resolve at load time and ImportError the .so. Resolve via
+// `dlsym(RTLD_DEFAULT, ...)` at first use; if NULL (musl), the wrapper
+// no-ops. Same applies to `malloc_trim`.
+const dl = @cImport({
+    @cInclude("dlfcn.h");
+});
+
+const Mallopt = *const fn (c_int, c_int) callconv(.c) c_int;
+const MallocTrim = *const fn (usize) callconv(.c) c_int;
+var g_mallopt: ?Mallopt = null;
+var g_malloc_trim: ?MallocTrim = null;
+var g_libc_probed: bool = false;
+
+fn probeLibc() void {
+    if (g_libc_probed) return;
+    g_libc_probed = true;
+    // RTLD_DEFAULT = NULL on both glibc + musl. translate-c sometimes
+    // omits this preprocessor define so we pass null explicitly.
+    const mp = dl.dlsym(null, "mallopt");
+    if (mp != null) g_mallopt = @ptrCast(@alignCast(mp));
+    const mt = dl.dlsym(null, "malloc_trim");
+    if (mt != null) g_malloc_trim = @ptrCast(@alignCast(mt));
+}
 
 // glibc <malloc.h> macros — values are stable ABI.
 const M_ARENA_MAX: c_int = -8;
@@ -73,10 +97,12 @@ const M_MMAP_THRESHOLD: c_int = -3;
 /// stays cold and the call is dead-code-eliminated under `if (linux)`.
 fn capMallocArenas() void {
     if (comptime builtin.os.tag != .linux) return;
-    _ = mallopt(M_ARENA_MAX, 1);
-    _ = mallopt(M_TRIM_THRESHOLD, 64 * 1024);
-    _ = mallopt(M_TOP_PAD, 64 * 1024);
-    _ = mallopt(M_MMAP_THRESHOLD, 64 * 1024);
+    probeLibc();
+    const mp = g_mallopt orelse return; // musl: no mallopt, silent skip
+    _ = mp(M_ARENA_MAX, 1);
+    _ = mp(M_TRIM_THRESHOLD, 64 * 1024);
+    _ = mp(M_TOP_PAD, 64 * 1024);
+    _ = mp(M_MMAP_THRESHOLD, 64 * 1024);
 }
 
 /// Move every currently-tracked Python object to the GC's "permanent
@@ -171,10 +197,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var latency_histogram_flag: c_int = 0;
     var dispatch_path_z: [*c]const u8 = null;
     var runtime_config_path_z: [*c]const u8 = null;
+    var dispatch_token_z: [*c]const u8 = null;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizz",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzz",
         &app,
         &host_z,
         &port,
@@ -222,6 +249,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &latency_histogram_flag,
         &dispatch_path_z,
         &runtime_config_path_z,
+        &dispatch_token_z,
     ) == 0) {
         return null;
     }
@@ -281,6 +309,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .latency_histogram = latency_histogram_flag != 0,
         .dispatch_path = if (dispatch_path_z != null) std.mem.span(dispatch_path_z) else null,
         .runtime_config_path = if (runtime_config_path_z != null) std.mem.span(runtime_config_path_z) else null,
+        .dispatch_token = if (dispatch_token_z != null) std.mem.span(dispatch_token_z) else null,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 
@@ -378,7 +407,8 @@ fn runSingleWorker(
     // Typically saves 1–3 MiB at the cost of a few microseconds, called
     // exactly once per `serve()` invocation. No-op on non-glibc systems.
     if (comptime builtin.os.tag == .linux) {
-        _ = malloc_trim(0);
+        probeLibc();
+        if (g_malloc_trim) |mt| _ = mt(0);
     }
 
     // Freeze the GC's tracking. Single-worker case: minor CPU win

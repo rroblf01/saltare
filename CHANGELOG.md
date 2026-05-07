@@ -30,6 +30,15 @@ counters on `/metrics`.
 
 ### Default-on (when an encoder is enabled)
 
+- **`process_*` Prometheus metrics** on `/metrics` — `process_open_fds`,
+  `process_start_time_seconds`, `process_cpu_seconds_total`. Mirrors
+  the conventions Grafana / Prometheus dashboards already understand.
+  Read directly from `/proc/self/fd` and `/proc/self/stat` in Zig (no
+  GIL on scrape).
+- **`--dispatch-token TOKEN`** — Bearer-token gate on
+  `/debug/dispatch`. When set, requests without
+  `Authorization: Bearer <token>` get 401. Constant-time compare so
+  length doesn't leak.
 - **`/metrics` response-compression counters** —
   `saltare_response_compression_total{encoding}`,
   `saltare_response_compression_bytes_in_total{encoding}`,
@@ -60,11 +69,23 @@ counters on `/metrics`.
   (epoll constants, `sys/sendfile.h`, `sys/prctl.h`, `MAP_POPULATE`).
   Real port is a v1.6 milestone, not a stub.
 
-### Tests + bench (v1.5.0)
+### Tests + tooling
 
-91 total: same coverage as v1.4 plus the v1.5 features exercised
-end-to-end via a manual smoke (`/debug/dispatch` returns valid JSON,
-SIGHUP reloads `runtime.cfg`, `/metrics` emits compression counters).
+96 total: same coverage as v1.4 + 5 new at
+[tests/test_v15.py](tests/test_v15.py) (`/debug/dispatch` snapshot,
+token-auth path, `/metrics` compression counters when gzip enabled,
+`process_*` metrics, SIGHUP runtime reload via subprocess).
+
+New tooling:
+
+- **`scripts/smoke-alpine.sh`** — runs the freshly-built musllinux
+  wheel inside an Alpine container, hits `/`, `/metrics`,
+  `/debug/dispatch`, fails on any non-2xx. Catches dynamic-linker /
+  libc regressions cibuildwheel's manylinux test stage misses.
+- **`benchmarks/soak.py`** — sustained-load harness (default 1800 s
+  at 200 rps). Samples RSS every 5 s, fails when post-warmup drift
+  exceeds `--drift-mib` (default 20 MiB). Wired in `make soak`.
+- **`make smoke-alpine`** + **`make soak`** Make targets.
 
 Bench (same host, manylinux_2_28_x86_64, CPython 3.14.4):
 

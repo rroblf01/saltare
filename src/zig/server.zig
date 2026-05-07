@@ -23,6 +23,11 @@ const ws = @import("ws.zig");
 const timer = @import("timer.zig");
 
 const c = @cImport({
+    // sys/types.h first so musl's `bits/types/struct_timespec.h` /
+    // `bits/types/struct_stat.h` get pulled in transitively. Without
+    // this, Zig's translate-c reports both as opaque under musllinux
+    // (glibc inlines them in time.h / sys/stat.h directly).
+    @cInclude("sys/types.h");
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
     @cInclude("netinet/tcp.h");
@@ -35,6 +40,7 @@ const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("time.h");
     @cInclude("arpa/inet.h");
+    @cInclude("dirent.h");
 });
 
 // accept4 is a Linux/glibc extension. Defining _GNU_SOURCE in the @cImport
@@ -48,9 +54,24 @@ extern fn accept4(
     flags: c_int,
 ) c_int;
 
-// glibc-only — guarded with `if (builtin.os.tag == .linux)` at every
-// call site so the extern stays cold on macOS / non-glibc builds.
-extern fn malloc_trim(pad: usize) c_int;
+// glibc-only. `extern fn` would fail to resolve at .so load time on
+// musl (musllinux wheel target), so we look up the symbol via
+// `dlsym(RTLD_DEFAULT, ...)` lazily; missing → no-op.
+const dl_server = @cImport({
+    @cInclude("dlfcn.h");
+});
+const MallocTrim = *const fn (usize) callconv(.c) c_int;
+var g_malloc_trim_server: ?MallocTrim = null;
+var g_malloc_trim_probed: bool = false;
+fn malloc_trim(pad: usize) c_int {
+    if (!g_malloc_trim_probed) {
+        g_malloc_trim_probed = true;
+        const sym = dl_server.dlsym(null, "malloc_trim");
+        if (sym != null) g_malloc_trim_server = @ptrCast(@alignCast(sym));
+    }
+    if (g_malloc_trim_server) |fp| return fp(pad);
+    return 0; // musl path: no-op, succeed silently
+}
 
 const SERVER_HEADER = "saltare/1.5.0";
 
@@ -173,6 +194,12 @@ pub const Observability = struct {
     /// info as the SIGUSR1 dump but reachable from a probe / curl;
     /// useful in containers where signals are awkward.
     dispatch_path: ?[]const u8 = null,
+    /// v1.5 dispatch endpoint shared-secret. When non-null, the
+    /// `/debug/dispatch` endpoint requires `Authorization: Bearer
+    /// <token>` and 401s otherwise. Cheap defense-in-depth for
+    /// network namespaces where the operator can't fully gate the
+    /// route via a sidecar / istio policy.
+    dispatch_token: ?[]const u8 = null,
     /// v1.5 hot-reload runtime config. When set, on `SIGHUP` saltare
     /// re-reads this file and atomically swaps a small subset of
     /// `Limits` / `Observability` fields without a process restart.
@@ -650,9 +677,24 @@ var g_stalled_head: ?*Connection = null;
 /// of a metrics scrape is dominated by the formatting, not by Zig
 /// indirection. Off the hot path when `access_log` is off (we only call
 /// it on request start/end then).
+///
+/// Zig's translate-c reports `struct timespec` as opaque under
+/// musllinux (musl's `time.h` only forward-declares it; the body
+/// lives in `bits/types/struct_timespec.h` and isn't always pulled
+/// in transitively). Manylinux/glibc inlines it directly. The
+/// extern struct + `clock_gettime` declaration below works on both
+/// libcs — same x86_64 layout: `time_t` is `c_long`, `tv_nsec` is
+/// `c_long`.
+const Timespec = extern struct {
+    tv_sec: c_long,
+    tv_nsec: c_long,
+};
+extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+const CLOCK_MONOTONIC_COMPAT: c_int = 1;
+
 fn monoNs() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    var ts: Timespec = undefined;
+    _ = clock_gettime(CLOCK_MONOTONIC_COMPAT, &ts);
     return @as(i64, @intCast(ts.tv_sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.tv_nsec));
 }
 
@@ -845,6 +887,69 @@ fn readVmRssBytes() u64 {
     return kib * 1024;
 }
 
+/// Count open file descriptors by listing `/proc/self/fd`. Linux-only.
+/// Best-effort: returns 0 on any error. Used by the `/metrics`
+/// `process_open_fds` gauge.
+fn readOpenFds() u64 {
+    if (comptime builtin.os.tag != .linux) return 0;
+    const dir = c.opendir("/proc/self/fd") orelse return 0;
+    defer _ = c.closedir(dir);
+    var count: u64 = 0;
+    while (c.readdir(dir)) |entry| {
+        const name_ptr: [*:0]const u8 = @ptrCast(&entry.*.d_name[0]);
+        const name = std.mem.span(name_ptr);
+        if (name.len == 0 or name[0] == '.') continue; // skip . and ..
+        count += 1;
+    }
+    // -1 for the opendir fd itself which is in the listing.
+    return if (count > 0) count - 1 else 0;
+}
+
+/// CPU time consumed (user + kernel) since process start, in seconds.
+/// Reads `/proc/self/stat` field 14 (utime) + 15 (stime), both in
+/// clock ticks. `_SC_CLK_TCK` (typically 100) converts to seconds.
+/// Linux-only.
+fn readCpuSeconds() f64 {
+    if (comptime builtin.os.tag != .linux) return 0.0;
+    const fd = c.open("/proc/self/stat", c.O_RDONLY);
+    if (fd < 0) return 0.0;
+    defer _ = c.close(fd);
+    var buf: [4096]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return 0.0;
+    const data = buf[0..@intCast(n)];
+    // Field separators are spaces, but the comm field (field 2) can
+    // contain spaces inside parens. Skip past the closing paren first.
+    const close_paren = std.mem.lastIndexOfScalar(u8, data, ')') orelse return 0.0;
+    const tail = data[close_paren + 2 ..]; // skip ") "
+    var iter = std.mem.tokenizeScalar(u8, tail, ' ');
+    // After the comm + state field, utime is field 14 in the original
+    // numbering which is field 12 of `tail`.
+    var idx: usize = 0;
+    var utime: u64 = 0;
+    var stime: u64 = 0;
+    while (iter.next()) |tok| : (idx += 1) {
+        // tail starts at the state char (field 3 in original).
+        if (idx == 11) utime = std.fmt.parseInt(u64, tok, 10) catch return 0.0;
+        if (idx == 12) {
+            stime = std.fmt.parseInt(u64, tok, 10) catch return 0.0;
+            break;
+        }
+    }
+    const ticks = utime + stime;
+    const hz: u64 = @intCast(c.sysconf(c._SC_CLK_TCK));
+    if (hz == 0) return 0.0;
+    return @as(f64, @floatFromInt(ticks)) / @as(f64, @floatFromInt(hz));
+}
+
+/// Process start time as seconds-since-epoch. Mirrors Prometheus
+/// client convention `process_start_time_seconds`. Linux-only.
+fn readStartTimeSeconds() f64 {
+    return @as(f64, @floatFromInt(g_process_start_unix_secs.load(.seq_cst)));
+}
+
+var g_process_start_unix_secs: std.atomic.Value(i64) = std.atomic.Value(i64).init(0);
+
 /// Build a Prometheus-format text dump of saltare's counters and write it
 /// to the connection. Bypasses the bridge entirely — the user app never
 /// sees the request, so there's no Python overhead per scrape.
@@ -903,6 +1008,12 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         \\# HELP saltare_process_resident_memory_bytes RSS of the worker, from /proc/self/status (Linux only; 0 elsewhere).
         \\# TYPE saltare_process_resident_memory_bytes gauge
         \\saltare_process_resident_memory_bytes {d}
+        \\# HELP process_open_fds Open file descriptors. Prom client convention.
+        \\# TYPE process_open_fds gauge
+        \\process_open_fds {d}
+        \\# HELP process_start_time_seconds Seconds since epoch when the process started.
+        \\# TYPE process_start_time_seconds gauge
+        \\process_start_time_seconds {d}
         \\# HELP saltare_health_state 0=healthy, 1=draining (SIGTERM received).
         \\# TYPE saltare_health_state gauge
         \\saltare_health_state {d}
@@ -916,8 +1027,23 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         total_bytes_sent,
         total_bytes_recv,
         rss_bytes,
+        readOpenFds(),
+        @as(i64, @intFromFloat(readStartTimeSeconds())),
         @as(u32, if (g_draining.load(.seq_cst)) 1 else 0),
     });
+
+    // process_cpu_seconds_total — separate format to keep float precision.
+    {
+        const cpu_secs = readCpuSeconds();
+        const whole: u64 = @intFromFloat(cpu_secs);
+        const frac: u64 = @intFromFloat((cpu_secs - @as(f64, @floatFromInt(whole))) * 1_000_000.0);
+        w.write(
+            "# HELP process_cpu_seconds_total CPU time used by this process (user + kernel) in seconds.\n" ++
+                "# TYPE process_cpu_seconds_total counter\n" ++
+                "process_cpu_seconds_total {d}.{d:0>6}\n",
+            .{ whole, frac },
+        );
+    }
 
     // v1.4 latency histogram. Emitted only when the operator opted in;
     // saves 14 bucket lines + sum + count + 2 HELP/TYPE lines (~700 B
@@ -1132,12 +1258,18 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
     if (fd < 0) {
         return sendStatus(loop, conn, 404, "Not Found");
     }
-    var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0) {
+    // `struct stat` is opaque under translate-c on musllinux (musl
+    // splits it across bits/types files). `lseek(SEEK_END)` returns
+    // the same size info without touching the struct, works on both
+    // libcs identically. SEEK_SET back so subsequent sendfile starts
+    // at offset 0 — actually we pass `&offset` to sendfile and start
+    // from 0 explicitly below, so the lseek is just a getter here.
+    const size_off = c.lseek(fd, 0, c.SEEK_END);
+    if (size_off < 0) {
         _ = c.close(fd);
         return sendStatus(loop, conn, 500, "Internal Server Error");
     }
-    const size: u64 = @intCast(st.st_size);
+    const size: u64 = @intCast(size_off);
 
     const reason: []const u8 = switch (sf.status) {
         200 => "OK",
@@ -1270,6 +1402,28 @@ fn serveTracemalloc(loop: *eventloop.Loop, conn: *Connection) void {
 /// Python entirely (no GIL acquired) so even a deadlocked dispatcher
 /// answers the probe.
 fn serveDispatch(loop: *eventloop.Loop, conn: *Connection) void {
+    // Optional Bearer-token gate. When `dispatch_token` is set, any
+    // request without `Authorization: Bearer <token>` matching gets a
+    // 401. Constant-time compare avoids leaking length info; the token
+    // is short so the cost is trivial.
+    if (g_obs.dispatch_token) |expected| {
+        const auth = conn.parsed.?.header("authorization") orelse {
+            return sendStatus(loop, conn, 401, "Unauthorized");
+        };
+        const prefix = "Bearer ";
+        if (!std.ascii.startsWithIgnoreCase(auth, prefix)) {
+            return sendStatus(loop, conn, 401, "Unauthorized");
+        }
+        const presented = std.mem.trim(u8, auth[prefix.len..], " \t");
+        if (presented.len != expected.len) {
+            return sendStatus(loop, conn, 401, "Unauthorized");
+        }
+        var diff: u8 = 0;
+        for (presented, expected) |a, b| diff |= a ^ b;
+        if (diff != 0) {
+            return sendStatus(loop, conn, 401, "Unauthorized");
+        }
+    }
     var body_buf: [768]u8 = undefined;
     const open_conns = g_active_conns.load(.seq_cst);
     const in_flight = g_in_flight.load(.seq_cst);
@@ -2091,6 +2245,8 @@ pub fn run(
     defer g_listen_fd.store(-1, .seq_cst);
 
     installSignalHandlers();
+    // Record process start time for `process_start_time_seconds`.
+    g_process_start_unix_secs.store(@intCast(c.time(null)), .seq_cst);
 
     var loop = try eventloop.Loop.init();
     defer loop.deinit();

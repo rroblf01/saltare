@@ -15,17 +15,24 @@
 
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("time.h");
-});
+// musl's `time.h` forward-declares `struct timespec` and puts the
+// definition behind feature gates Zig's translate-c misses. Same
+// fix as in server.zig — manual extern declaration that works on
+// both libcs (x86_64 timespec is `c_long, c_long`).
+const Timespec = extern struct {
+    tv_sec: c_long,
+    tv_nsec: c_long,
+};
+extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
+const CLOCK_MONOTONIC: c_int = 1;
 
 /// Monotonic seconds since some unspecified epoch. We don't use std.time
 /// here because Zig 0.16's std.time was trimmed down significantly (see
 /// the project's Zig 0.16 quirks notes); libc clock_gettime is the
 /// stable, portable path.
 fn monoSec() i64 {
-    var ts: c.struct_timespec = undefined;
-    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    var ts: Timespec = undefined;
+    _ = clock_gettime(CLOCK_MONOTONIC, &ts);
     return @intCast(ts.tv_sec);
 }
 
