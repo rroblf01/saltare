@@ -102,6 +102,72 @@ def _load_app(target: str) -> Any:
         ) from exc
 
 
+# Mirrors the recogniser inside `src/zig/server.zig::applyRuntimeKey`.
+# Keep the two in sync — this list is the authoritative source for
+# documentation; the Zig side is the runtime enforcer.
+_RUNTIME_CONFIG_KEYS: dict[str, type] = {
+    "rate_limit_per_sec": int,
+    "rate_limit_burst": int,
+    "max_connections_per_ip": int,
+    "max_connection_lifetime_secs": int,
+    "access_log": bool,
+}
+
+
+def _check_config(path: str) -> int:
+    """Dry-run validate a runtime-config-path file. Returns 0 on clean
+    parse, 1 if any line is malformed / has an unknown key / has a
+    bad value type. Mirrors the parser in `reloadRuntimeConfig`."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except OSError as exc:
+        sys.stderr.write(f"saltare check-config: cannot open {path!r}: {exc}\n")
+        return 1
+    bad = 0
+    seen = 0
+    for lineno, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            sys.stderr.write(f"  L{lineno}: missing '=' separator: {line!r}\n")
+            bad += 1
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        spec = _RUNTIME_CONFIG_KEYS.get(key)
+        if spec is None:
+            sys.stderr.write(
+                f"  L{lineno}: unknown key {key!r}; valid: "
+                f"{sorted(_RUNTIME_CONFIG_KEYS)}\n"
+            )
+            bad += 1
+            continue
+        if spec is int:
+            try:
+                int(value)
+            except ValueError:
+                sys.stderr.write(f"  L{lineno}: {key} expects int, got {value!r}\n")
+                bad += 1
+                continue
+        elif spec is bool:
+            if value not in ("true", "false", "1", "0", "yes", "no"):
+                sys.stderr.write(
+                    f"  L{lineno}: {key} expects boolean (true/false/1/0/yes/no), "
+                    f"got {value!r}\n"
+                )
+                bad += 1
+                continue
+        seen += 1
+    if bad:
+        sys.stderr.write(f"saltare check-config: {bad} error(s), {seen} ok\n")
+        return 1
+    sys.stderr.write(f"saltare check-config: {seen} key(s) ok in {path}\n")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="saltare",
@@ -111,6 +177,10 @@ def main(argv: list[str] | None = None) -> None:
         "app",
         nargs="?",
         help="ASGI app target as 'module:attr' (e.g. 'main:app').",
+    )
+    parser.add_argument(
+        "--check-config", type=str, default=None, metavar="FILE",
+        help="dry-run validate a runtime-config-path file (key=value); exit 0 ok, 1 fail",
     )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -423,7 +493,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--dispatch-token", type=str, default=None, metavar="TOKEN",
-        help="shared-secret Bearer token gating /debug/dispatch (401 without)",
+        help="shared-secret Bearer token gating /debug/dispatch (also reads SALTARE_DISPATCH_TOKEN env)",
     )
     parser.add_argument(
         "--version",
@@ -432,8 +502,25 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
+    # `--check-config FILE` is a dry-run for the runtime-config-path file
+    # SIGHUP would re-read. Parses every line, reports unknown keys + bad
+    # values without starting the server. Exit 0 on clean parse, 1 if any
+    # line was unrecognised or numeric values were out of range. Lets ops
+    # validate a config push before sending the SIGHUP that activates it.
+    if args.check_config:
+        sys.exit(_check_config(args.check_config))
+
     if not args.app:
         parser.error("missing app target (e.g. 'main:app')")
+
+    # Guardrail: a one-digit rate limit is almost always a typo. Print a
+    # single warning at boot — the user can ignore if intentional.
+    if 0 < args.rate_limit_per_sec < 10:
+        sys.stderr.write(
+            f"saltare: warning: --rate-limit-per-sec={args.rate_limit_per_sec} "
+            "is unusually low; double-check this isn't a typo (real values "
+            "for HTTP APIs are usually 100+)\n"
+        )
 
     app = _load_app(args.app)
     run(
@@ -498,5 +585,8 @@ def main(argv: list[str] | None = None) -> None:
         reload_poll_secs=args.reload_poll_secs,
         dispatch_path=args.dispatch_path,
         runtime_config_path=args.runtime_config_path,
-        dispatch_token=args.dispatch_token,
+        # SALTARE_DISPATCH_TOKEN env var wins over a missing CLI flag.
+        # CLI args show up in `ps aux` and k8s audit logs; env-driven
+        # secrets are the safer default for production.
+        dispatch_token=args.dispatch_token or os.environ.get("SALTARE_DISPATCH_TOKEN") or None,
     )

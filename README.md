@@ -735,7 +735,18 @@ curl http://127.0.0.1:8000/debug/dispatch
 #  "rl_table_size":12,"draining":0,"rss_bytes":48472064}
 ```
 
-Off by default. Recommend gating behind a sidecar / network policy in production — it leaks no secrets but does expose RSS + connection counts.
+Off by default. Recommend gating behind a sidecar / network policy in production — it leaks no secrets but does expose RSS + connection counts. For added defense-in-depth, set a Bearer-token gate:
+
+```bash
+# CLI flag (visible in `ps aux` — fine for dev, avoid for prod)
+saltare app:app --dispatch-path /debug/dispatch --dispatch-token s3cr3t
+
+# Env var (preferred for prod — secret stays out of process listing)
+SALTARE_DISPATCH_TOKEN="$(openssl rand -hex 16)" \
+    saltare app:app --dispatch-path /debug/dispatch
+```
+
+Without the matching `Authorization: Bearer <token>` header the endpoint returns 401. Compare is constant-time.
 
 ### Hot config reload (`--runtime-config-path` + `SIGHUP`, v1.5)
 
@@ -764,7 +775,13 @@ kill -HUP $(pidof saltare)
 # stderr: saltare: SIGHUP: applied 3 key(s), 0 unknown
 ```
 
-Unknown keys + parse errors log a warning and keep the previous value — a typo never crashes the running server.
+Unknown keys + parse errors log a warning and keep the previous value — a typo never crashes the running server. To verify a config push **before** sending the SIGHUP, dry-run it with:
+
+```bash
+saltare --check-config /etc/saltare/runtime.cfg
+# saltare check-config: 3 key(s) ok in /etc/saltare/runtime.cfg
+echo $?  # 0 on clean, 1 if any line was malformed / unknown
+```
 
 ### Compression counters on `/metrics` (v1.5)
 
@@ -860,8 +877,9 @@ Development (v1.4)
 
 Operational depth (v1.5)
   --dispatch-path PATH              JSON dispatch-state snapshot endpoint
-  --dispatch-token TOKEN            Bearer-token gate on --dispatch-path (401 without)
+  --dispatch-token TOKEN            Bearer-token gate on --dispatch-path (also reads SALTARE_DISPATCH_TOKEN env)
   --runtime-config-path FILE        key=value file re-read on SIGHUP for hot config swap
+  --check-config FILE               dry-run validate a runtime-config-path file (exit 0=ok, 1=fail)
 
 Compression (v1.4; lazy dlopen — libs only loaded when flags are on)
   --response-gzip                   negotiate Accept-Encoding: gzip (single-shot + streaming)

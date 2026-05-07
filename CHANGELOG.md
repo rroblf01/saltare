@@ -38,7 +38,21 @@ counters on `/metrics`.
 - **`--dispatch-token TOKEN`** — Bearer-token gate on
   `/debug/dispatch`. When set, requests without
   `Authorization: Bearer <token>` get 401. Constant-time compare so
-  length doesn't leak.
+  length doesn't leak. Also reads from `SALTARE_DISPATCH_TOKEN` env
+  var (preferred in production — keeps the secret out of `ps aux`
+  and k8s audit logs).
+- **`saltare --check-config FILE`** — dry-run validates a
+  `--runtime-config-path` file before sending SIGHUP. Reports
+  unknown keys, malformed lines, type errors. Exit 0 on clean
+  parse, 1 on any error. Matches the Zig-side recogniser in
+  `applyRuntimeKey`.
+- **Boot-time warning on `--rate-limit-per-sec < 10`** — defends
+  against typo footguns ("ratelimit=1 per second" vs the intended
+  "100"). Single stderr line; user can ignore if intentional.
+- **TLS smoke under musl** — `scripts/smoke-alpine.sh` now also
+  generates a self-signed cert + curl HTTPS, verifying the lazy
+  `dlopen("libssl.so.3")` resolves correctly on Alpine before any
+  prod traffic touches the deployment.
 - **`/metrics` response-compression counters** —
   `saltare_response_compression_total{encoding}`,
   `saltare_response_compression_bytes_in_total{encoding}`,

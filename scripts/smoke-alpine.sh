@@ -44,9 +44,7 @@ docker run --rm --platform=linux/amd64 \
     -v "$WHEEL_DIR:/wheels:ro" \
     "alpine:3.20" sh -c "
 set -e
-apk add --no-cache python3 py3-pip curl >/dev/null 2>&1 || true
-# Some Alpine images lock /usr/lib/python3.X — use --break-system-packages
-# (or a venv). Venv is cleanest.
+apk add --no-cache python3 py3-pip curl openssl >/dev/null 2>&1 || true
 python3 -m venv /opt/v
 . /opt/v/bin/activate
 pip install --quiet '/wheels/$WHEEL_NAME' httpx
@@ -64,12 +62,13 @@ async def app(scope, receive, send):
     await send({'type':'http.response.body','body':b'ok\n','more_body':False})
 EOF
 cd /app
+
+echo '=== plain HTTP smoke ==='
 saltare app:app --host 127.0.0.1 --port 8765 \
     --metrics-path /metrics --dispatch-path /debug/dispatch \
     --shutdown-timeout 1 > /tmp/srv.log 2>&1 &
 SALTARE_PID=\$!
 
-# Wait for listen.
 for i in 1 2 3 4 5 6 7 8 9 10; do
     if curl -s -o /dev/null http://127.0.0.1:8765/; then break; fi
     sleep 0.5
@@ -81,14 +80,36 @@ for path in '/' '/metrics' '/debug/dispatch'; do
     echo \"\$path -> \$code\"
     case \$code in 2*) ;; *) ok=1 ;; esac
 done
-
 kill \$SALTARE_PID 2>/dev/null || true
 wait 2>/dev/null || true
-
 if [ \$ok -ne 0 ]; then
-    echo '--- saltare stderr ---'
-    cat /tmp/srv.log
-    exit 1
+    echo '--- saltare stderr ---'; cat /tmp/srv.log; exit 1
 fi
-echo 'alpine smoke: OK'
+
+echo '=== TLS smoke (verifies dlopen of libssl resolves on musl) ==='
+# Generate self-signed cert. The CN doesn't matter for this smoke
+# because curl --insecure skips the chain check; we're verifying the
+# handshake itself completes.
+openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/k.pem -out /tmp/c.pem \
+    -days 1 -subj '/CN=localhost' >/dev/null 2>&1
+saltare app:app --host 127.0.0.1 --port 8443 \
+    --ssl-certfile /tmp/c.pem --ssl-keyfile /tmp/k.pem \
+    --shutdown-timeout 1 > /tmp/srv-tls.log 2>&1 &
+TLS_PID=\$!
+
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -k -s -o /dev/null https://127.0.0.1:8443/; then break; fi
+    sleep 0.5
+done
+tls_code=\$(curl -k -s -o /dev/null -w '%{http_code}' https://127.0.0.1:8443/)
+echo \"https / -> \$tls_code\"
+kill \$TLS_PID 2>/dev/null || true
+wait 2>/dev/null || true
+case \$tls_code in 2*) ;; *)
+    echo 'TLS handshake failed under musl'
+    echo '--- saltare-tls stderr ---'; cat /tmp/srv-tls.log
+    exit 1
+;;
+esac
+echo 'alpine smoke: OK (HTTP + TLS)'
 "
