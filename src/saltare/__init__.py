@@ -76,6 +76,7 @@ def run(
     dispatch_path: str | None = None,
     runtime_config_path: str | None = None,
     dispatch_token: str | None = None,
+    ktls: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -320,4 +321,5 @@ def run(
         dispatch_path,
         runtime_config_path,
         dispatch_token,
+        int(bool(ktls)),
     )

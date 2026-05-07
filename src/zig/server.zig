@@ -666,6 +666,12 @@ fn resetMetrics() void {
 /// `serve()` call. Each accepted connection wraps its fd with a fresh SSL
 /// derived from this context.
 var g_tls_ctx: ?*tls.Ctx = null;
+/// v1.5: kTLS — when set, sendfile-over-HTTPS is allowed because
+/// OpenSSL has handed cipher state to the kernel and the socket fd
+/// emits TLS records on raw `sendfile(2)`/`write(2)`. Plain-HTTP +
+/// userspace-TLS deployments leave this at `false` (no behaviour
+/// change vs v1.4).
+var g_ktls_enabled: bool = false;
 
 /// Head of the doubly-linked list of stalled connections. A connection is
 /// stalled when its in-flight HTTP dispatch's Task is parked on something
@@ -1242,11 +1248,20 @@ fn serveFavicon(loop: *eventloop.Loop, conn: *Connection) void {
 /// can't use sendfile (the kernel writes plaintext), so we 500
 /// gracefully there too.
 fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRequest) void {
-    if (conn.ssl != null) {
-        // sendfile + userspace TLS don't compose. App should fall
-        // back to chunked body for HTTPS endpoints.
+    if (conn.ssl != null and !g_ktls_enabled) {
+        // sendfile + userspace TLS don't compose. With kTLS the kernel
+        // applies TLS records on the socket so the regular sendfile(2)
+        // syscall just works — see `--ktls`. Without kTLS the app
+        // should fall back to chunked body for HTTPS endpoints.
         return sendStatus(loop, conn, 500, "Internal Server Error");
     }
+    // kTLS path: we still need to flush any plaintext OpenSSL has
+    // buffered (handshake state). On a fresh connection right after
+    // the handshake, OpenSSL has already pushed cipher state into
+    // the kernel — the socket fd is now a kTLS socket, so sendfile
+    // emits TLS records directly. We write the head via SSL_write
+    // so OpenSSL's bookkeeping stays consistent, then sendfile() the
+    // body via the bare fd (kernel encrypts on the way out).
 
     var path_buf: [4096]u8 = undefined;
     if (sf.path.len >= path_buf.len) {
@@ -2104,9 +2119,12 @@ pub fn run(
     obs: Observability,
     uds_path: ?[]const u8,
     inherited_listen_fd: ?c_int,
+    ktls: bool,
 ) !void {
     g_tls_ctx = tls_ctx;
     defer g_tls_ctx = null;
+    g_ktls_enabled = ktls;
+    defer g_ktls_enabled = false;
     g_timeouts = timeouts;
     defer g_timeouts = .{};
     g_limits = limits;

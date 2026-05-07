@@ -125,12 +125,24 @@ pub const InitError = error{
 /// `session_cache_size` configures OpenSSL's server-side session cache.
 /// Zero disables caching (every connection negotiates from scratch).
 /// Non-zero enables it; ~20 KiB resident per cached session at peak.
+// v1.5: kTLS — kernel TLS offload. With OpenSSL ≥ 3.0, setting
+// `SSL_OP_ENABLE_KTLS` on the context tells OpenSSL to push cipher
+// state into the kernel after handshake, so subsequent writes go
+// straight from kernel buffers to the wire (and `sendfile(2)`
+// works on TLS sockets — exactly the gap saltare's v1.4 sendfile
+// path had). Plus `SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE` (≥ 3.2)
+// avoids a TX copy. Constants are public ABI; safe to hard-code.
+const SSL_OP_ENABLE_KTLS: c_long = 0x00000008;
+const SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE: c_long = 0x00000010;
+const SSL_CTRL_OPTIONS: c_int = 32;
+
 pub fn newContext(
     cert_file: [*c]const u8,
     key_file: [*c]const u8,
     session_cache_size: u32,
     ca_file: [*c]const u8,
     verify_client: bool,
+    enable_ktls: bool,
 ) InitError!*Ctx {
     if (!loadFuncs()) return InitError.LibSslNotFound;
     const f = funcs.?;
@@ -174,6 +186,17 @@ pub fn newContext(
             SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
             null,
         );
+    }
+
+    if (enable_ktls) {
+        // SSL_CTX_set_options is a macro over SSL_CTX_ctrl with
+        // cmd=SSL_CTRL_OPTIONS. Returns the new option mask. We don't
+        // care about the return — failure to set on OpenSSL < 3.0
+        // (where the bit is 0) is harmless: the option is ignored,
+        // OpenSSL falls back to userspace TLS, sendfile-over-TLS keeps
+        // returning 500. Zero RAM cost when off.
+        const ktls_bits = SSL_OP_ENABLE_KTLS | SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE;
+        _ = f.SSL_CTX_ctrl(ctx, SSL_CTRL_OPTIONS, ktls_bits, null);
     }
 
     return ctx;

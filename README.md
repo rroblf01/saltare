@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.5.0 — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL) with **Bearer-token gate** (`--dispatch-token`), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **`process_*` Prometheus metrics** (`process_open_fds`, `process_cpu_seconds_total`, `process_start_time_seconds` — Grafana / Prom-client conventions), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip), **production runbook + day-2 ops table** in README, **`make smoke-alpine`** (real Alpine container smoke test against the freshly-built musllinux wheel), **`make soak`** (sustained-load RSS-drift gate, defaults 1800 s @ 200 rps). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
+> **Status: 1.5.0 — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL) with **Bearer-token gate** (`--dispatch-token`), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **`process_*` Prometheus metrics** (`process_open_fds`, `process_cpu_seconds_total`, `process_start_time_seconds` — Grafana / Prom-client conventions), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip), **production runbook + day-2 ops table** in README, **`make smoke-alpine`** (real Alpine container smoke test against the freshly-built musllinux wheel), **`make soak`** (sustained-load RSS-drift gate, defaults 1800 s @ 200 rps), **`--ktls`** (kernel TLS offload via OpenSSL ≥ 3.0 — closes the v1.4 sendfile-over-HTTPS gap; off by default). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
 
 > **Status: 1.4.0 (historical entry) — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. **Dev autoreload**: `--reload` watches code and `SIGTERM`s + respawns the child on change (poll-based, no `inotify` dep — works inside containers / overlayfs / NFS). Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
 
@@ -783,6 +783,27 @@ saltare --check-config /etc/saltare/runtime.cfg
 echo $?  # 0 on clean, 1 if any line was malformed / unknown
 ```
 
+### kTLS (sendfile-over-HTTPS, v1.5)
+
+`--ktls` flips OpenSSL's `SSL_OP_ENABLE_KTLS` so cipher state is handed to the Linux kernel after handshake. Two consequences:
+
+1. **`saltare.sendfile` works on TLS connections.** v1.4 returned 500 because `sendfile(2)` can't encrypt; with kTLS the kernel applies TLS records on the socket and the syscall just works.
+2. **TX-zerocopy on plaintext writes.** `SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE` removes one buffer copy per write. Throughput win on large responses.
+
+Requirements:
+
+- **OpenSSL ≥ 3.0** at runtime. The flag bit is `0` on older OpenSSLs, so silently ignored — saltare falls back to userspace TLS and `serveSendfile` returns 500 on HTTPS as before.
+- **Linux ≥ 4.13** for AES-128-GCM, **≥ 5.2** for AES-256-GCM kTLS support. Older kernels: OpenSSL detects the missing kernel feature and itself falls back to userspace.
+- Kernel module `tls` available (`modprobe tls` or built into the kernel; standard on modern distros).
+
+```bash
+saltare app:app --host 0.0.0.0 --port 8443 \
+    --ssl-certfile /etc/tls/cert.pem --ssl-keyfile /etc/tls/key.pem \
+    --ktls
+```
+
+Off by default. When off, behaviour is identical to v1.4 (`serveSendfile` returns 500 on TLS connections; userspace SSL_write handles the rest).
+
 ### Compression counters on `/metrics` (v1.5)
 
 When any response encoder is enabled (`--response-gzip` / `-brotli` / `-zstd`), `/metrics` automatically grows four families:
@@ -880,6 +901,7 @@ Operational depth (v1.5)
   --dispatch-token TOKEN            Bearer-token gate on --dispatch-path (also reads SALTARE_DISPATCH_TOKEN env)
   --runtime-config-path FILE        key=value file re-read on SIGHUP for hot config swap
   --check-config FILE               dry-run validate a runtime-config-path file (exit 0=ok, 1=fail)
+  --ktls                            enable OpenSSL kTLS (sendfile-over-HTTPS; needs OpenSSL>=3.0 + Linux>=4.13)
 
 Compression (v1.4; lazy dlopen — libs only loaded when flags are on)
   --response-gzip                   negotiate Accept-Encoding: gzip (single-shot + streaming)

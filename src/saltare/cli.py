@@ -496,6 +496,10 @@ def main(argv: list[str] | None = None) -> None:
         help="shared-secret Bearer token gating /debug/dispatch (also reads SALTARE_DISPATCH_TOKEN env)",
     )
     parser.add_argument(
+        "--ktls", action="store_true",
+        help="enable OpenSSL kTLS (sendfile-over-HTTPS, kernel TLS records; needs OpenSSL >=3.0 + Linux >=4.13)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -589,4 +593,5 @@ def main(argv: list[str] | None = None) -> None:
         # CLI args show up in `ps aux` and k8s audit logs; env-driven
         # secrets are the safer default for production.
         dispatch_token=args.dispatch_token or os.environ.get("SALTARE_DISPATCH_TOKEN") or None,
+        ktls=args.ktls,
     )

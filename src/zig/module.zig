@@ -198,10 +198,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var dispatch_path_z: [*c]const u8 = null;
     var runtime_config_path_z: [*c]const u8 = null;
     var dispatch_token_z: [*c]const u8 = null;
+    var ktls_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzz",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzzi",
         &app,
         &host_z,
         &port,
@@ -250,6 +251,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &dispatch_path_z,
         &runtime_config_path_z,
         &dispatch_token_z,
+        &ktls_flag,
     ) == 0) {
         return null;
     }
@@ -329,7 +331,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     // serve() time with a clear Python exception, not at first connection.
     var tls_ctx: ?*tls.Ctx = null;
     if (both_set) {
-        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache, ssl_ca_z, ssl_verify_client_flag != 0) catch |err| {
+        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache, ssl_ca_z, ssl_verify_client_flag != 0, ktls_flag != 0) catch |err| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(
                 &msg_buf,
@@ -354,13 +356,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
             py.PyErr_SetString(py.PyExc_RuntimeError, msg.ptr);
             return null;
         };
-        return runMultiWorker(app.?, host, port, ssl_cert_z, ssl_key_z, both_set, tls_ctx, timeouts, limits, obs, uds_path, listen_fd, workers);
+        return runMultiWorker(app.?, host, port, ssl_cert_z, ssl_key_z, both_set, tls_ctx, timeouts, limits, obs, uds_path, listen_fd, workers, ktls_flag != 0);
     }
 
     // Single-worker path. Identical to v0.18 except `inherited_listen_fd`
     // is now an explicit `null` instead of an absent argument.
     setProcName("saltare");
-    return runSingleWorker(app.?, host, port, both_set, tls_ctx, timeouts, limits, obs, uds_path, null);
+    return runSingleWorker(app.?, host, port, both_set, tls_ctx, timeouts, limits, obs, uds_path, null, ktls_flag != 0);
 }
 
 /// Run lifespan + I/O loop + lifespan-shutdown in this process. Used for
@@ -376,6 +378,7 @@ fn runSingleWorker(
     obs: server.Observability,
     uds_path: ?[]const u8,
     inherited_listen_fd: ?c_int,
+    ktls: bool,
 ) ?*py.PyObject {
     if (!bridge.init(app, host, port, is_tls)) {
         return null;
@@ -418,7 +421,7 @@ fn runSingleWorker(
     freezePython();
 
     const tstate = py.PyEval_SaveThread();
-    server.run(host, @intCast(port), tls_ctx, timeouts, limits, obs, uds_path, inherited_listen_fd) catch |err| {
+    server.run(host, @intCast(port), tls_ctx, timeouts, limits, obs, uds_path, inherited_listen_fd, ktls) catch |err| {
         py.PyEval_RestoreThread(tstate);
         bridge.lifespanShutdown();
         bridge.shutdown();
@@ -458,6 +461,7 @@ fn runMultiWorker(
     uds_path: ?[]const u8,
     listen_fd: c_int,
     workers: c_uint,
+    ktls: bool,
 ) ?*py.PyObject {
     _ = ssl_cert_z;
     _ = ssl_key_z;
@@ -507,7 +511,7 @@ fn runMultiWorker(
             var name_buf: [16]u8 = undefined;
             const wname = std.fmt.bufPrint(&name_buf, "saltare:wkr{d}", .{spawned}) catch "saltare:wkr";
             setProcName(wname);
-            const result = runSingleWorker(app, host, port, is_tls, tls_ctx, timeouts, limits, obs, uds_path, listen_fd);
+            const result = runSingleWorker(app, host, port, is_tls, tls_ctx, timeouts, limits, obs, uds_path, listen_fd, ktls);
             // Child must exit — we don't return up the Python call stack.
             // Use the conventional `_exit` to skip atexit handlers (which
             // might double-flush stdio with the master).

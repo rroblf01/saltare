@@ -53,6 +53,16 @@ counters on `/metrics`.
   generates a self-signed cert + curl HTTPS, verifying the lazy
   `dlopen("libssl.so.3")` resolves correctly on Alpine before any
   prod traffic touches the deployment.
+- **`--ktls`** — kernel-TLS offload via `SSL_OP_ENABLE_KTLS` +
+  `SSL_OP_ENABLE_KTLS_TX_ZEROCOPY_SENDFILE`. After the OpenSSL
+  handshake, cipher state is pushed into the kernel; subsequent
+  writes go straight from kernel buffers to the wire and `sendfile(2)`
+  works on TLS sockets. Closes the v1.4 gap where `serveSendfile`
+  returned 500 on HTTPS connections. Requires OpenSSL ≥ 3.0 and
+  Linux ≥ 4.13 (5.2+ for AES-256-GCM); the option is silently ignored
+  on older OpenSSLs (the bit is 0) so the wheel stays portable.
+  Off by default — when off, TLS path is unchanged from v1.4 and
+  `serveSendfile` keeps returning 500 over HTTPS.
 - **`/metrics` response-compression counters** —
   `saltare_response_compression_total{encoding}`,
   `saltare_response_compression_bytes_in_total{encoding}`,
