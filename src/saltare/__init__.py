@@ -233,20 +233,22 @@ def run(
     # no-op. Emit a single-line stderr warning so the misconfiguration
     # is visible in container logs.
     import sys as _sys
+    # Use known-good encoder params for the probe so an out-of-range
+    # user param doesn't masquerade as a missing lib.
     if response_brotli:
-        if _core.brotli_encode(b"probe", int(response_brotli_quality)) is None:
+        if _core.brotli_encode(b"probe", 4) is None:
             _sys.stderr.write(
                 "saltare: warning: --response-brotli is on but libbrotlienc.so.1 "
                 "could not be dlopen'd; falling back to gzip / identity\n"
             )
     if response_zstd:
-        if _core.zstd_encode(b"probe", int(response_zstd_level)) is None:
+        if _core.zstd_encode(b"probe", 3) is None:
             _sys.stderr.write(
                 "saltare: warning: --response-zstd is on but libzstd.so.1 "
                 "could not be dlopen'd; falling back to gzip / identity\n"
             )
     if response_gzip or request_decompression:
-        if _core.gzip_encode(b"probe", int(response_gzip_level)) is None:
+        if _core.gzip_encode(b"probe", 6) is None:
             _sys.stderr.write(
                 "saltare: warning: --response-gzip / --request-decompression is on "
                 "but libz.so.1 could not be dlopen'd; compression is a no-op\n"

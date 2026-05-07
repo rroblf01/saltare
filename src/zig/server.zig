@@ -1039,6 +1039,8 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
     while (written < head.len) {
         const r = c.write(conn.fd, @ptrCast(head[written..].ptr), head.len - written);
         if (r < 0) {
+            // EINTR: retry, no progress lost. Anything else: drop.
+            if (std.posix.errno(r) == .INTR) continue;
             _ = c.close(fd);
             loop.remove(conn.fd);
             conn.destroy();
@@ -1053,6 +1055,27 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
         written += @intCast(r);
     }
 
+    // RFC 7230 §3.3.3: HEAD response has the same headers as GET but
+    // MUST NOT include a body. Skip the sendfile loop entirely —
+    // emitting the body bytes after the head would corrupt the
+    // pipeline on keep-alive (the client would parse them as the
+    // start of the next response).
+    const is_head = std.mem.eql(u8, conn.parsed.?.method, "HEAD");
+    if (is_head) {
+        _ = c.close(fd);
+        conn.bytes_sent = 0;
+        conn.response_status = sf.status;
+        conn.keep_alive = sf.keep_alive;
+        finishRequest(conn);
+        if (sf.keep_alive) {
+            keepAliveReset(loop, conn);
+        } else {
+            loop.remove(conn.fd);
+            conn.destroy();
+        }
+        return;
+    }
+
     // sendfile in a loop until the whole file is on the wire. For
     // very large files this should yield to the event loop; for v1.4
     // we keep it synchronous (the loop handles other connections in
@@ -1063,8 +1086,14 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
     while (remaining > 0) {
         const sent = c.sendfile(conn.fd, fd, &offset, remaining);
         if (sent < 0) {
+            const err = std.posix.errno(sent);
+            // EINTR: a signal hit between syscall entry and any data
+            // transfer. Retry transparently — no progress to lose.
+            // SIGCHLD / SIGUSR1 / a wheel timer firing all land here
+            // and would otherwise drop the connection.
+            if (err == .INTR) continue;
             // EAGAIN/EWOULDBLOCK on full socket buffer — yield.
-            if (std.posix.errno(sent) == .AGAIN) {
+            if (err == .AGAIN) {
                 // Wait for the socket to be writable. We register
                 // the fd for EPOLLOUT and re-enter sendfile on the
                 // next event. Simpler v1.4 impl: block here briefly

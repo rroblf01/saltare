@@ -156,8 +156,8 @@ def supervise(
     poll_secs: float = _DEFAULT_POLL_SECS,
 ) -> int:
     """Parent reload loop. Returns the child's last exit code on a
-    clean parent shutdown (Ctrl-C). Never returns under normal use —
-    the child is what serves traffic."""
+    clean parent shutdown (Ctrl-C / SIGTERM). Never returns under
+    normal use — the child is what serves traffic."""
     env = os.environ.copy()
     env[_RELOAD_ENV_FLAG] = "1"
     snap = _snapshot(reload_dirs, includes, excludes)
@@ -166,6 +166,21 @@ def supervise(
         f"{', '.join(reload_dirs)} (poll {poll_secs}s)\n"
     )
     child = _spawn(env)
+
+    # Forward SIGTERM (systemd / docker / k8s graceful shutdown) to the
+    # child so the dev-mode supervisor exits the same way prod does.
+    # Without this the parent dies mid-loop and orphans the child;
+    # PID-1 cleanup in containers usually catches it but the shutdown
+    # path is racy and the access-log line for the in-flight request
+    # never makes it to stderr. The handler raises KeyboardInterrupt
+    # so we share the cleanup code path with Ctrl-C.
+    def _on_sigterm(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        # Non-main thread or unsupported on this platform — best effort.
+        pass
 
     last_exit = 0
     try:

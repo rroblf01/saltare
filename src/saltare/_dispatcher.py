@@ -530,6 +530,12 @@ def set_response_gzip(enabled: bool, min_bytes: int = 512, level: int = 6) -> No
         _response_gzip_min_bytes = int(min_bytes)
     if 1 <= level <= 9:
         _response_gzip_level = int(level)
+    elif enabled:
+        import sys as _sys
+        _sys.stderr.write(
+            f"saltare: response_gzip_level={level} out of range [1, 9]; "
+            f"keeping {_response_gzip_level}\n"
+        )
 
 
 def set_response_brotli(enabled: bool, quality: int = 4) -> None:
@@ -539,6 +545,12 @@ def set_response_brotli(enabled: bool, quality: int = 4) -> None:
     _response_brotli_enabled = bool(enabled)
     if 0 <= quality <= 11:
         _response_brotli_quality = int(quality)
+    elif enabled:
+        import sys as _sys
+        _sys.stderr.write(
+            f"saltare: response_brotli_quality={quality} out of range [0, 11]; "
+            f"keeping {_response_brotli_quality}\n"
+        )
 
 
 def set_response_zstd(enabled: bool, level: int = 3) -> None:
@@ -548,6 +560,12 @@ def set_response_zstd(enabled: bool, level: int = 3) -> None:
     _response_zstd_enabled = bool(enabled)
     if 1 <= level <= 22:
         _response_zstd_level = int(level)
+    elif enabled:
+        import sys as _sys
+        _sys.stderr.write(
+            f"saltare: response_zstd_level={level} out of range [1, 22]; "
+            f"keeping {_response_zstd_level}\n"
+        )
 
 
 def set_request_decompression(enabled: bool, cap_bytes: int = 0) -> None:
@@ -1928,6 +1946,11 @@ def http_dispatch_pop_sendfile(handle: int) -> tuple[str, int, list[tuple[bytes,
 def http_dispatch_abort(handle: int) -> None:
     """Connection went away mid-stream. Cancel the Task and free state."""
     state_obj = _ensure_state()
+    # Defensive cleanup — if the bridge stashed a sendfile request but
+    # the connection dropped before serveSendfile pulled it out, the
+    # stash entry would otherwise leak forever (handle counter never
+    # rolls back). Pop unconditionally; absent key is fine.
+    _pending_sendfiles.pop(handle, None)
     s = state_obj.http_states.pop(handle, None)
     if s is None:
         return
