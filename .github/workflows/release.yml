@@ -54,16 +54,23 @@ jobs:
           ZIG_SKIP_SYMLINK: "1"
         run: bash scripts/install-zig.sh
 
+      # Wrap cibuildwheel in retries: quay.io serves the manylinux /
+      # musllinux images and occasionally returns 502 Bad Gateway under
+      # load. The pull is idempotent so a 30-second backoff usually
+      # clears the transient. 3 attempts is enough — sustained quay.io
+      # outages are operator-visible problems, not flaky-CI ones.
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4
-        env:
-          CIBW_ARCHS: ${{ matrix.arch }}
-          # Mount the pre-installed Zig read-only and prepend it to PATH
-          # inside the container. install-zig.sh's fast path then sees
-          # `zig` already on PATH at the right version and exits early
-          # — no in-container download needed.
-          CIBW_CONTAINER_ENGINE: 'docker; create_args: --volume ${{ runner.temp }}/zig:/host-zig:ro'
-          CIBW_ENVIRONMENT_LINUX: 'PATH=/host-zig:/usr/local/bin:$PATH ZIG_VERSION=${{ env.ZIG_VERSION }}'
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 60
+          max_attempts: 3
+          retry_wait_seconds: 30
+          retry_on: error
+          command: |
+            CIBW_ARCHS=${{ matrix.arch }} \
+            CIBW_CONTAINER_ENGINE='docker; create_args: --volume ${{ runner.temp }}/zig:/host-zig:ro' \
+            CIBW_ENVIRONMENT_LINUX='PATH=/host-zig:/usr/local/bin:$PATH ZIG_VERSION=${{ env.ZIG_VERSION }}' \
+            pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
         with:
