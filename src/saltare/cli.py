@@ -394,6 +394,26 @@ def main(argv: list[str] | None = None) -> None:
         help="surface W3C Trace Context (traceparent/tracestate) on scope and echo on response",
     )
     parser.add_argument(
+        "--reload", action="store_true",
+        help="dev autoreload: poll watch dirs, SIGTERM + respawn on change (disables --workers > 1)",
+    )
+    parser.add_argument(
+        "--reload-dir", action="append", metavar="DIR", default=None,
+        help="directory to watch for code changes (repeatable; default: cwd)",
+    )
+    parser.add_argument(
+        "--reload-include", action="append", metavar="GLOB", default=None,
+        help="fnmatch glob for files to watch (repeatable; default: '*.py')",
+    )
+    parser.add_argument(
+        "--reload-exclude", action="append", metavar="GLOB", default=None,
+        help="fnmatch glob to exclude (repeatable; sensible defaults skip __pycache__/.git/etc.)",
+    )
+    parser.add_argument(
+        "--reload-poll-secs", type=float, default=0.5, metavar="SECS",
+        help="reloader poll interval in seconds (default 0.5)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -459,4 +479,9 @@ def main(argv: list[str] | None = None) -> None:
         max_request_head_bytes=args.max_request_head_bytes,
         latency_histogram=args.latency_histogram,
         traceparent_propagation=args.traceparent_propagation,
+        reload=args.reload,
+        reload_dirs=args.reload_dir,
+        reload_includes=args.reload_include,
+        reload_excludes=args.reload_exclude,
+        reload_poll_secs=args.reload_poll_secs,
     )

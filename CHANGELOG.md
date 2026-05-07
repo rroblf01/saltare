@@ -80,6 +80,21 @@ keep the v1.3 RAM floor unchanged.
   working. ASGI app resolution: `SALTARE_ASGI_APPLICATION` →
   `ASGI_APPLICATION` → `get_asgi_application()`. Dev-only — production
   still calls the `saltare` CLI directly, no Django dep at runtime.
+- **`--reload` autoreload** — parent process supervises a saltare
+  child, polls watch dirs for `*.py` mtime changes (default 0.5 s),
+  `SIGTERM` + respawn on change. Same shutdown path as production.
+  Poll-based (no `inotify` dep) so it works inside containers /
+  overlayfs / NFS without surprises. Sensible default excludes
+  (`__pycache__`, `.git`, `.venv`, `node_modules`, IDE caches).
+  Crash-loop guard: a syntax error in the child waits for the next
+  file change before respawn instead of pegging CPU. `--workers > 1`
+  is auto-coerced to 1 (reloader + pre-fork supervisor can't share
+  the listen socket). `__pycache__` is purged between respawns so
+  saltare's `PYTHONOPTIMIZE=2`-baked `.opt-2.pyc` files (keyed by
+  second-resolution mtime) don't shadow sub-second edits.
+  Implementation: `src/saltare/_reload.py`. Flags: `--reload`,
+  `--reload-dir DIR` (repeatable), `--reload-include GLOB`,
+  `--reload-exclude GLOB`, `--reload-poll-secs SECS`.
 
 ### Compression negotiation
 

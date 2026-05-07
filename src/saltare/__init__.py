@@ -68,6 +68,11 @@ def run(
     max_request_head_bytes: int = 0,
     latency_histogram: bool = False,
     traceparent_propagation: bool = False,
+    reload: bool = False,
+    reload_dirs: list[str] | tuple[str, ...] | None = None,
+    reload_includes: list[str] | tuple[str, ...] | None = None,
+    reload_excludes: list[str] | tuple[str, ...] | None = None,
+    reload_poll_secs: float = 0.5,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -175,6 +180,36 @@ def run(
     `IPV6_V6ONLY=1` set. Run a second saltare process for v4 if you
     need both families.
     """
+    # v1.4 --reload: parent process supervises a saltare child, watches
+    # files, SIGTERM + respawn on change. The child re-enters this fn
+    # with `_SALTARE_RELOAD_CHILD=1` set in env and skips the supervise
+    # branch. Multi-worker (`--workers > 1`) is incompatible with the
+    # supervisor — we silently fall back to single-worker so the
+    # reloader can own the listen socket.
+    if reload:
+        from saltare import _reload
+        if not _reload.is_reload_child():
+            if int(workers) > 1:
+                import sys as _sys
+                _sys.stderr.write(
+                    "saltare: --reload disables --workers > 1 "
+                    "(reloader and pre-fork supervisor share no listen socket)\n"
+                )
+            dirs = tuple(reload_dirs) if reload_dirs else (".",)
+            includes = tuple(reload_includes) if reload_includes else _reload._DEFAULT_INCLUDES
+            excludes = tuple(reload_excludes) if reload_excludes else _reload._DEFAULT_EXCLUDES
+            _reload.supervise(
+                reload_dirs=dirs,
+                includes=includes,
+                excludes=excludes,
+                poll_secs=float(reload_poll_secs),
+            )
+            return
+        # Child path: force workers=1 so the child is a single saltare
+        # process the supervisor can SIGTERM cleanly.
+        if int(workers) > 1:
+            workers = 1
+
     # Wire Python-side proxy-headers handling. Done before _core.serve
     # because the dispatcher's scope build happens on every request.
     from saltare import _dispatcher

@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.4.0 — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
+> **Status: 1.4.0 — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. **Dev autoreload**: `--reload` watches code and `SIGTERM`s + respawns the child on change (poll-based, no `inotify` dep — works inside containers / overlayfs / NFS). Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
 
 ### v1.4.x candidates (still pending)
 
@@ -507,6 +507,27 @@ saltare.run(app, workers=0)   # min(cpu_count, 4)
 
 `workers=0` (and `--workers 0`) reads `os.cpu_count()` and caps at 4 — past 4 the GIL-locked dispatch sees diminishing returns under saltare's architecture. Set explicitly when you know better.
 
+### Autoreload (`--reload`, v1.4)
+
+Dev-only file watcher: parent process supervises a saltare child, polls the configured directories for `*.py` mtime changes (default 0.5 s), and on change does `SIGTERM → drain → respawn`. Same shutdown path as production, so the new child starts on a clean socket.
+
+```bash
+saltare myapp:app --reload
+saltare myapp:app --reload --reload-dir src --reload-dir lib
+saltare myapp:app --reload --reload-include '*.py' --reload-include '*.toml'
+saltare myapp:app --reload --reload-exclude '*/migrations/*' --reload-poll-secs 1.0
+```
+
+Behaviour:
+
+- `--workers > 1` is auto-coerced to 1 — the reloader and the pre-fork supervisor can't share a listen socket.
+- A syntax-error crash in the child does **not** restart-loop. The supervisor waits for the next file change before respawning.
+- Default excludes already cover `__pycache__`, `.git`, `.venv`, `node_modules`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.pyc`. Override with `--reload-exclude` (repeatable).
+- The watcher is poll-based (no `inotify` dep) so it works the same in containers, on overlayfs / NFS / 9p mounts, and across rename storms during `git checkout`.
+- Each respawn first deletes `__pycache__` directories under the watched roots. saltare's `PYTHONOPTIMIZE=2` re-exec writes `.opt-2.pyc` keyed by *second-resolution* source mtime; without the purge an edit within 1 s of the previous import would leave the new child running stale bytecode.
+
+Implementation: [src/saltare/_reload.py](src/saltare/_reload.py). Production deployments should run without `--reload` and let your supervisor (systemd, k8s) handle restart on crash.
+
 ### mTLS (client certificate verification)
 
 ```python
@@ -766,6 +787,13 @@ Operational
   --startup-request                 issue an internal GET / after lifespan startup (warm app)
   --gc-collect-every-n-requests N   periodic gc.collect(0) cadence (0 = disabled)
   --version                         print saltare version
+
+Development (v1.4)
+  --reload                          autoreload: poll watch dirs + SIGTERM/respawn on change
+  --reload-dir DIR                  watch directory (repeatable; default: cwd)
+  --reload-include GLOB             fnmatch glob to include (repeatable; default: '*.py')
+  --reload-exclude GLOB             fnmatch glob to exclude (repeatable)
+  --reload-poll-secs SECS           poll interval (default 0.5)
 
 Compression (v1.4; lazy dlopen — libs only loaded when flags are on)
   --response-gzip                   negotiate Accept-Encoding: gzip (single-shot + streaming)
