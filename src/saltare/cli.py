@@ -233,6 +233,41 @@ def main(argv: list[str] | None = None) -> None:
              "Diagnostic only — has CPU + RAM cost.",
     )
     parser.add_argument(
+        "--favicon-204",
+        action="store_true",
+        help="answer GET /favicon.ico with 204 No Content from Zig "
+             "(skips Python dispatch for browser favicon hits)",
+    )
+    parser.add_argument(
+        "--max-connections-per-ip",
+        type=int,
+        default=0,
+        metavar="N",
+        help="per-IP open-connection ceiling (0 = disabled). Over-cap "
+             "peers get a TCP-level close at accept time.",
+    )
+    parser.add_argument(
+        "--access-log-path",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="route access-log JSON lines to PATH instead of stderr",
+    )
+    parser.add_argument(
+        "--request-id-header",
+        type=str,
+        default=None,
+        metavar="NAME",
+        help="auto-generate an 8-byte hex request ID per request and "
+             "echo it as response header NAME (e.g. 'X-Request-ID'). "
+             "Apps can read it via scope['x-request-id'].",
+    )
+    parser.add_argument(
+        "--server-timing",
+        action="store_true",
+        help="emit `Server-Timing: total;dur=<ms>` on every response",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -266,4 +301,9 @@ def main(argv: list[str] | None = None) -> None:
         rate_limit_per_sec=args.rate_limit_per_sec,
         rate_limit_burst=args.rate_limit_burst,
         tracemalloc_path=args.tracemalloc_path,
+        favicon_204=args.favicon_204,
+        max_connections_per_ip=args.max_connections_per_ip,
+        access_log_path=args.access_log_path,
+        request_id_header=args.request_id_header,
+        server_timing=args.server_timing,
     )

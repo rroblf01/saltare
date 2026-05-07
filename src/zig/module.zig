@@ -116,10 +116,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var rate_limit_burst: c_uint = 100;
     var tracemalloc_path_z: [*c]const u8 = null;
     var proxy_headers_flag: c_int = 0;
+    var favicon_204_flag: c_int = 0;
+    var max_conn_per_ip: c_uint = 0;
+    var access_log_path_z: [*c]const u8 = null;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIzi",
+        "Osizz|IIIIIIKIzziIIziIIziiIz",
         &app,
         &host_z,
         &port,
@@ -144,6 +147,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &rate_limit_burst,
         &tracemalloc_path_z,
         &proxy_headers_flag,
+        &favicon_204_flag,
+        &max_conn_per_ip,
+        &access_log_path_z,
     ) == 0) {
         return null;
     }
@@ -172,18 +178,21 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .max_keepalive_requests = @intCast(max_keepalive),
         .rate_limit_per_sec = @intCast(rate_limit_per_sec),
         .rate_limit_burst = @intCast(rate_limit_burst),
+        .max_connections_per_ip = @intCast(max_conn_per_ip),
     };
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
         .health_path = if (health_path_z != null) std.mem.span(health_path_z) else null,
         .tracemalloc_path = if (tracemalloc_path_z != null) std.mem.span(tracemalloc_path_z) else null,
         .access_log = access_log_flag != 0,
+        .access_log_path = if (access_log_path_z != null) std.mem.span(access_log_path_z) else null,
         // The Python dispatcher consumes this for `scope["client"]` and
         // `scope["scheme"]`. Zig also reads it to use the X-Forwarded-For
         // address as the rate-limit key when set, so requests behind a
         // trusted proxy aren't all coalesced into the proxy's TCP peer IP.
         .proxy_headers = proxy_headers_flag != 0,
         .cors_preflight_allow_all = cors_preflight_flag != 0,
+        .favicon_204 = favicon_204_flag != 0,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 

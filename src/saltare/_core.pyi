@@ -25,4 +25,8 @@ def serve(
     rate_limit_per_sec: int = ...,
     rate_limit_burst: int = ...,
     tracemalloc_path: str | None = ...,
+    proxy_headers: int = ...,
+    favicon_204: int = ...,
+    max_connections_per_ip: int = ...,
+    access_log_path: str | None = ...,
 ) -> None: ...

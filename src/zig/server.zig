@@ -96,6 +96,14 @@ pub const Observability = struct {
     /// stderr (method, path, status, bytes_sent, latency_us, user_agent).
     /// Off by default — when off, zero work happens per request.
     access_log: bool = false,
+    /// If non-null, JSON access-log lines go to this file path instead
+    /// of stderr. The file is opened with `O_WRONLY | O_APPEND |
+    /// O_CREAT | O_CLOEXEC` and the fd is closed at server shutdown.
+    /// External log rotation (logrotate's `copytruncate`, or
+    /// `mv + reload`) won't be picked up — saltare doesn't reopen mid-
+    /// run. Best-effort: any open() failure logs once to stderr and
+    /// falls back to stderr writes.
+    access_log_path: ?[]const u8 = null,
     /// If true, the dispatcher honours `X-Forwarded-For` /
     /// `X-Forwarded-Proto` from the request to populate `scope["client"]`
     /// and `scope["scheme"]`. Only enable behind a trusted reverse proxy
@@ -116,6 +124,11 @@ pub const Observability = struct {
     /// snapshots are populated. Diagnostic only — leak hunts in
     /// long-running deployments. The user app never sees the request.
     tracemalloc_path: ?[]const u8 = null,
+    /// If true, GET / HEAD requests for `/favicon.ico` are answered
+    /// from Zig with `204 No Content`. Browsers spam this path on
+    /// every page load; without this flag every hit serialises through
+    /// FastAPI's routing for a 404. Costs zero RAM when off.
+    favicon_204: bool = false,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -146,6 +159,12 @@ pub const Limits = struct {
     /// `rate_limit_per_sec` tokens / second up to `rate_limit_burst`.
     rate_limit_per_sec: u32 = 0,
     rate_limit_burst: u32 = 100,
+    /// Per-IP open-connection ceiling. Zero disables. When set, a peer
+    /// that already holds this many connections gets a TCP-level close
+    /// at accept time (no HTTP response — the kernel sends a RST). The
+    /// per-IP table is shared with the rate limiter; both share the
+    /// 4096-entry cap.
+    max_connections_per_ip: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -159,6 +178,10 @@ const RateLimitEntry = struct {
     peer: [16]u8,
     tokens: f32,
     last_refill_ns: i64,
+    /// Number of currently-open connections from this peer. Maintained
+    /// by `acceptAll` (++) and `Connection.destroy` (--). Used by the
+    /// `max_connections_per_ip` cap; safe to ignore when the cap is 0.
+    open_conns: u32,
 };
 
 const RATE_LIMIT_MAX_IPS: usize = 4096;
@@ -235,6 +258,67 @@ fn parseFirstForwardedIp(value: []const u8) ?[16]u8 {
     return key;
 }
 
+/// Find or create the rate-limit entry for `peer`. Returns a pointer
+/// into `g_rl_entries`; never null (LRU-evicts on overflow). Inlined
+/// callers are `rateLimitAllow` and the per-IP connection-cap path.
+fn rateLimitGetEntry(peer: *const [16]u8, now_ns: i64) *RateLimitEntry {
+    for (g_rl_entries[0..g_rl_count]) |*entry| {
+        if (std.mem.eql(u8, &entry.peer, peer)) return entry;
+    }
+    if (g_rl_count < RATE_LIMIT_MAX_IPS) {
+        g_rl_entries[g_rl_count] = .{
+            .peer = peer.*,
+            .tokens = @floatFromInt(g_limits.rate_limit_burst),
+            .last_refill_ns = now_ns,
+            .open_conns = 0,
+        };
+        const idx = g_rl_count;
+        g_rl_count += 1;
+        return &g_rl_entries[idx];
+    }
+    var oldest_idx: usize = 0;
+    var oldest_ns: i64 = g_rl_entries[0].last_refill_ns;
+    for (g_rl_entries[1..], 1..) |entry, i| {
+        if (entry.last_refill_ns < oldest_ns) {
+            oldest_ns = entry.last_refill_ns;
+            oldest_idx = i;
+        }
+    }
+    g_rl_entries[oldest_idx] = .{
+        .peer = peer.*,
+        .tokens = @floatFromInt(g_limits.rate_limit_burst),
+        .last_refill_ns = now_ns,
+        .open_conns = 0,
+    };
+    return &g_rl_entries[oldest_idx];
+}
+
+/// Per-IP connection acquire result. `over_cap == true` means the
+/// caller should reject the new socket (peer already at the cap);
+/// `entry_idx == 0xFFFF` means the limiter is disabled.
+const PerIpAcquire = struct { entry_idx: u16, over_cap: bool };
+
+/// Bump the per-peer connection counter at accept time.
+fn perIpConnAcquire(peer: *const [16]u8, now_ns: i64) PerIpAcquire {
+    const cap = g_limits.max_connections_per_ip;
+    if (cap == 0) return .{ .entry_idx = 0xFFFF, .over_cap = false };
+    const entry = rateLimitGetEntry(peer, now_ns);
+    const idx_usize: usize = @intFromPtr(entry) -% @intFromPtr(&g_rl_entries[0]);
+    const idx: u16 = @intCast(idx_usize / @sizeOf(RateLimitEntry));
+    if (entry.open_conns >= cap) return .{ .entry_idx = idx, .over_cap = true };
+    entry.open_conns += 1;
+    return .{ .entry_idx = idx, .over_cap = false };
+}
+
+/// Drop a connection from the per-peer counter. No-op when index is
+/// the sentinel (cap was disabled, UDS, or table evicted the slot).
+fn perIpConnRelease(entry_idx: u16) void {
+    if (entry_idx == 0xFFFF) return;
+    const idx: usize = entry_idx;
+    if (idx >= g_rl_count) return;
+    if (g_rl_entries[idx].open_conns > 0) g_rl_entries[idx].open_conns -= 1;
+}
+
 /// Returns true if the request is allowed; false if it should be 429'd.
 /// Implements a per-peer token bucket: refilled at `rate_per_sec` tokens
 /// per second up to a `burst` ceiling. Each allowed request consumes one
@@ -265,6 +349,7 @@ fn rateLimitAllow(peer: *const [16]u8, now_ns: i64) bool {
             .peer = peer.*,
             .tokens = burst - 1.0,
             .last_refill_ns = now_ns,
+            .open_conns = 0,
         };
         g_rl_count += 1;
         return true;
@@ -282,6 +367,7 @@ fn rateLimitAllow(peer: *const [16]u8, now_ns: i64) bool {
         .peer = peer.*,
         .tokens = burst - 1.0,
         .last_refill_ns = now_ns,
+        .open_conns = 0,
     };
     return true;
 }
@@ -306,6 +392,11 @@ var g_limits: Limits = .{};
 /// completed request (access_log). When `metrics_path == null` and
 /// `access_log == false` the v0.14-equivalent fast paths run unchanged.
 var g_obs: Observability = .{};
+
+/// Access-log fd. 2 = stderr (default). When `access_log_path` is set,
+/// run() open()'s the file and stores the fd here. Reset back to 2 on
+/// run() exit so a follow-up serve() call doesn't write to a freed fd.
+var g_access_log_fd: c_int = 2;
 
 /// Number of accepted connections currently alive (i.e. created but not
 /// yet destroyed). Atomic for paranoia even though the I/O loop is
@@ -454,7 +545,7 @@ fn emitAccessLog(conn: *Connection) void {
         // Single write(2) keeps the line atomic from the kernel's view —
         // partial interleaving with other workers' lines is impossible
         // even without explicit locking.
-        _ = c.write(2, &log.buf, log.pos);
+        _ = c.write(g_access_log_fd, &log.buf, log.pos);
     }
 }
 
@@ -670,6 +761,17 @@ fn serveHealth(loop: *eventloop.Loop, conn: *Connection) void {
     serveFixedBody(loop, conn, 200, "OK", "text/plain; charset=utf-8", "ok\n", "");
 }
 
+/// Browsers fetch `/favicon.ico` on first page load. Without this
+/// intercept, every hit serialises through Python's routing for a 404
+/// (or, worse, a multi-millisecond FastAPI 404 page). 204 + empty body
+/// + a 24h `Cache-Control: max-age` so the browser doesn't keep asking.
+fn serveFavicon(loop: *eventloop.Loop, conn: *Connection) void {
+    serveFixedBody(
+        loop, conn, 204, "No Content", "image/x-icon", "",
+        "Cache-Control: public, max-age=86400\r\n",
+    );
+}
+
 /// Serve a tracemalloc dump (top-N Python allocations grouped by
 /// `lineno`). Allocates a body via the bridge, copies into a heap
 /// response, and sends. Body is ~few KiB for typical N=30. The user
@@ -825,6 +927,12 @@ const Connection = struct {
     /// brief moment between Connection.create and the accept path
     /// stamping the address.
     has_peer_key: bool,
+    /// Index into `g_rl_entries` for the per-IP connection counter.
+    /// `0xFFFF` (= u16 max) means "no entry" (cap disabled, UDS, or
+    /// table evicted). On `Connection.destroy` we decrement by index;
+    /// the index is stable as long as we never compact the array, and
+    /// we never do.
+    rl_entry_idx: u16,
 
     /// Borrowed from the pool while a request is in flight, returned to the
     /// pool when the connection goes idle (between keep-alive requests).
@@ -933,6 +1041,7 @@ const Connection = struct {
             .state = .reading,
             .peer_key = std.mem.zeroes([16]u8),
             .has_peer_key = false,
+            .rl_entry_idx = 0xFFFF,
             .read_buf = null,
             .read_total = 0,
             .parsed = null,
@@ -984,6 +1093,9 @@ const Connection = struct {
         if (self.read_buf) |b| self.pool.release(b, monoNs());
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
         _ = c.close(self.fd);
+        // Pair the per-IP connection counter inc'd at accept (no-op
+        // when the cap was disabled or the peer is UDS).
+        perIpConnRelease(self.rl_entry_idx);
         // Pair with the increment in acceptAll. Subtract before destroying
         // so `g_active_conns` reflects the soon-to-be-freed slot.
         _ = g_active_conns.fetchSub(1, .seq_cst);
@@ -1132,6 +1244,32 @@ pub fn run(
     defer g_limits = .{};
     g_obs = obs;
     defer g_obs = .{};
+
+    // Access log fd. Default = stderr. If a path was supplied, open()
+    // it append-mode and route writes there. Failure falls back to
+    // stderr with a single warning to stderr — we don't refuse to
+    // serve over a log-write target.
+    if (obs.access_log_path) |path_slice| {
+        var path_buf: [4096]u8 = undefined;
+        if (path_slice.len < path_buf.len) {
+            @memcpy(path_buf[0..path_slice.len], path_slice);
+            path_buf[path_slice.len] = 0;
+            const fd = c.open(
+                @as([*c]const u8, @ptrCast(&path_buf[0])),
+                c.O_WRONLY | c.O_APPEND | c.O_CREAT | c.O_CLOEXEC,
+                @as(c_uint, 0o640),
+            );
+            if (fd >= 0) {
+                g_access_log_fd = fd;
+            } else {
+                std.log.warn("saltare: access_log_path open failed; falling back to stderr", .{});
+            }
+        }
+    }
+    defer if (g_access_log_fd != 2) {
+        _ = c.close(g_access_log_fd);
+        g_access_log_fd = 2;
+    };
     g_active_conns.store(0, .seq_cst);
     defer g_active_conns.store(0, .seq_cst);
     resetMetrics();
@@ -1357,6 +1495,15 @@ fn acceptAll(
         if (peerKey(&addr_storage)) |key| {
             conn.peer_key = key;
             conn.has_peer_key = true;
+            // Per-IP connection cap. Decision is taken now, before
+            // SSL handshake or any Python work — over-cap peers pay
+            // the cheapest possible cost (a TCP RST).
+            const acq = perIpConnAcquire(&conn.peer_key, monoNs());
+            if (acq.over_cap) {
+                conn.destroy();
+                continue;
+            }
+            conn.rl_entry_idx = acq.entry_idx;
         }
         // Disable Nagle: most ASGI responses are a single small chunk,
         // so coalescing 40 ms before flushing only adds latency. Best-
@@ -1367,6 +1514,19 @@ fn acceptAll(
             client,
             c.IPPROTO_TCP,
             c.TCP_NODELAY,
+            @ptrCast(&tcp_nodelay),
+            @sizeOf(c_int),
+        );
+        // SO_KEEPALIVE: kernel sends periodic probes on idle connections
+        // so dead peers (NAT timeouts, mobile-network drops, hard
+        // crashes) don't hold a Connection struct hostage for the full
+        // `keep_alive_secs` window. Default kernel cadence is generous
+        // (~2 hours idle then probes), but it's strictly better than
+        // nothing and the wakeup is free for live connections.
+        _ = c.setsockopt(
+            client,
+            c.SOL_SOCKET,
+            c.SO_KEEPALIVE,
             @ptrCast(&tcp_nodelay),
             @sizeOf(c_int),
         );
@@ -1754,6 +1914,12 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     {
         return serveCorsPreflight(loop, conn);
     }
+    if (g_obs.favicon_204 and
+        std.mem.eql(u8, req.target, "/favicon.ico") and
+        (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "HEAD")))
+    {
+        return serveFavicon(loop, conn);
+    }
 
     // Per-IP rate limit. Cheap when disabled (single u32 compare). When
     // `proxy_headers` is enabled and the request carries an X-Forwarded-
@@ -1847,6 +2013,10 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
     };
+    // Subprotocol buffer is owned by us regardless of which branch we
+    // exit through. Free it on every error path AND after we've copied
+    // it into the response.
+    defer if (opened.subprotocol.len > 0) conn.allocator.free(opened.subprotocol);
 
     if (!opened.accepted) {
         // App rejected by closing without accepting.
@@ -1869,21 +2039,39 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     const accept = ws.computeAccept(trimmed_key, &accept_buf);
 
     var resp_buf: [512]u8 = undefined;
-    const resp = std.fmt.bufPrint(
-        &resp_buf,
-        "HTTP/1.1 101 Switching Protocols\r\n" ++
-            "Upgrade: websocket\r\n" ++
-            "Connection: Upgrade\r\n" ++
-            "Sec-WebSocket-Accept: {s}\r\n" ++
-            "Server: " ++ SERVER_HEADER ++ "\r\n" ++
-            "\r\n",
-        .{accept},
-    ) catch {
-        if (opened.frames.len > 0) conn.allocator.free(opened.frames);
-        loop.remove(conn.fd);
-        conn.destroy();
-        return;
-    };
+    const resp = if (opened.subprotocol.len > 0)
+        std.fmt.bufPrint(
+            &resp_buf,
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Accept: {s}\r\n" ++
+                "Sec-WebSocket-Protocol: {s}\r\n" ++
+                "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+                "\r\n",
+            .{ accept, opened.subprotocol },
+        ) catch {
+            if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+    else
+        std.fmt.bufPrint(
+            &resp_buf,
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Accept: {s}\r\n" ++
+                "Server: " ++ SERVER_HEADER ++ "\r\n" ++
+                "\r\n",
+            .{accept},
+        ) catch {
+            if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
 
     // Concatenate 101 + any frames the app emitted between accept and the
     // first await receive() (e.g. an immediate `websocket.send`).

@@ -42,12 +42,40 @@ _state = threading.local()
 # wrapper calls `set_proxy_headers` before invoking _core.serve).
 _proxy_headers_enabled = False
 
+# v1.3: per-request X-Request-ID. When set to a non-empty header name
+# (e.g. b"x-request-id"), the dispatcher generates an 8-byte hex ID
+# per HTTP request, attaches it to `scope["x-request-id"]`, and echoes
+# it as a response header. Apps see the ID in scope without having to
+# parse incoming headers themselves.
+_request_id_header: bytes | None = None
+
+# v1.3: Server-Timing. When True, dispatcher tracks request start time
+# and prepends a `Server-Timing: total;dur=<ms>` header to every
+# response. Cost ~0 RAM (one float64 per in-flight request); ~1 µs CPU.
+_server_timing_enabled = False
+
 
 def set_proxy_headers(enabled: bool) -> None:
     """Toggle X-Forwarded-For / X-Forwarded-Proto handling. Called by the
     `saltare.run()` wrapper just before the I/O loop starts."""
     global _proxy_headers_enabled
     _proxy_headers_enabled = bool(enabled)
+
+
+def set_request_id_header(name: str | None) -> None:
+    """Configure the response header name to echo the auto-generated
+    request ID under. None disables — no ID generated, no scope key,
+    no response header."""
+    global _request_id_header
+    _request_id_header = (
+        name.lower().encode("ascii") if isinstance(name, str) and name else None
+    )
+
+
+def set_server_timing(enabled: bool) -> None:
+    """Toggle the `Server-Timing: total;dur=<ms>` response header."""
+    global _server_timing_enabled
+    _server_timing_enabled = bool(enabled)
 
 
 def _ensure_state() -> threading.local:
@@ -345,7 +373,8 @@ def _build_server_frame(opcode: int, payload: bytes) -> bytes:
 
 class _WsState:
     __slots__ = (
-        "recv_queue", "outgoing", "outgoing_bytes", "accepted", "closed", "task",
+        "recv_queue", "outgoing", "outgoing_bytes", "accepted",
+        "subprotocol", "closed", "task",
     )
 
     def __init__(self, app: Any, scope: dict[str, Any]) -> None:
@@ -355,6 +384,11 @@ class _WsState:
         # Bounds the worst-case RAM cost of a slow client + fast app.
         self.outgoing_bytes: int = 0
         self.accepted: bool = False
+        # Subprotocol the app picked in `websocket.accept`, if any.
+        # Empty string when the app didn't negotiate one (default).
+        # The Zig bridge reads this back after the upgrade pump and
+        # echoes it as `Sec-WebSocket-Protocol` in the 101 response.
+        self.subprotocol: str = ""
         self.closed: bool = False
 
         async def receive() -> dict[str, Any]:
@@ -375,6 +409,13 @@ class _WsState:
             mtype = message.get("type")
             if mtype == "websocket.accept":
                 self.accepted = True
+                # ASGI 2.x: app may pick a subprotocol from the list the
+                # client sent in `Sec-WebSocket-Protocol`. We pass it
+                # back to Zig via `_WsState.subprotocol` and the bridge
+                # surfaces it in the 101 response.
+                sub = message.get("subprotocol")
+                if isinstance(sub, str) and sub:
+                    self.subprotocol = sub
             elif mtype == "websocket.send":
                 if self.closed:
                     return
@@ -454,23 +495,42 @@ def ws_open(
     server_host: str,
     server_port: int,
     scheme: str,
-) -> tuple[int, bool, bytes, bool]:
+) -> tuple[int, bool, bytes, bool, str]:
     """Start a WebSocket coroutine, push the websocket.connect event, and
-    pump the loop. Returns (handle, accepted, frames, done):
-       handle:   opaque int the bridge keeps for subsequent ws_event calls.
-       accepted: True if the app called websocket.accept.
-       frames:   already-encoded server frames to write (close, early sends).
-       done:     True if the coroutine finished (clean close).
+    pump the loop. Returns (handle, accepted, frames, done, subprotocol):
+       handle:      opaque int the bridge keeps for subsequent ws_event calls.
+       accepted:    True if the app called websocket.accept.
+       frames:      already-encoded server frames to write (close, early sends).
+       done:        True if the coroutine finished (clean close).
+       subprotocol: subprotocol the app selected via `accept(subprotocol=...)`,
+                    or empty string. Bridge echoes it as
+                    `Sec-WebSocket-Protocol` in the 101 response.
     """
     global _next_ws_handle
 
     try:
         path = decoded_path.decode("utf-8")
     except UnicodeDecodeError:
-        return (0, False, b"", True)
+        return (0, False, b"", True, "")
 
     # Same as the HTTP path: names already lowercase from the bridge.
     headers = raw_headers
+
+    # ASGI scope must carry the client's offered subprotocol list so the
+    # app can pick one. Parse the comma-separated `sec-websocket-protocol`
+    # header here (case-insensitive lookup; header names are already
+    # lowercased by the bridge).
+    subprotocols: list[str] = []
+    for name, value in headers:
+        if name == b"sec-websocket-protocol":
+            for tok in value.split(b","):
+                t = tok.strip()
+                if t:
+                    try:
+                        subprotocols.append(t.decode("ascii"))
+                    except UnicodeDecodeError:
+                        continue
+            break
 
     scope: dict[str, Any] = {
         "type": "websocket",
@@ -484,7 +544,7 @@ def ws_open(
         "server": (server_host, server_port),
         "client": None,
         "root_path": "",
-        "subprotocols": [],
+        "subprotocols": subprotocols,
         "method": method,
     }
 
@@ -501,7 +561,13 @@ def ws_open(
     except BaseException:
         traceback.print_exc(file=sys.stderr)
 
-    return (handle, ws_state.accepted, ws_state.drain(), ws_state.task.done())
+    return (
+        handle,
+        ws_state.accepted,
+        ws_state.drain(),
+        ws_state.task.done(),
+        ws_state.subprotocol,
+    )
 
 
 def ws_event(handle: int, opcode: int, payload: bytes) -> tuple[bytes, bool]:
@@ -667,6 +733,20 @@ class _HttpState:
         "ka",
         "headers_done",
         "body_done",
+        # ASGI HTTP trailers (`http.response.trailers`). True when the
+        # app declared `trailers=True` on `http.response.start`. We then
+        # delay the chunked terminator until the app emits the trailer
+        # event (or finishes without one — RFC 7230 allows zero
+        # trailers).
+        "wants_trailers",
+        # True once the first `http.response.trailers` event arrives —
+        # we've written the `0\r\n` opener for the trailer section and
+        # subsequent trailer events just append more header lines.
+        "_trailer_started",
+        # v1.3 X-Request-ID + Server-Timing support. Both default off
+        # (and stay zero-cost when disabled at the module level).
+        "_request_id",
+        "_start_ns",
     )
 
     def __init__(
@@ -687,6 +767,10 @@ class _HttpState:
         # Wire bytes produced by the app, drained by the I/O loop.
         self.outgoing: list[bytes] = []
         self._outgoing_bytes: int = 0
+        self.wants_trailers: bool = False
+        self._trailer_started: bool = False
+        self._request_id: bytes = b""
+        self._start_ns: int = 0
         # Filled in when http.response.start arrives.
         self.status: int = 500
         self.out_headers: list[tuple[bytes, bytes]] = []
@@ -742,7 +826,35 @@ class _HttpState:
                 name.lower() == b"content-length"
                 for name, _ in self.out_headers
             )
+            # ASGI 2.4: app may set `trailers=True` on the start message
+            # to indicate it'll emit `http.response.trailers` after the
+            # final body chunk. We force chunked transfer-encoding in
+            # that case (Content-Length is incompatible with trailers).
+            self.wants_trailers = bool(message.get("trailers", False))
             self.headers_done = True
+        elif mtype == "http.response.trailers":
+            # Trailers come AFTER all body chunks (the app must have
+            # already sent body with `more_body=False`). We emit
+            # `0\r\n<trailer headers>\r\n` to terminate the chunked
+            # stream with trailer fields.
+            if not self.headers_sent or not self.chunked:
+                return  # ASGI violation
+            trailer_headers = message.get("headers") or []
+            more_trailers = bool(message.get("more_trailers", False))
+            parts: list[bytes] = []
+            # First trailer event prepends `0\r\n` to open the trailer
+            # section. Subsequent events just append more header lines.
+            if not self._trailer_started:
+                parts.append(b"0\r\n")
+                self._trailer_started = True
+            for name, value in trailer_headers:
+                parts.append(name + b": " + value + b"\r\n")
+            if not more_trailers:
+                parts.append(_CRLF)
+                self.body_done = True
+            joined = b"".join(parts)
+            self.outgoing.append(joined)
+            self._outgoing_bytes += len(joined)
         elif mtype == "http.response.body":
             chunk = message.get("body", b"") or b""
             more = bool(message.get("more_body", False))
@@ -764,9 +876,18 @@ class _HttpState:
                     self._outgoing_bytes += len(chunk)
             if not more:
                 if self.chunked:
-                    self.outgoing.append(_CHUNKED_TERMINATOR)
-                    self._outgoing_bytes += len(_CHUNKED_TERMINATOR)
-                self.body_done = True
+                    if self.wants_trailers:
+                        # Defer the chunked terminator until the app
+                        # emits `http.response.trailers` (or finishes
+                        # without one — handled in `_finalize_if_needed`).
+                        # body_done stays False so finalize closes us.
+                        pass
+                    else:
+                        self.outgoing.append(_CHUNKED_TERMINATOR)
+                        self._outgoing_bytes += len(_CHUNKED_TERMINATOR)
+                        self.body_done = True
+                else:
+                    self.body_done = True
             # Backpressure: if a streaming app has accumulated more than
             # `_HTTP_SEND_YIELD_BYTES` since the last drain, hand control
             # back to the event loop. The Zig main loop's stalled-pump
@@ -800,6 +921,10 @@ class _HttpState:
         # allocation. Marginal but cumulative across requests.
         self.outgoing.clear()
         self._outgoing_bytes = 0
+        self.wants_trailers = False
+        self._trailer_started = False
+        self._request_id = b""
+        self._start_ns = 0
         self.status = 500
         self.out_headers = []
         self.headers_sent = False
@@ -820,6 +945,17 @@ class _HttpState:
             _SERVER_LINE,
             _CONNECTION_KEEPALIVE_LINE if self.ka else _CONNECTION_CLOSE_LINE,
         ]
+        # v1.3: optional X-Request-ID + Server-Timing. Both gates are
+        # module-level and read once per response — when off, two
+        # `is None`/`if not` checks per request.
+        if self._request_id and _request_id_header is not None:
+            parts.append(_request_id_header + b": " + self._request_id + b"\r\n")
+        if _server_timing_enabled and self._start_ns:
+            import time
+            elapsed_ms = (time.monotonic_ns() - self._start_ns) / 1_000_000.0
+            parts.append(
+                f"server-timing: total;dur={elapsed_ms:.2f}\r\n".encode("ascii")
+            )
 
         if streaming:
             if self.explicit_cl:
@@ -892,9 +1028,14 @@ def _finalize_if_needed(handle: int, s: _HttpState) -> bytes:
             keep_alive=False,
         )
     elif s.chunked and not s.body_done:
-        # App finished but didn't send the terminating empty chunk. RFC 7230
-        # requires `0\r\n\r\n` to delimit a chunked response.
-        extra = _CHUNKED_TERMINATOR
+        # App finished but didn't close the chunked stream cleanly.
+        # If a trailer section was opened (`_trailer_started`), we just
+        # need the section-terminator `\r\n`. Otherwise emit the full
+        # `0\r\n\r\n` terminator.
+        if s._trailer_started:
+            extra = _CRLF
+        else:
+            extra = _CHUNKED_TERMINATOR
     return extra
 
 
@@ -957,6 +1098,16 @@ def http_dispatch_start(
                 if proto in (b"http", b"https"):
                     effective_scheme = proto.decode("ascii")
 
+    # v1.3: synthesise the request ID up front so the app sees it in
+    # scope (as `scope["x-request-id"]`) AND `_emit_headers` can echo
+    # it as a response header. Generating in Python (vs Zig + bridge
+    # marshal) keeps the code path simple; `os.urandom(8).hex()` is a
+    # ~200 ns syscall on a sane Linux box.
+    req_id_bytes: bytes = b""
+    if _request_id_header is not None:
+        import os as _os
+        req_id_bytes = _os.urandom(8).hex().encode("ascii")
+
     scope: dict[str, Any] = {
         "type": "http",
         "asgi": _ASGI_HTTP_SUB,
@@ -971,11 +1122,19 @@ def http_dispatch_start(
         "client": effective_client,
         "root_path": "",
     }
+    if req_id_bytes:
+        # ASGI extension key — apps grab it via scope["x-request-id"].
+        # Stored as str (decoded) for ergonomic Python access.
+        scope["x-request-id"] = req_id_bytes.decode("ascii")
 
     handle = state_obj.next_http_handle
     state_obj.next_http_handle += 1
 
     s = _acquire_http_state(app, scope, initial_body, bool(more_body), bool(keep_alive))
+    s._request_id = req_id_bytes
+    if _server_timing_enabled:
+        import time as _time
+        s._start_ns = _time.monotonic_ns()
     state_obj.http_states[handle] = s
 
     try:

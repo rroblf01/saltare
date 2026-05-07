@@ -36,6 +36,11 @@ def run(
     rate_limit_per_sec: int = 0,
     rate_limit_burst: int = 100,
     tracemalloc_path: str | None = None,
+    favicon_204: bool = False,
+    max_connections_per_ip: int = 0,
+    access_log_path: str | None = None,
+    request_id_header: str | None = None,
+    server_timing: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -147,6 +152,8 @@ def run(
     # because the dispatcher's scope build happens on every request.
     from saltare import _dispatcher
     _dispatcher.set_proxy_headers(bool(proxy_headers))
+    _dispatcher.set_request_id_header(request_id_header)
+    _dispatcher.set_server_timing(bool(server_timing))
 
     _core.serve(
         app,
@@ -173,4 +180,7 @@ def run(
         int(rate_limit_burst),
         tracemalloc_path,
         int(bool(proxy_headers)),
+        int(bool(favicon_204)),
+        int(max_connections_per_ip),
+        access_log_path,
     )

@@ -440,6 +440,11 @@ pub const WsOpen = struct {
     /// Owned by `allocator` once returned; caller must free.
     frames: []u8,
     done: bool,
+    /// Subprotocol the app picked via `accept(subprotocol=...)`. Owned
+    /// by `allocator` (zero-length means none — caller checks
+    /// `subprotocol.len > 0`). Server.zig echoes this in the
+    /// `Sec-WebSocket-Protocol` 101-response header.
+    subprotocol: []u8,
 };
 
 pub const WsTick = struct {
@@ -538,13 +543,15 @@ pub fn wsDisconnect(handle: c_long, code: u16, allocator: std.mem.Allocator) []u
 }
 
 fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
-    if (py.PyTuple_Size(result) != 4) return null;
+    if (py.PyTuple_Size(result) != 5) return null;
 
     const handle_obj = py.PyTuple_GetItem(result, 0);
     const accepted_obj = py.PyTuple_GetItem(result, 1);
     const frames_obj = py.PyTuple_GetItem(result, 2);
     const done_obj = py.PyTuple_GetItem(result, 3);
-    if (handle_obj == null or accepted_obj == null or frames_obj == null or done_obj == null) {
+    const sub_obj = py.PyTuple_GetItem(result, 4);
+    if (handle_obj == null or accepted_obj == null or frames_obj == null or
+        done_obj == null or sub_obj == null) {
         return null;
     }
 
@@ -553,7 +560,29 @@ fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
     const done = py.PyObject_IsTrue(done_obj) == 1;
     const frames = copyBytes(frames_obj.?, allocator) orelse return null;
 
-    return .{ .handle = handle, .accepted = accepted, .frames = frames, .done = done };
+    // Subprotocol arrives as a Python `str` (empty when the app didn't
+    // pick one). Translate to bytes via PyUnicode_AsUTF8AndSize so we
+    // don't need a roundtrip through `bytes`.
+    var sub_len: py.Py_ssize_t = 0;
+    const sub_ptr = py.PyUnicode_AsUTF8AndSize(sub_obj.?, &sub_len);
+    var subprotocol: []u8 = &.{};
+    if (sub_ptr != null and sub_len > 0) {
+        const len: usize = @intCast(sub_len);
+        const buf = allocator.alloc(u8, len) catch {
+            allocator.free(frames);
+            return null;
+        };
+        @memcpy(buf, sub_ptr[0..len]);
+        subprotocol = buf;
+    }
+
+    return .{
+        .handle = handle,
+        .accepted = accepted,
+        .frames = frames,
+        .done = done,
+        .subprotocol = subprotocol,
+    };
 }
 
 fn extractWsTick(result: *py.PyObject, allocator: std.mem.Allocator) ?WsTick {
