@@ -103,6 +103,22 @@ def set_gc_collect_every_n(n: int) -> None:
     _gc_collect_every_n = max(0, int(n))
 
 
+# v1.4 W3C Trace Context. When enabled, the dispatcher reads `traceparent`
+# (and optionally `tracestate`) from the request, exposes them on
+# `scope["traceparent"]` / `scope["tracestate"]` as ASGI extension keys,
+# and echoes `traceparent` back in the response so downstream services
+# correlate without us pulling in the OpenTelemetry SDK. Off by default —
+# zero per-request cost when off (one bool compare).
+_traceparent_propagation: bool = False
+
+
+def set_traceparent_propagation(enabled: bool) -> None:
+    """Toggle W3C Trace Context (`traceparent` + `tracestate`) propagation
+    on `scope` and the response. Off by default."""
+    global _traceparent_propagation
+    _traceparent_propagation = bool(enabled)
+
+
 def _ensure_state() -> threading.local:
     if not hasattr(_state, "loop"):
         _state.loop = asyncio.new_event_loop()
@@ -282,7 +298,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/1.3.0"
+_SERVER_HEADER = b"saltare/1.4.0"
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +313,15 @@ def init_tracemalloc() -> None:
     if not tracemalloc.is_tracing():
         # 25 frames deep: enough to identify FastAPI / Pydantic call sites.
         tracemalloc.start(25)
+
+
+# v1.4: cached tracemalloc snapshot. `take_snapshot()` is expensive
+# (~10-50 ms for a real-world FastAPI app); without caching, hitting
+# `/debug/tracemalloc` from a monitoring agent every few seconds
+# would block the I/O loop. We cache the formatted text dump for
+# `_TRACEMALLOC_CACHE_TTL_NS` (default 5 s) before regenerating.
+_TRACEMALLOC_CACHE_TTL_NS = 5 * 1_000_000_000
+_tracemalloc_cache: tuple[int, bytes] | None = None
 
 
 def prewarm_app(app: Any) -> None:
@@ -373,18 +398,31 @@ def dump_tracemalloc(top_n: int = 30) -> bytes:
     """Return a top-N tracemalloc snapshot as bytes (text/plain). Each
     line is `<size_kib> KiB  <count> blocks  <traceback-summary>`.
     Empty result if tracemalloc isn't tracking — happens when
-    `tracemalloc_path` wasn't configured."""
+    `tracemalloc_path` wasn't configured.
+
+    v1.4: snapshots are cached for 5 s. A monitoring agent polling
+    every second sees the same snapshot 5× before a fresh one;
+    saves ~10-50 ms per cached hit (the take_snapshot() itself).
+    Cache invalidates on each call past the TTL."""
     import tracemalloc
     if not tracemalloc.is_tracing():
         return b"tracemalloc not tracking (configure tracemalloc_path=)\n"
+
+    import time as _time
+    now_ns = _time.monotonic_ns()
+    global _tracemalloc_cache
+    if _tracemalloc_cache is not None:
+        cached_ns, cached_bytes = _tracemalloc_cache
+        if now_ns - cached_ns < _TRACEMALLOC_CACHE_TTL_NS:
+            return cached_bytes
+
     snap = tracemalloc.take_snapshot()
     stats = snap.statistics("lineno")[:top_n]
     lines: list[str] = [
-        f"# top {len(stats)} allocations (group: lineno)\n"
+        f"# top {len(stats)} allocations (group: lineno; cached up to 5 s)\n"
     ]
     for stat in stats:
         size_kib = stat.size / 1024
-        # Last frame is most useful (it's the user's call site).
         last_frame = stat.traceback[-1] if stat.traceback else None
         loc = (
             f"{last_frame.filename}:{last_frame.lineno}"
@@ -394,7 +432,9 @@ def dump_tracemalloc(top_n: int = 30) -> bytes:
         lines.append(
             f"{size_kib:>8.1f} KiB  {stat.count:>5d} blocks  {loc}\n"
         )
-    return "".join(lines).encode("utf-8")
+    payload = "".join(lines).encode("utf-8")
+    _tracemalloc_cache = (now_ns, payload)
+    return payload
 
 # ASGI scope sub-dicts. These never change between requests, so caching them
 # at module level avoids one dict allocation (~200 B) per dispatch. ASGI
@@ -434,6 +474,166 @@ _CONNECTION_CLOSE_LINE = b"connection: close\r\n"
 _TRANSFER_ENCODING_CHUNKED_LINE = b"transfer-encoding: chunked\r\n"
 _CHUNKED_TERMINATOR = b"0\r\n\r\n"
 _CRLF = b"\r\n"
+
+# v1.4 zlib wiring. Default-off operationally — both knobs are toggled via
+# `set_compression_*` setters from `_core.serve`. When off (default), the
+# Python dispatcher does no compression work and `_core.gzip_encode` /
+# `_core.gunzip` are never called, so libz stays unloaded (the lazy dlopen
+# in `src/zig/zlib.zig` only fires on first call).
+#
+# Response compression. `_response_gzip_enabled = True` triggers
+# encoding on single-shot or chunked-streaming responses when (a) the
+# client offered the encoding via `Accept-Encoding`, (b) Content-Type is
+# in the compressible set, (c) body length ≥ `_response_gzip_min_bytes`,
+# and (d) the app didn't pre-set Content-Encoding. Brotli + zstd are
+# enabled per-flag; when `_response_brotli_enabled` is True and the
+# client lists `br` ahead of (or with equal weight to) `gzip`, brotli
+# wins. zstd similarly. The runtime auto-falls back to gzip when libbrotli
+# / libzstd aren't present in the image.
+_response_gzip_enabled: bool = False
+_response_brotli_enabled: bool = False
+_response_zstd_enabled: bool = False
+_response_gzip_min_bytes: int = 512
+_response_gzip_level: int = 6
+_response_brotli_quality: int = 4
+_response_zstd_level: int = 3
+# Compressible content-type prefixes (lowercase, byte-string for cheap
+# `startswith` against header values). HTML/JSON/JS/CSS/SVG/XML are the
+# 95th-percentile cases; binary formats (png, mp4, woff2) compress poorly
+# under gzip and we'd waste CPU.
+_GZIPPABLE_TYPE_PREFIXES: tuple[bytes, ...] = (
+    b"text/",
+    b"application/json",
+    b"application/javascript",
+    b"application/xml",
+    b"application/xhtml+xml",
+    b"application/atom+xml",
+    b"application/rss+xml",
+    b"application/x-javascript",
+    b"image/svg+xml",
+)
+
+# Request decompression: when set True, a request whose `Content-Encoding`
+# header lists `gzip` gets decompressed before the body event lands in the
+# app. Cap is `max_request_body` (the same byte budget that bounds raw
+# bodies). Returns 413 on overflow, 400 on malformed gzip.
+_request_decompress_enabled: bool = False
+_request_decompress_cap: int = 1 * 1024 * 1024
+
+
+def set_response_gzip(enabled: bool, min_bytes: int = 512, level: int = 6) -> None:
+    """Toggle response gzip negotiation. Off by default — when off the
+    dispatcher never calls `_core.gzip_encode`, so libz stays unmapped."""
+    global _response_gzip_enabled, _response_gzip_min_bytes, _response_gzip_level
+    _response_gzip_enabled = bool(enabled)
+    if min_bytes > 0:
+        _response_gzip_min_bytes = int(min_bytes)
+    if 1 <= level <= 9:
+        _response_gzip_level = int(level)
+
+
+def set_response_brotli(enabled: bool, quality: int = 4) -> None:
+    """Toggle response brotli (`Accept-Encoding: br`). Off by default —
+    libbrotli stays unloaded when off."""
+    global _response_brotli_enabled, _response_brotli_quality
+    _response_brotli_enabled = bool(enabled)
+    if 0 <= quality <= 11:
+        _response_brotli_quality = int(quality)
+
+
+def set_response_zstd(enabled: bool, level: int = 3) -> None:
+    """Toggle response zstd (`Accept-Encoding: zstd`). Off by default —
+    libzstd stays unloaded when off."""
+    global _response_zstd_enabled, _response_zstd_level
+    _response_zstd_enabled = bool(enabled)
+    if 1 <= level <= 22:
+        _response_zstd_level = int(level)
+
+
+def set_request_decompression(enabled: bool, cap_bytes: int = 0) -> None:
+    """Toggle request `Content-Encoding: gzip` decompression. `cap_bytes`
+    matches `max_request_body`; 0 keeps the existing cap."""
+    global _request_decompress_enabled, _request_decompress_cap
+    _request_decompress_enabled = bool(enabled)
+    if cap_bytes > 0:
+        _request_decompress_cap = int(cap_bytes)
+
+
+def _is_gzippable_content_type(ctype: bytes) -> bool:
+    lower = ctype.lower().strip()
+    if not lower:
+        return False
+    # Strip parameters (`; charset=…`) before prefix-matching.
+    semi = lower.find(b";")
+    if semi != -1:
+        lower = lower[:semi].rstrip()
+    for prefix in _GZIPPABLE_TYPE_PREFIXES:
+        if lower.startswith(prefix):
+            return True
+    return False
+
+
+def _parse_accept_encoding(value: bytes) -> dict[bytes, float]:
+    """Parse `Accept-Encoding` into {encoding: q-weight}. Tokens with `q=0`
+    are dropped. Empty / malformed weights default to 1.0 per RFC 7231."""
+    result: dict[bytes, float] = {}
+    for token in value.lower().split(b","):
+        t = token.strip()
+        if not t:
+            continue
+        name = t
+        weight = 1.0
+        if b";" in t:
+            name, _, rest = t.partition(b";")
+            name = name.strip()
+            for param in rest.split(b";"):
+                p = param.strip()
+                if p.startswith(b"q="):
+                    try:
+                        weight = float(p[2:].strip())
+                    except ValueError:
+                        weight = 1.0
+                    break
+        if weight <= 0.0:
+            continue
+        result[name] = weight
+    return result
+
+
+def _negotiate_encoding(value: bytes) -> bytes:
+    """Pick the best response encoding from `Accept-Encoding`. Server
+    preference order is br > zstd > gzip when multiple are offered with
+    equal weight (br compresses tightest for text, zstd is fastest, gzip
+    is the universal fallback). Returns b"" when nothing is acceptable
+    or the corresponding encoder is disabled at module level."""
+    weights = _parse_accept_encoding(value)
+    star = weights.get(b"*", 0.0)
+
+    def acceptable(name: bytes) -> float:
+        if name in weights:
+            return weights[name]
+        return star
+
+    # Respect server-side ordering by walking the priority list and taking
+    # the first encoder both enabled AND offered with q>0. Within an equal
+    # client-q tier we still prefer the server order (br/zstd/gzip).
+    candidates: list[tuple[bytes, float]] = []
+    if _response_brotli_enabled:
+        q = acceptable(b"br")
+        if q > 0:
+            candidates.append((b"br", q))
+    if _response_zstd_enabled:
+        q = acceptable(b"zstd")
+        if q > 0:
+            candidates.append((b"zstd", q))
+    if _response_gzip_enabled:
+        q = acceptable(b"gzip")
+        if q > 0:
+            candidates.append((b"gzip", q))
+    if not candidates:
+        return b""
+    candidates.sort(key=lambda kv: kv[1], reverse=True)
+    return candidates[0][0]
 
 # Status lines for the codes saltare emits or that user apps use heavily.
 # Apps returning an unusual code fall back to the fmt path.
@@ -872,6 +1072,29 @@ class _HttpState:
         # v1.3: HEAD requests get the same headers as GET but the body
         # is suppressed (RFC 7230 §3.3.3). Set in `http_dispatch_start`.
         "_is_head",
+        # v1.4 sendfile path. When the app emits a `saltare.sendfile`
+        # message, we stage headers but no body bytes — Zig opens the
+        # file and `sendfile(2)`s it directly to the socket. Read by
+        # the bridge via `http_dispatch_pop_sendfile()` after the
+        # initial dispatch completes.
+        "_sendfile_path",
+        # v1.4 negotiated response encoding. b"" = identity (no
+        # compression). b"gzip" / b"br" / b"zstd" otherwise. Picked at
+        # request entry from `Accept-Encoding` and the operator-set
+        # encoder flags. Used by `_send` to compress single-shot bodies
+        # (and stream-init for chunked-streaming gzip) before headers
+        # are emitted.
+        "_negotiated_encoding",
+        # v1.4 W3C Trace Context echo. Held as bytes (matches header
+        # casing exactly when echoed back). Empty = no traceparent on
+        # this request, no echo needed.
+        "_traceparent_echo",
+        # v1.4 streaming response gzip. Held as a `zlib.compressobj` (or
+        # None when not streaming-compressed). When set, body chunks are
+        # routed through `co.compress + co.flush(Z_SYNC_FLUSH)` before
+        # the chunked transfer-encoding wrapper. The final chunk uses
+        # `Z_FINISH` to flush the gzip trailer.
+        "_gzip_co",
     )
 
     def __init__(
@@ -897,6 +1120,10 @@ class _HttpState:
         self._request_id: bytes = b""
         self._start_ns: int = 0
         self._is_head: bool = False
+        self._sendfile_path: str = ""
+        self._negotiated_encoding: bytes = b""
+        self._traceparent_echo: bytes = b""
+        self._gzip_co: Any = None
         # Filled in when http.response.start arrives.
         self.status: int = 500
         self.out_headers: list[tuple[bytes, bytes]] = []
@@ -943,6 +1170,32 @@ class _HttpState:
 
     async def _send(self, message: dict[str, Any]) -> None:
         mtype = message.get("type")
+        if mtype == "saltare.sendfile":
+            # v1.4 ASGI extension. App emits this in lieu of
+            # `http.response.start` + `http.response.body` to ask the
+            # server to push a file directly via `sendfile(2)`. Zig
+            # opens the file, fstat()s for the size, writes status +
+            # headers (with `Content-Length` from the stat), then
+            # `sendfile`s the body — bytes never enter Python.
+            #
+            # Required keys: path. Optional: status (default 200),
+            # headers (default []). saltare adds `Content-Length`
+            # from `fstat`; the app SHOULD NOT pre-declare one.
+            if self.headers_done or self.headers_sent:
+                return  # ASGI violation; can't switch mid-response
+            path = message.get("path", "")
+            if not isinstance(path, str) or not path:
+                return
+            self._sendfile_path = path
+            self.status = int(message.get("status", 200))
+            self.out_headers = list(message.get("headers", []))
+            # We mark headers + body done so the dispatch loop returns
+            # immediately; the actual headers + sendfile happen on
+            # the Zig side after `http_dispatch_pop_sendfile()`.
+            self.headers_done = True
+            self.headers_sent = True
+            self.body_done = True
+            return
         if mtype == "http.response.start":
             if self.headers_done:
                 return  # ASGI: ignore double-start
@@ -987,6 +1240,16 @@ class _HttpState:
             if not self.headers_sent:
                 if not self.headers_done:
                     return  # ASGI violation; bail without crashing
+                if not self._is_head and self._negotiated_encoding:
+                    if not more and chunk and len(chunk) >= _response_gzip_min_bytes:
+                        # Single-shot path: encode in one go, rewrite
+                        # headers, no streaming state needed.
+                        chunk = self._maybe_compress_response(chunk)
+                    elif more and self._negotiated_encoding == b"gzip":
+                        # Streaming path: only gzip supports per-chunk
+                        # `Z_SYNC_FLUSH` here; brotli/zstd streaming-encode
+                        # is deferred (one-shot only for those in v1.4).
+                        self._maybe_init_streaming_gzip()
                 # HEAD: same headers as GET but no body. Force single-
                 # shot mode (no chunked) and use the first chunk's
                 # length as Content-Length unless the app explicitly
@@ -1002,6 +1265,16 @@ class _HttpState:
                         complete_body_len=None if more else len(chunk),
                     )
                 self.headers_sent = True
+            if self._gzip_co is not None and not self._is_head:
+                # Streaming gzip path. Z_SYNC_FLUSH per intermediate chunk
+                # so decompressors see decoded bytes promptly; Z_FINISH on
+                # the final chunk flushes the gzip trailer (CRC + isize).
+                import zlib as _zlib
+                if more:
+                    encoded = self._gzip_co.compress(chunk) + self._gzip_co.flush(_zlib.Z_SYNC_FLUSH)
+                else:
+                    encoded = self._gzip_co.compress(chunk) + self._gzip_co.flush(_zlib.Z_FINISH)
+                chunk = encoded
             if chunk and not self._is_head:
                 if self.chunked:
                     framed = _encode_chunk(chunk)
@@ -1038,6 +1311,105 @@ class _HttpState:
                 await asyncio.sleep(0)
         # Ignored message types (http.response.trailers etc.) silently drop.
 
+    def _maybe_init_streaming_gzip(self) -> None:
+        """Set up streaming gzip when the response is chunked + the request
+        accepted gzip. Builds a `zlib.compressobj` (wbits=31 for gzip wrap),
+        rewrites `out_headers` to drop CL/CE, append `Content-Encoding:
+        gzip` + `Vary: Accept-Encoding`, and clears `explicit_cl` so the
+        chunked path is engaged in `_emit_headers`.
+
+        Bails silently when the content-type is non-compressible or the app
+        already set Content-Encoding."""
+        ctype = b""
+        for name, value in self.out_headers:
+            if name.lower() == b"content-type":
+                ctype = value
+                break
+        if not _is_gzippable_content_type(ctype):
+            return
+        for name, _value in self.out_headers:
+            if name.lower() == b"content-encoding":
+                return
+        import zlib as _zlib
+        try:
+            co = _zlib.compressobj(_response_gzip_level, _zlib.DEFLATED, 31)
+        except Exception:
+            return
+        # Rewrite headers identical to the single-shot path.
+        new_headers: list[tuple[bytes, bytes]] = []
+        have_vary = False
+        for name, value in self.out_headers:
+            ln = name.lower()
+            if ln == b"content-length" or ln == b"content-encoding":
+                continue
+            if ln == b"vary":
+                if b"accept-encoding" not in value.lower():
+                    value = value + b", Accept-Encoding"
+                have_vary = True
+            new_headers.append((name, value))
+        new_headers.append((b"content-encoding", b"gzip"))
+        if not have_vary:
+            new_headers.append((b"vary", b"Accept-Encoding"))
+        self.out_headers = new_headers
+        self.explicit_cl = False
+        self._gzip_co = co
+
+    def _maybe_compress_response(self, chunk: bytes) -> bytes:
+        """Single-shot encode `chunk` according to `self._negotiated_encoding`
+        (b"gzip" / b"br" / b"zstd"). Mutates `self.out_headers` to drop
+        any pre-existing Content-Length / Content-Encoding and to append
+        `Content-Encoding: <enc>` + `Vary: Accept-Encoding`.
+
+        Returns the (possibly unchanged) chunk. Falls through silently
+        on libload failure (no encode applied; client sees raw body —
+        legal because the encoding was an offered preference)."""
+        enc = self._negotiated_encoding
+        if not enc:
+            return chunk
+        ctype = b""
+        for name, value in self.out_headers:
+            if name.lower() == b"content-type":
+                ctype = value
+                break
+        if not _is_gzippable_content_type(ctype):
+            return chunk
+        # Skip if app already encoded it (e.g. upstream brotli or
+        # nginx-side encoding).
+        for name, _value in self.out_headers:
+            if name.lower() == b"content-encoding":
+                return chunk
+        from saltare import _core
+        if enc == b"gzip":
+            encoded = _core.gzip_encode(chunk, _response_gzip_level)
+        elif enc == b"br":
+            encoded = _core.brotli_encode(chunk, _response_brotli_quality)
+        elif enc == b"zstd":
+            encoded = _core.zstd_encode(chunk, _response_zstd_level)
+        else:
+            return chunk
+        if encoded is None or len(encoded) >= len(chunk):
+            return chunk
+        # Rewrite headers: drop CL / CE, append our own + Vary.
+        new_headers: list[tuple[bytes, bytes]] = []
+        have_vary = False
+        for name, value in self.out_headers:
+            ln = name.lower()
+            if ln == b"content-length" or ln == b"content-encoding":
+                continue
+            if ln == b"vary":
+                if b"accept-encoding" not in value.lower():
+                    value = value + b", Accept-Encoding"
+                have_vary = True
+            new_headers.append((name, value))
+        new_headers.append((b"content-encoding", enc))
+        if not have_vary:
+            new_headers.append((b"vary", b"Accept-Encoding"))
+        self.out_headers = new_headers
+        # We dropped the app's CL — `_emit_headers` will re-emit one
+        # from `complete_body_len`.
+        self.explicit_cl = False
+        return encoded
+
     def reset(
         self,
         app: Any,
@@ -1065,6 +1437,10 @@ class _HttpState:
         self._request_id = b""
         self._start_ns = 0
         self._is_head = False
+        self._sendfile_path = ""
+        self._negotiated_encoding = b""
+        self._traceparent_echo = b""
+        self._gzip_co = None
         self.status = 500
         self.out_headers = []
         self.headers_sent = False
@@ -1090,6 +1466,8 @@ class _HttpState:
         # `is None`/`if not` checks per request.
         if self._request_id and _request_id_header is not None:
             parts.append(_request_id_header + b": " + self._request_id + b"\r\n")
+        if self._traceparent_echo:
+            parts.append(b"traceparent: " + self._traceparent_echo + b"\r\n")
         if _server_timing_enabled and self._start_ns:
             import time
             elapsed_ms = (time.monotonic_ns() - self._start_ns) / 1_000_000.0
@@ -1331,12 +1709,80 @@ def http_dispatch_start(
         # Stored as str (decoded) for ergonomic Python access.
         scope["x-request-id"] = req_id_bytes.decode("ascii")
 
+    # v1.4 W3C Trace Context. When opt-in via `set_traceparent_propagation`
+    # we surface `traceparent` (and `tracestate` if present) on `scope`
+    # for downstream handlers / OpenTelemetry instrumentations to pick up
+    # without parsing headers themselves, and we'll echo `traceparent`
+    # on the response in `_emit_headers`. We don't validate the format
+    # (32-hex-trace-id + 16-hex-span-id + flags) — invalid values are
+    # passed through unchanged so the app can decide.
+    traceparent_bytes: bytes = b""
+    if _traceparent_propagation:
+        for name, value in headers:
+            if name == b"traceparent":
+                traceparent_bytes = value
+                try:
+                    scope["traceparent"] = value.decode("ascii")
+                except UnicodeDecodeError:
+                    pass
+            elif name == b"tracestate":
+                try:
+                    scope["tracestate"] = value.decode("ascii")
+                except UnicodeDecodeError:
+                    pass
+
+    # v1.4 zlib wiring — pre-dispatch peek at the headers for the two
+    # negotiation decisions:
+    #   1. `Accept-Encoding: ...gzip...` → flag the state so single-shot
+    #      responses get gzipped before headers are emitted.
+    #   2. `Content-Encoding: gzip` (with `more_body=False`) → decompress
+    #      the body in place; strip the encoding header from `scope` so
+    #      the app sees the decompressed bytes as if uncompressed.
+    negotiated_encoding = b""
+    if _response_gzip_enabled or _response_brotli_enabled or _response_zstd_enabled:
+        for name, value in headers:
+            if name == b"accept-encoding":
+                negotiated_encoding = _negotiate_encoding(value)
+                break
+    if (
+        _request_decompress_enabled
+        and not more_body
+        and initial_body
+    ):
+        for i, (name, value) in enumerate(headers):
+            if name == b"content-encoding":
+                if value.strip().lower() == b"gzip":
+                    from saltare import _core
+                    decoded = _core.gunzip(initial_body, _request_decompress_cap)
+                    if decoded is None:
+                        # Either libz unavailable or payload exceeded the
+                        # cap / was malformed. The latter cases are far
+                        # more common — return 413 (over cap is the
+                        # expected guard) rather than guessing.
+                        return (
+                            0,
+                            _build_wire(
+                                413, [], b"compressed body exceeds cap or invalid\n",
+                                keep_alive=False,
+                            ),
+                            True,
+                        )
+                    initial_body = decoded
+                    # Strip Content-Encoding so the app doesn't try to
+                    # double-decode; rebuild the headers list with that
+                    # one entry removed.
+                    headers = headers[:i] + headers[i + 1 :]
+                    scope["headers"] = headers
+                break
+
     handle = state_obj.next_http_handle
     state_obj.next_http_handle += 1
 
     s = _acquire_http_state(app, scope, initial_body, bool(more_body), bool(keep_alive))
     s._request_id = req_id_bytes
     s._is_head = (method == "HEAD")
+    s._negotiated_encoding = negotiated_encoding
+    s._traceparent_echo = traceparent_bytes
     if _server_timing_enabled:
         import time as _time
         s._start_ns = _time.monotonic_ns()
@@ -1444,6 +1890,20 @@ def http_dispatch_drain(handle: int) -> tuple[bytes, bool]:
         _release_http_state(s)
 
     return (chunks, done)
+
+
+def http_dispatch_pop_sendfile(handle: int) -> tuple[str, int, list[tuple[bytes, bytes]], bool]:
+    """v1.4: query whether a completed dispatch resolved to a
+    `saltare.sendfile` ASGI extension. Returns `(path, status,
+    headers, keep_alive)`. `path` is empty when the app didn't ask
+    for sendfile — caller should fall back to the normal write path.
+    Called by the bridge once after `http_dispatch_start`/`drain`
+    returned `done=True`."""
+    state_obj = _ensure_state()
+    s = state_obj.http_states.get(handle)
+    if s is None or not s._sendfile_path:
+        return ("", 0, [], False)
+    return (s._sendfile_path, s.status, s.out_headers, bool(s.ka))
 
 
 def http_dispatch_abort(handle: int) -> None:

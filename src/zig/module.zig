@@ -15,6 +15,9 @@ const server = @import("server.zig");
 const bridge = @import("bridge.zig");
 const tls = @import("tls.zig");
 const master_mod = @import("master.zig");
+const zlib_mod = @import("zlib.zig");
+const brotli_mod = @import("brotli.zig");
+const zstd_mod = @import("zstd.zig");
 
 const c = @cImport({
     @cInclude("unistd.h");
@@ -163,10 +166,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var ssl_verify_client_flag: c_int = 0;
     var tcp_fastopen_qlen: c_int = 0;
     var gc_collect_every_n: c_uint = 0;
+    var max_request_uri: c_uint = 8192;
+    var max_request_head_bytes: c_uint = 0;
+    var latency_histogram_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiI",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIi",
         &app,
         &host_z,
         &port,
@@ -209,6 +215,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &ssl_verify_client_flag,
         &tcp_fastopen_qlen,
         &gc_collect_every_n,
+        &max_request_uri,
+        &max_request_head_bytes,
+        &latency_histogram_flag,
     ) == 0) {
         return null;
     }
@@ -246,6 +255,8 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .auto_raise_nofile = auto_raise_nofile_flag != 0,
         .max_connection_lifetime_secs = @intCast(max_conn_lifetime),
         .tcp_fastopen_qlen = tcp_fastopen_qlen,
+        .max_request_uri = @intCast(max_request_uri),
+        .max_request_head_bytes = @intCast(max_request_head_bytes),
     };
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
@@ -263,6 +274,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .proxy_protocol = proxy_protocol_flag != 0,
         .server_header = if (server_header_z != null) std.mem.span(server_header_z) else null,
         .startup_request = startup_request_flag != 0,
+        .latency_histogram = latency_histogram_flag != 0,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 
@@ -480,6 +492,109 @@ fn runMultiWorker(
     return pyReturnNone();
 }
 
+/// gzip_encode(payload: bytes, level: int = 6) -> bytes | None.
+/// Returns None when libz can't be loaded (musl images without libz, etc.).
+/// Used by the Python dispatcher to compress response bodies when the
+/// client negotiated `Accept-Encoding: gzip`. Lazy-loads libz on first
+/// call — plain-HTTP / no-compression deployments never pay the lib mapping.
+fn saltareGzipEncode(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var level: c_int = 6;
+    if (py.PyArg_ParseTuple(args, "y#|i", &src_ptr, &src_len, &level) == 0) return null;
+    const src = src_ptr[0..@intCast(src_len)];
+    // Release the GIL: zlib's deflate path is pure CPU and can be 100s of µs
+    // for non-trivial bodies; letting other threads run during compression
+    // matters when free-threaded Python lands.
+    const save = py.PyEval_SaveThread();
+    const out = zlib_mod.gzipEncode(src, std.heap.c_allocator, level);
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
+/// brotli_encode(payload: bytes, quality: int = 4) -> bytes | None.
+/// Lazy-loads libbrotlienc + libbrotlidec; returns None on miss. Used
+/// when client sends `Accept-Encoding: br`.
+fn saltareBrotliEncode(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var quality: c_int = brotli_mod.DEFAULT_QUALITY;
+    if (py.PyArg_ParseTuple(args, "y#|i", &src_ptr, &src_len, &quality) == 0) return null;
+    const src = src_ptr[0..@intCast(src_len)];
+    const save = py.PyEval_SaveThread();
+    const out = brotli_mod.brotliEncode(src, std.heap.c_allocator, quality);
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
+/// brotli_decode(payload: bytes, max_size: int) -> bytes | None.
+fn saltareBrotliDecode(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var max_size: c_ulonglong = 0;
+    if (py.PyArg_ParseTuple(args, "y#K", &src_ptr, &src_len, &max_size) == 0) return null;
+    const src = src_ptr[0..@intCast(src_len)];
+    const save = py.PyEval_SaveThread();
+    const out = brotli_mod.brotliDecode(src, std.heap.c_allocator, @intCast(max_size));
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
+/// zstd_encode(payload: bytes, level: int = 3) -> bytes | None.
+fn saltareZstdEncode(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var level: c_int = zstd_mod.DEFAULT_LEVEL;
+    if (py.PyArg_ParseTuple(args, "y#|i", &src_ptr, &src_len, &level) == 0) return null;
+    const src = src_ptr[0..@intCast(src_len)];
+    const save = py.PyEval_SaveThread();
+    const out = zstd_mod.zstdEncode(src, std.heap.c_allocator, level);
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
+/// zstd_decode(payload: bytes, max_size: int) -> bytes | None.
+fn saltareZstdDecode(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var max_size: c_ulonglong = 0;
+    if (py.PyArg_ParseTuple(args, "y#K", &src_ptr, &src_len, &max_size) == 0) return null;
+    const src = src_ptr[0..@intCast(src_len)];
+    const save = py.PyEval_SaveThread();
+    const out = zstd_mod.zstdDecode(src, std.heap.c_allocator, @intCast(max_size));
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
+/// gunzip(payload: bytes, max_size: int) -> bytes | None.
+/// Decompresses a gzip-wrapped (RFC 1952) payload. `max_size` caps the
+/// output (zip-bomb defense — return None on overflow). Returns None when
+/// libz can't be loaded or the payload is malformed. Used by the Python
+/// dispatcher to decompress request bodies with `Content-Encoding: gzip`.
+fn saltareGunzip(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var max_size: c_ulonglong = 0;
+    if (py.PyArg_ParseTuple(args, "y#K", &src_ptr, &src_len, &max_size) == 0) return null;
+    const src = src_ptr[0..@intCast(src_len)];
+    const save = py.PyEval_SaveThread();
+    const out = zlib_mod.gunzip(src, std.heap.c_allocator, @intCast(max_size));
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
 var methods = [_]py.PyMethodDef{
     .{
         .ml_name = "version",
@@ -492,6 +607,42 @@ var methods = [_]py.PyMethodDef{
         .ml_meth = @ptrCast(&saltareServe),
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "serve(app, host: str, port: int) -> None. Bind and serve until SIGINT/SIGTERM.",
+    },
+    .{
+        .ml_name = "gzip_encode",
+        .ml_meth = @ptrCast(&saltareGzipEncode),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "gzip_encode(payload: bytes, level: int = 6) -> bytes | None. None when libz can't load.",
+    },
+    .{
+        .ml_name = "gunzip",
+        .ml_meth = @ptrCast(&saltareGunzip),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "gunzip(payload: bytes, max_size: int) -> bytes | None. None on libz miss / overflow.",
+    },
+    .{
+        .ml_name = "brotli_encode",
+        .ml_meth = @ptrCast(&saltareBrotliEncode),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "brotli_encode(payload: bytes, quality: int = 4) -> bytes | None. None when libbrotli is absent.",
+    },
+    .{
+        .ml_name = "brotli_decode",
+        .ml_meth = @ptrCast(&saltareBrotliDecode),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "brotli_decode(payload: bytes, max_size: int) -> bytes | None.",
+    },
+    .{
+        .ml_name = "zstd_encode",
+        .ml_meth = @ptrCast(&saltareZstdEncode),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "zstd_encode(payload: bytes, level: int = 3) -> bytes | None. None when libzstd is absent.",
+    },
+    .{
+        .ml_name = "zstd_decode",
+        .ml_meth = @ptrCast(&saltareZstdDecode),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "zstd_decode(payload: bytes, max_size: int) -> bytes | None.",
     },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };

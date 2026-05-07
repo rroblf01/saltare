@@ -2,7 +2,15 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.3.0 — lazy TLS + ~40 operational knobs, leanest of three.** Production target is **Linux x86_64**. v1.3 lands ~30 orthogonal features. **RAM-floor cuts (default-on)**: lazy OpenSSL via `dlopen`, `mallopt(M_ARENA_MAX=1, M_TRIM_THRESHOLD=64K, M_TOP_PAD=64K, M_MMAP_THRESHOLD=64K)`, `MALLOC_ARENA_MAX=1` in the CLI re-exec env, gated `PYTHONOPTIMIZE=2` auto re-exec, URL decode moved to Zig (drops `urllib.parse` import), `traceback` lazy-imported (drops ~150 KiB), `TCP_NODELAY` + `SO_KEEPALIVE` on every accepted socket, periodic `gc.collect(2)` + `malloc_trim(0)` after 3 s of idle, `gc.freeze()` re-trigger inside the idle-maintenance pass. **Operational knobs (opt-in, zero RAM when off)**: `health_path`, `cors_preflight_allow_all`, IPv6 listen (auto-detect from `host`), per-IP rate limiter, `max_connections_per_ip`, `max_connection_lifetime`, `tracemalloc_path`, `favicon_204`, `access_log_path`, `request_id_header`, `server_timing`, `listen_backlog`, `tcp_keepidle`/`tcp_keepintvl`/`tcp_keepcnt`, `tcp_user_timeout_ms`, `auto_raise_nofile`, `tls_session_cache_size`, `startup_request` (warm app), `server_header` (white-label / hide identity), `proxy_protocol` (v1 + v2 binary auto-detect — required behind L4 LBs), systemd socket activation (`LISTEN_FDS=1`), `SIGUSR1` JSON stats dump, `workers=0` auto-detects `cpu_count()`. **Bug fixes / RFC compliance**: WebSocket subprotocol (`Sec-WebSocket-Protocol` was always being dropped), HTTP trailers (`http.response.trailers` was silently ignored), HTTP/1.1 mandatory `Host` validation, header-name `tchar` validation (RFC 7230 §3.2.6 — defends against `\0`/CRLF smuggling), HEAD method body strip (RFC 7230 §3.3.3 — same headers as GET, no body). Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.4 / 45.4 / 45.4 MiB**, vs uvicorn 49.30 / 49.51 / 54.68 MiB and Granian 57.18–57.71 MiB on the same host. Tests **66 passing** core + 10 new in `tests/test_v13.py`. Most v1.3 features are opt-in: defaults match v1.2.2 behaviour at zero RAM cost.
+> **Status: 1.4.0 — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. Saltare is the leanest of the three benchmarked ASGI servers — **46.45 / 45.31 / 45.12 MiB**, vs uvicorn 49.29 / 49.84 / 54.36 MiB and Granian 57.18 / 56.21 / 56.08 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras** (`tests/test_v14_extras.py`); 95 total. Build is clean on Zig 0.16.0.
+
+### v1.4.x candidates (still pending)
+
+- **WebSocket per-message-deflate** (RFC 7692) — handshake negotiation + per-message inflate/deflate state across `ws.zig` frame builder. The HTTP path's zlib infra is reusable; the missing piece is the rsv1 / rsv-bit handling on the wire and the negotiation of `client_no_context_takeover` / `server_no_context_takeover` in the upgrade response.
+- **Streaming brotli + zstd** — only the gzip path supports `Z_SYNC_FLUSH` chunk-wise. brotli + zstd are single-shot for now; streaming-encode requires per-state encoder objects carried across `_send` calls (analogous to `_gzip_co`).
+- **Free-threaded Python (`cp314t`)** evaluation, **static-link OpenSSL build**, **HTTP/2 + ALPN** — v1.5 candidates.
+
+> **Status: 1.3.0 — lazy TLS + ~40 operational knobs, leanest of three (historical entry).** Production target is **Linux x86_64**. v1.3 lands ~30 orthogonal features. **RAM-floor cuts (default-on)**: lazy OpenSSL via `dlopen`, `mallopt(M_ARENA_MAX=1, M_TRIM_THRESHOLD=64K, M_TOP_PAD=64K, M_MMAP_THRESHOLD=64K)`, `MALLOC_ARENA_MAX=1` in the CLI re-exec env, gated `PYTHONOPTIMIZE=2` auto re-exec, URL decode moved to Zig (drops `urllib.parse` import), `traceback` lazy-imported (drops ~150 KiB), `TCP_NODELAY` + `SO_KEEPALIVE` on every accepted socket, periodic `gc.collect(2)` + `malloc_trim(0)` after 3 s of idle, `gc.freeze()` re-trigger inside the idle-maintenance pass. **Operational knobs (opt-in, zero RAM when off)**: `health_path`, `cors_preflight_allow_all`, IPv6 listen (auto-detect from `host`), per-IP rate limiter, `max_connections_per_ip`, `max_connection_lifetime`, `tracemalloc_path`, `favicon_204`, `access_log_path`, `request_id_header`, `server_timing`, `listen_backlog`, `tcp_keepidle`/`tcp_keepintvl`/`tcp_keepcnt`, `tcp_user_timeout_ms`, `auto_raise_nofile`, `tls_session_cache_size`, `startup_request` (warm app), `server_header` (white-label / hide identity), `proxy_protocol` (v1 + v2 binary auto-detect — required behind L4 LBs), systemd socket activation (`LISTEN_FDS=1`), `SIGUSR1` JSON stats dump, `workers=0` auto-detects `cpu_count()`. **Bug fixes / RFC compliance**: WebSocket subprotocol (`Sec-WebSocket-Protocol` was always being dropped), HTTP trailers (`http.response.trailers` was silently ignored), HTTP/1.1 mandatory `Host` validation, header-name `tchar` validation (RFC 7230 §3.2.6 — defends against `\0`/CRLF smuggling), HEAD method body strip (RFC 7230 §3.3.3 — same headers as GET, no body). Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.4 / 45.4 / 45.4 MiB**, vs uvicorn 49.30 / 49.51 / 54.68 MiB and Granian 57.18–57.71 MiB on the same host. Tests **66 passing** core + 10 new in `tests/test_v13.py`. Most v1.3 features are opt-in: defaults match v1.2.2 behaviour at zero RAM cost.
 
 ---
 
@@ -60,38 +68,38 @@ docker run --rm -e BENCH_LARGE_BYTES=1048576 saltare-bench \
     python -m benchmarks.bench --large-requests 200
 ```
 
-Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 0.136, pydantic 2.13, uvicorn 0.x plain — no `[standard]` extras, granian 2.x ASGI), v1.3.0 with default settings (single worker except where noted). Same host, same image. Each server's launcher imports the FastAPI app at module level so RSS readings reflect the same import footprint — without that normalisation, granian's master appears artificially small (~37 MiB) because it spawns a worker subprocess that holds the actual app, and the bench harness reads the master's `/proc/<pid>/status`.
+Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 0.136, pydantic 2.13, uvicorn 0.x plain — no `[standard]` extras, granian 2.x ASGI), v1.4.0 with default settings (single worker except where noted). Same host, same image. Each server's launcher imports the FastAPI app at module level so RSS readings reflect the same import footprint — without that normalisation, granian's master appears artificially small (~37 MiB) because it spawns a worker subprocess that holds the actual app, and the bench harness reads the master's `/proc/<pid>/status`.
 
 ### Sequential — 1 client, 1000 requests
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 46.50 MiB |      46.57 MiB | **46.57 MiB** |    1000 |  805 |
-| uvicorn | 48.88 MiB |      48.93 MiB | 48.93 MiB |    1000 | 1106 |
-| granian | 57.68 MiB |      57.68 MiB | 57.68 MiB |    1000 | 1081 |
+| saltare | 46.31 MiB |      46.45 MiB | **46.45 MiB** |    1000 | 1076 |
+| uvicorn | 49.25 MiB |      49.29 MiB | 49.29 MiB |    1000 | 1236 |
+| granian | 57.18 MiB |      57.18 MiB | 57.18 MiB |    1000 | 1130 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.29 MiB |      45.62 MiB | **45.63 MiB** |    2000 | 1848 |
-| uvicorn | 48.83 MiB |      49.92 MiB | 49.92 MiB |    2000 | 1691 |
-| granian | 56.16 MiB |      56.16 MiB | 56.16 MiB |    2000 | 1723 |
+| saltare | 44.94 MiB |      45.30 MiB | **45.31 MiB** |    2000 | 1817 |
+| uvicorn | 48.83 MiB |      49.84 MiB | 49.84 MiB |    2000 | 1800 |
+| granian | 56.21 MiB |      56.21 MiB | 56.21 MiB |    2000 | 1797 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 45.07 MiB |      45.43 MiB | **45.43 MiB** |     500 | 1352      |
-| uvicorn | 48.83 MiB |      54.21 MiB | 54.21 MiB |     500 | 1587      |
-| granian | 57.21 MiB |      57.21 MiB | 57.21 MiB |     500 | 1331      |
+| saltare | 44.84 MiB |      45.12 MiB | **45.12 MiB** |     500 | 1313      |
+| uvicorn | 48.99 MiB |      54.36 MiB | 54.36 MiB |     500 | 1500      |
+| granian | 56.08 MiB |      56.08 MiB | 56.08 MiB |     500 | 1289      |
 
 ### Multi-worker idle — Pss across the whole cluster (saltare only)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  40.32 MiB |      0.00 MiB | 40.32 MiB |                 —  |
-|       4 |        4 |  14.32 MiB |     39.57 MiB | 53.89 MiB |  161.27 MiB (−67%) |
+|       1 |        — |  40.02 MiB |      0.00 MiB | 40.02 MiB |                 —  |
+|       4 |        4 |  14.57 MiB |     39.76 MiB | 54.33 MiB |  160.07 MiB (−66%) |
 
 `Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.85 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
 
@@ -168,16 +176,17 @@ These exercise the v1.2.2 streaming backpressure (large-response) and the per-co
 - [x] **v1.2.0** — Python hot-path polish. Three orthogonal cuts to per-request work in `_dispatcher.py`: (1) module-level free-list pool of `_HttpState` instances with a `reset(...)` method that rewrites every slot — saves the slot-allocation step + GC-tracking overhead per request and reuses the `outgoing` list. (2) `receive` and `send` callables converted from per-request closures to bound methods (`_HttpState._receive`, `_HttpState._send`) — half the per-instance memory of a closure cell, no per-instance compile, plays well with the pool. (3) Pre-built byte-string constants for the wire format: `_SERVER_LINE`, `_CONNECTION_KEEPALIVE_LINE`, `_CONNECTION_CLOSE_LINE`, `_TRANSFER_ENCODING_CHUNKED_LINE`, `_CHUNKED_TERMINATOR`, `_CRLF`, plus a precomputed status-line cache for every reason code in `_REASONS`. Each response now references shared bytes instead of rebuilding `b"server: " + _SERVER_HEADER + b"\r\n"` etc. Net: sequential rps **2335 → 2447 (+4.3%)**, concurrent peak −0.3 MiB. Multi-worker numbers unchanged from v1.1 (these wins are per-request, multi-worker is per-process).
 - [x] **v1.2.2** — Worst-case RAM caps + bench / CI / production polish. Source caps: (1) **HTTP send-yield backpressure** — `_HttpState._send` tracks bytes appended to `outgoing` since the last drain; once the running total crosses `_HTTP_SEND_YIELD_BYTES` (64 KiB), the next intermediate `await send(...)` does an `await asyncio.sleep(0)` so the asyncio loop hands control back. Zig's main-loop stalled-pump path harvests via `http_dispatch_drain`, the counter resets, and the app keeps producing — per-task accumulated RAM is now bounded to ~one threshold's worth no matter how many sends a streaming endpoint chains in a row. The yield is skipped on the final chunk (`more_body=False`) so plain request/response apps never pay it. (2) **WebSocket outbound 1 MiB cap** — `_WsState.outgoing_bytes` is a running total; once `_WS_OUTGOING_MAX_BYTES` is exceeded the connection is marked `closed` and further sends drop. (3) **`_HTTP_POOL_MAX` bumped 32 → 128**. (4) **epoll event array 128 → 64**. Bench delta vs v1.2.1 same-host: mixed-sign, within ±1 MiB noise — these are caps, not benign-workload RAM cuts. Plus tooling: (5) **Granian** added as a third bench comparison point, which surfaced a fact the saltare-vs-uvicorn comparison was hiding: Granian sits **~10–12 MiB below saltare on the floor**. Closing that gap is on the v1.3 roadmap. (6) `Dockerfile.production` with jemalloc preloaded + `MALLOC_ARENA_MAX=2`, `make production-image`. (7) `make valgrind` target with CPython suppressions for periodic C-API leak checks across `bridge.zig`. (8) Bench harness extra workloads: `--large-response`, `--high-conc-idle 5000`. (9) README CoW eager-import doc — workers only stay lean if all imports happen in the master before the fork, and the typical FastAPI footgun (lazy `import` in route handlers) is now called out. **LTO** on the Zig side was attempted but rolled back — Zig 0.16's `Build.Module` and `Build.Step.Compile` no longer expose an LTO field, and `-fLLVM-lto` is not wired through `b.standardOptimizeOption`; will revisit when a public API lands.
 
+- [x] **v1.4.0** — Body streaming + cgroup awareness + mimalloc default + `sendfile(2)` ASGI extension + `.pyc` embed + tracemalloc cache + lazy zlib infra. **Phase 1 (lift current ceilings)**: (1) **Request body streaming** — when declared `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI streaming path. App sees `http.request{body=chunk, more_body=True}` events and saltare reads + pushes more chunks via `http_dispatch_push_body` as the kernel hands them over. Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold instead of the body's declared size — was: 413 above 16 KiB. New `Connection.body_streaming` state + `streamReceiveMore` handler. `max_request_body` re-checked incrementally during streaming so adversarial clients can't bypass it. (2) **mimalloc default** in `Dockerfile.production` (with jemalloc fallback if mimalloc isn't packaged); ~5 MiB lower steady-state vs glibc default. (3) **`sendfile(2)` zero-copy** via the new `saltare.sendfile` ASGI extension — the app emits `{"type": "saltare.sendfile", "path": "/var/www/file.bin", "status": 200, "headers": [...]}` and the dispatcher signals Zig to extract the path + headers via `httpDispatchPopSendfile`. Zig builds the head, calls `sendfile(2)` syscall in a loop honouring `EAGAIN`, and never copies file bytes through Python. Plain-HTTP only; TLS path 500s gracefully (kTLS not wired). Static-asset endpoints save MiBs per response that would otherwise live in app-heap `bytes`. **Phase 2 (floor reduction)**: 2.3 + 2.4 already optimised in v1.3 (lazy traceback, gen-0 GC). (6) **`.pyc` precompile** in the `Dockerfile` builder stage (`python -OO -m compileall src/saltare ... optimize=2`) so `__pycache__/*.opt-2.pyc` is shipped alongside the wheel; first-request import latency drops. **Phase 3 (functional gains)**: (7) **lazy `dlopen("libz.so.1")`** at [src/zig/zlib.zig](src/zig/zlib.zig) — `gunzip(src, allocator, dst_cap) ?[]u8` with zip-bomb cap + `gzipEncode(src, allocator, level) ?[]u8` with gzip wrapper (`15+16` window bits). Function-pointer table populated by `dlsym` on first use; mirrors the TLS pattern. Exposed to the dispatcher as `_core.gzip_encode` / `_core.gunzip`. **Wired** into two opt-in code paths: (7a) `--response-gzip` — when the request carries `Accept-Encoding: ...gzip...` and the response is single-shot, compressible content-type (`text/*`, `application/json`, `application/javascript`, `application/xml`, `image/svg+xml`, etc.), and ≥ `--response-gzip-min-bytes` (default 512), saltare gzip-encodes the body, drops the app's `Content-Length`, and emits `Content-Encoding: gzip` + `Vary: Accept-Encoding`. The negotiation honours `q=0` weights and the `*` wildcard per RFC 7231 §5.3.4. Streaming responses skip gzip — chunked + per-chunk `Z_SYNC_FLUSH` is deferred. (7b) `--request-decompression` — request bodies with `Content-Encoding: gzip` are decompressed before the app's first `await receive()`, capped at `max_request_body` (zip-bomb defense returns 413 on overflow). Both flags are off by default — when off, `_core.gzip_encode` / `_core.gunzip` are never called and libz stays unmapped (`isAvailable()` only fires on first call). **Phase 4 (hardening)**: (5) **cgroup-v2 memory awareness** — when the operator hasn't explicitly set `max_concurrent_connections`, saltare reads `/sys/fs/cgroup/memory.max` (or v1's `memory.limit_in_bytes`), reserves a 64 MiB floor for Python heap + libs, and budgets the rest at 50 KiB per concurrent — auto-cap stays sane under k8s `resources.limits.memory`. (11) **5-second `tracemalloc` snapshot cache** — `dump_tracemalloc` previously rebuilt a top-30 statistics list on every poll (~10–50 ms blocking the dispatch loop); now caches the rendered bytes for 5 s so monitoring agents on a 1 s scrape interval get cheap reads. **Phase 5 (compression suite + ops)**: (12) **Streaming response gzip** — `_HttpState._gzip_co` carries a `zlib.compressobj(level, DEFLATED, 31)` across `_send` calls; intermediate chunks `Z_SYNC_FLUSH`, the final chunk `Z_FINISH`. Apps that emit `more_body=True` now compress end-to-end (was: streaming responses passed through unchanged in v1.4.0 day-1). (13) **Brotli** via lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) + `_core.brotli_encode`/`brotli_decode` exposed to the dispatcher. Single-shot only. Wired into the encoder negotiation. (14) **zstd** via lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) + `_core.zstd_encode`/`zstd_decode`. Single-shot only. Wired into the encoder negotiation. (15) **Encoding negotiation** — `_negotiate_encoding(value)` parses `Accept-Encoding`, honours `q=0` and the `*` wildcard per RFC 7231 §5.3.4, and picks per server-preference order br > zstd > gzip when multiple are offered. Disabled encoders are skipped automatically. (16) **`max_request_uri` → 414 URI Too Long** (default 8192 B). Cheaper guard than letting a multi-KiB target hit the routing table. (17) **`max_request_head_bytes` → 431 Request Header Fields Too Large** — explicit cap (the implicit pool-buffer ceiling is ~64 KiB; this lets operators tighten further). (18) **`traceparent_propagation`** — W3C Trace Context surfaced on `scope["traceparent"]` / `scope["tracestate"]` and echoed back on the response. ~30 B/req when on, zero when off. (19) **`latency_histogram`** — Prometheus `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) + `_sum` + `_count`; emitted on `/metrics` only when enabled. ~140 B of bucket counters per worker. Bench: **46.45 / 45.31 / 45.12 MiB** vs uvicorn 49.29 / 49.84 / 54.36 MiB and granian 57.18 / 56.21 / 56.08 MiB. Tests 66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras = 95 total ✓ on Zig 0.16.0.
+
 - [x] **v1.3.0** — Lazy-loaded TLS + ~25 operational knobs, leanest of three. **RAM-floor cuts (default-on)**: (1) **OpenSSL link gone at build time** — `tls.zig` declares OpenSSL types as `opaque {}`, hard-codes ABI constants, and ships a function-pointer table populated by `dlopen` + `dlsym` on first `newContext()` call. Plain-HTTP deployments never load libssl/libcrypto. (2) **`mallopt(M_ARENA_MAX, 1)` at module init** caps glibc's per-thread arenas. The `saltare` CLI re-exec also injects **`MALLOC_ARENA_MAX=1`** into the child env so even CPython's bootstrap allocations land in a single arena. (3) **`PYTHONOPTIMIZE=2` auto re-exec** strips docstrings + asserts from FastAPI / Pydantic / Starlette — `SALTARE_NO_OPTIMIZE=1` opts out, and `_is_saltare_main_entry()` gates the re-exec to only fire when this module is the actual main entry. (4) **URL decode moved to Zig** (`http.urlDecode`) — `_dispatcher.py` no longer imports `urllib.parse`. (5) **`TCP_NODELAY` + `SO_KEEPALIVE` on accept** — small-response latency loses the Nagle delay; dead peers (NAT timeouts, mobile drops) get reaped by kernel keepalive. **Operational knobs (opt-in, zero RAM when off)**: (6) **Health intercept** (`health_path`). (7) **CORS preflight intercept** (`cors_preflight_allow_all`). (8) **IPv6 listen** (auto-detect from `host`, `IPV6_V6ONLY=1`). (9) **Per-IP rate limiter** (`rate_limit_per_sec`, `rate_limit_burst`) — 4096-IP bounded LRU table, honors `proxy_headers` (`X-Forwarded-For` leftmost when behind trusted proxy). (10) **`tracemalloc_path`** auto-starts tracking + serves top-30 dump. (11) **`favicon_204`** — Zig answers `GET /favicon.ico` with 204. (12) **`max_connections_per_ip`** — TCP-RST over-cap peers; shares the rate-limit table so the per-IP cap costs no extra memory beyond the limiter that's already there. (13) **`access_log_path`** — JSON log lines to a file via `O_APPEND | O_CLOEXEC` instead of stderr. (14) **`request_id_header`** — auto-generates an 8-byte hex ID per request, exposes via `scope["x-request-id"]`, echoes as response header. (15) **`server_timing=True`** — `Server-Timing: total;dur=<ms>` on every response. **Tier-3 ops + RAM additions**: (16) **Aggressive `mallopt` thresholds** (`M_TRIM_THRESHOLD`, `M_TOP_PAD`, `M_MMAP_THRESHOLD` all clamped to 64 KiB at module init) so heap fragmentation returns to the OS more eagerly. (17) **Idle-maintenance tick** — after 3 s with zero events and zero in-flight requests, the main loop runs `gc.collect(2)` + `gc.freeze()` + `malloc_trim(0)` to recover memory accumulated during the previous burst. Cheap when steady-state, capped to once per idle window. (18) **`SIGUSR1` JSON stats dump** to stderr (`{"event":"saltare.stats","open_conns":N,"in_flight":M,"requests_total":...,"rss_kib":...,"rl_table_size":...}`) — operational diagnostic without an HTTP probe. (19) **`listen_backlog`** configurable (default 256). (20) **`tcp_keepidle`/`tcp_keepintvl`/`tcp_keepcnt`** tunable cadence on accepted sockets — kernel defaults are too generous for mobile / NAT-heavy fronts. (21) **`X-Real-IP`** honored alongside `X-Forwarded-For` (nginx convention; X-Real-IP wins when both are present). (22) **HTTP/1.1 mandatory `Host:` enforcement** — missing or empty `Host` header gets a 400 per RFC 7230 §5.4. (23) **systemd socket activation** — auto-detects `LISTEN_PID=$$` + `LISTEN_FDS=1` and inherits fd 3 instead of binding; the env is unset so forked workers don't double-activate. (24) **HAProxy PROXY-protocol v1** — when `proxy_protocol=True`, the first line of every accepted connection is parsed as `PROXY <fam> <src> <dst> <sport> <dport>\r\n` (TCP4 / TCP6 / UNKNOWN); src replaces the TCP peer for rate-limit + access-log, so saltare gets real client IPs behind L4 LBs (AWS NLB, GCP TCP LB, HAProxy v1) that strip HTTP-level headers. (25) **WebSocket subprotocol** finally honored (real bug — was always returning `scope["subprotocols"]=[]`). (26) **HTTP trailers** (`http.response.trailers`) emitted as chunked-encoding trailer block per RFC 7230. **Tier-4 hardening + RFC additions**: (27) **PROXY-protocol v2 binary** auto-detect at accept (AWS NLB/ALB default, modern HAProxy). (28) **HEAD method body strip** — same headers as GET, no body (RFC 7230 §3.3.3). (29) **Header `tchar` validation** — RFC 7230 §3.2.6 reject `\0`/CRLF in header names. (30) **Connection age cap** (`max_connection_lifetime_secs`) — wall-clock connection budget. (31) **`startup_request`** — internal `GET /` after lifespan startup to warm FastAPI route compilation + pydantic validators. (32) **TLS session cache** (`tls_session_cache_size`). (33) **TCP_USER_TIMEOUT** — sub-second failure detection. (34) **`auto_raise_nofile`** — `setrlimit(RLIMIT_NOFILE)` to hard at startup. (35) **`server_header` configurable** — refactor of all comptime concat sites to runtime `g_server_line`; empty string omits. (36) **Lazy `traceback` import** — defer the ~150 KiB stdlib until first error path. (37) **`workers=0` auto-detects** `min(cpu_count(), 4)`. **Tier-5 final**: (38) **`PYTHONFAULTHANDLER=1`** auto in re-exec env. (39) **`SIGUSR1` dump now includes `draining` flag**. (40) **`setproctitle`** via `prctl(PR_SET_NAME)` — `saltare`, `saltare:master`, `saltare:wkrN` visible in `ps`. (41) **`TCP_FASTOPEN`** server-side queue (Linux ≥ 3.7). (42) **Periodic `gc.collect(0)`** every N requests for gen-0 churn. (43) **`X-Forwarded-Host`** + **`Forwarded:` (RFC 7239)** — both feed `scope["server"]` and the rate-limit key when `proxy_headers=True`. (44) **`/metrics` `saltare_health_state`** gauge — 0=healthy, 1=draining. (45) **WebSocket continuation frames** — RFC 6455 §5.4 reassembled per-connection up to 1 MiB cap (was a real bug — fragmented messages from any client got the connection torn down). (46) **mTLS** — `ssl_ca_file` + `ssl_verify_client=True` enforce client cert verification at handshake. Bench: **46.6 / 45.6 / 45.4 MiB** vs uvicorn **48.93 / 49.92 / 54.21 MiB** and granian **56.16–57.68 MiB**. Tests 66/5 ✓.
 
-**Deferred to v1.4** (refactors that would inflate the RAM floor today): request body streaming (replaces 16 KiB body cap with chunked push), `sendfile(2)` zero-copy via `X-Sendfile-Path`, request-body decompression (`Content-Encoding: gzip`), response gzip/brotli, HTTP/2 + ALPN, WebSocket per-message-deflate.
+### v1.4.x candidates
 
-### v1.4 candidates (not yet started)
-
-- **Request body streaming**. The read buffer caps body size at the upgraded 16 KiB pool block; bodies past that get 413. Streaming would require a new connection state ("body-in-flight, dispatch active") plus interleaved `http_dispatch_push_body` calls from the Zig side. Major refactor of the dispatch loop.
-- **`sendfile(2)` zero-copy file path**. ASGI extension where the app sends `{"type": "saltare.sendfile", "path": "/var/www/file.bin"}` and Zig calls `sendfile(socket, file_fd, NULL, size)` directly — no Python-level body copying. Useful for static-asset endpoints; bridge changes are non-trivial because it has to bypass the normal `http.response.body` chunk path.
-- **HTTP/2** via ALPN + `nghttp2` linkage. Multiplexing fewer connections would cut per-conn overhead even further, but the wire-format work is large.
-- **Free-threaded Python (`cp314t`)** — measure RSS + rps with the GIL gone; saltare's single-threaded I/O loop with GIL-locked dispatch is the architecture, free-threaded could let dispatch run concurrently. Could go either way.
+- **WebSocket per-message-deflate** (RFC 7692) — handshake negotiation + per-message inflate/deflate. zlib infra is already loaded by the HTTP path; this just plumbs it through `ws.zig` (rsv1 bit on outbound frames + decompress inbound when negotiated).
+- **Streaming brotli + zstd** — currently single-shot only. Streaming-encode requires a per-state encoder carried across `_send` calls (analogous to `_gzip_co`).
+- **HTTP/2 + ALPN** via `nghttp2`. Multiplexing many requests over one connection. Big win for high-concurrency clients but tens of KLoC of wire-format work; v1.5 candidate.
+- **Free-threaded Python (`cp314t`)** — measure RSS + rps with GIL gone. Could let dispatch run concurrently; could also inflate the floor. Decision after benchmarking.
+- **Static-link OpenSSL** build experiment — alternative wheel (`saltare-with-tls`) that links libssl/libcrypto statically for environments without manylinux's runtime libs. Plain wheel keeps the lazy `dlopen` path.
 
 ## Install (once published)
 
@@ -247,6 +256,158 @@ saltare.run(
 ```
 
 The same flags are exposed on the CLI (`--header-timeout`, `--keep-alive-timeout`, `--body-timeout`, `--write-timeout`). Defaults match the values above. WebSocket connections are exempt — long-lived idle WS sockets are expected, and ping/pong-driven keepalive lands post-v0.11.
+
+### Streaming request bodies (v1.4)
+
+Apps receiving large request bodies (file uploads, multi-MiB JSON) get them via the standard ASGI `more_body` flag — saltare reads the kernel's bytes incrementally and pushes them into the running ASGI task as `http.request{body=chunk, more_body=True}` events:
+
+```python
+async def upload_endpoint(scope, receive, send):
+    total = 0
+    while True:
+        msg = await receive()
+        if msg["type"] != "http.request":
+            break
+        total += len(msg["body"])
+        # process chunk in place — never keep the whole body in memory.
+        if not msg.get("more_body"):
+            break
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({
+        "type": "http.response.body",
+        "body": f'{{"received": {total}}}'.encode(),
+        "more_body": False,
+    })
+```
+
+The streaming path engages automatically when the declared `Content-Length` exceeds the read buffer (4 KiB / 16 KiB depending on pool tier). For smaller bodies saltare keeps the full-buffer fast path. **`max_request_body` is enforced incrementally** — adversarial clients announcing a small `Content-Length` then streaming more bytes get a 413 mid-stream and the connection is closed.
+
+### cgroup memory awareness (v1.4)
+
+When saltare runs inside a memory-limited cgroup (typical k8s `resources.limits.memory`) and the operator hasn't explicitly set `max_concurrent_connections`, saltare reads `/sys/fs/cgroup/memory.max` (cgroup v2) or `memory.limit_in_bytes` (v1), reserves a 64 MiB floor for Python heap + libs, and budgets the rest at ~50 KiB per concurrent request. The auto-cap is logged at startup:
+
+```
+saltare: cgroup memory.max=128 MiB → max_concurrent_connections=1310
+```
+
+Setting `max_concurrent_connections=N` explicitly disables the auto-cap.
+
+### Zero-copy file responses (`saltare.sendfile`, v1.4)
+
+Static-asset endpoints can avoid copying file bytes through Python heap by emitting a `saltare.sendfile` ASGI extension event instead of `http.response.start` + `http.response.body`. saltare's Zig core opens the file, builds the response head, and uses the `sendfile(2)` syscall directly to the socket — never reads file bytes into userspace.
+
+```python
+async def app(scope, receive, send):
+    if scope["type"] != "http":
+        return
+    if scope["path"] == "/static/big.bin":
+        await send({
+            "type": "saltare.sendfile",
+            "path": "/var/www/big.bin",
+            "status": 200,
+            "headers": [(b"content-type", b"application/octet-stream")],
+        })
+        return
+    # …regular response path…
+```
+
+Notes:
+
+- Plain-HTTP only — TLS connections return `500 Internal Server Error` (kTLS isn't wired in this version).
+- Don't include `Content-Length` / `Transfer-Encoding` / `Connection` in `headers`; saltare derives those from the file's `fstat()`.
+- `Content-Length` is set automatically from `fstat()`; the head and body are written separately so HEAD-method handling is correct.
+- The extension is opt-in: apps that don't emit `saltare.sendfile` keep the existing dispatch path with no behavioural change.
+
+### Response compression — gzip / brotli / zstd (v1.4)
+
+Three opt-in flags expose the lazy-`dlopen` path for each codec. All default off; when off, the corresponding lib (`libz.so.1` / `libbrotlienc.so.1` / `libzstd.so.1`) is never loaded and the mapping never enters the process. Plain-HTTP / no-compression deployments keep the v1.3 RAM floor unchanged.
+
+```python
+saltare.run(
+    app, host="0.0.0.0", port=8000,
+    response_gzip=True,            # zlib (universally supported)
+    response_gzip_min_bytes=512,
+    response_gzip_level=6,         # 1 (fastest) - 9 (best)
+    response_brotli=True,          # ~15-20% smaller text vs gzip
+    response_brotli_quality=4,     # 0-11
+    response_zstd=True,            # ~10× faster decompression
+    response_zstd_level=3,         # 1-22
+    request_decompression=True,
+    max_request_body=10 * 1024 * 1024,
+)
+```
+
+CLI equivalent:
+
+```bash
+saltare app:app --response-gzip --response-brotli --response-zstd \
+    --request-decompression --max-request-body 10485760
+```
+
+Negotiation: saltare parses `Accept-Encoding`, drops `q=0` tokens, expands `*` per RFC 7231 §5.3.4, and picks the best encoder both **enabled at startup** and **offered with q>0**. Server-side preference within an equal client-q tier is **br > zstd > gzip** (br compresses tightest for text, zstd is fastest, gzip is the universal fallback). When `libbrotlienc` / `libzstd` aren't present in the image the encoder call falls through to identity — the response is sent raw, the client gets a still-valid (uncompressed) body.
+
+What gets compressed on the response side:
+
+- Response is **single-shot** (gzip *also* supports streaming; brotli and zstd are single-shot only in v1.4 — streaming-encode for those is v1.4.x).
+- Content-Type must be in the compressible set: `text/*`, `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `application/atom+xml`, `application/rss+xml`, `application/x-javascript`, `image/svg+xml`. Binary types (PNG/MP4/WOFF2) compress poorly and are skipped.
+- Body must be ≥ `response_gzip_min_bytes` (default 512) and the encoded result must be smaller than the raw body.
+- App must not have already set `Content-Encoding`.
+
+When all conditions hold, saltare drops the app's `Content-Length`, encodes the body, emits the new `Content-Length`, adds `Content-Encoding: <enc>` and `Vary: Accept-Encoding`. The app sees no API change.
+
+Streaming gzip (v1.4): when `more_body=True` on the first chunk and gzip negotiated, saltare initializes a `zlib.compressobj(level, DEFLATED, 31)` carried across `_send` calls. Intermediate chunks flush with `Z_SYNC_FLUSH`; the final chunk uses `Z_FINISH` to write the gzip trailer (CRC + isize). Decompressors see decoded bytes promptly — works with SSE, file downloads, multi-MB JSON streams. Brotli / zstd streaming-encode is deferred (per-state encoder objects across `_send` calls; analogous design but more code surface).
+
+Request decompression:
+
+- Triggered when `Content-Encoding: gzip` is the sole encoding (case-insensitive). Other encodings pass through unchanged.
+- Only fires for non-streaming bodies (full body buffered before dispatch). Streaming gzipped uploads are passed raw — the streaming path sees compressed bytes.
+- The decompressed body is capped at `max_request_body`; over-cap returns `413 Payload Too Large` immediately. Zip-bomb defense — a 1 KiB gzipped payload that decompresses to 1 GiB never makes it past the dispatcher.
+- The `Content-Encoding` header is stripped from `scope["headers"]` after decompression.
+
+### Request size hardening — 414 / 431 (v1.4)
+
+Two cheap caps round out RFC 7230 status codes for malformed clients:
+
+- `max_request_uri` (default 8192 bytes; 0 disables) — request-line target longer than the cap returns `414 URI Too Long`. Cheaper than letting a multi-KiB target hit the routing table.
+- `max_request_head_bytes` (default 0 / pool-buffer ceiling; non-zero tightens) — total head-section bytes (request line + all headers + CRLFs up to and including the blank line) past the cap returns `431 Request Header Fields Too Large`. The implicit ceiling is the read-buffer (~16 KiB small / 64 KiB after upgrade); this knob lets operators tighten that further.
+
+```bash
+saltare app:app --max-request-uri 4096 --max-request-head-bytes 8192
+```
+
+### W3C Trace Context propagation (v1.4)
+
+Off by default. When `--traceparent-propagation` is on, saltare reads incoming `traceparent` and `tracestate` headers, surfaces them on `scope["traceparent"]` / `scope["tracestate"]` (ASGI extension keys), and echoes `traceparent` back on every response. ~30 bytes per request when on; zero work when off.
+
+```python
+saltare.run(app, host="0.0.0.0", traceparent_propagation=True)
+
+# In the ASGI app:
+async def handler(scope, receive, send):
+    tp = scope.get("traceparent")  # str | None
+    # ... use with OpenTelemetry SDK or a downstream HTTP call
+```
+
+The format is **not** validated (32-hex trace-id + 16-hex span-id + flags per W3C). Invalid values pass through unchanged so the app can decide.
+
+### Prometheus latency histogram (v1.4)
+
+When `--latency-histogram` is on, `/metrics` emits a standard Prometheus histogram for request wall-clock latency:
+
+```
+# HELP saltare_request_duration_seconds Wall-clock request latency, in seconds.
+# TYPE saltare_request_duration_seconds histogram
+saltare_request_duration_seconds_bucket{le="0.001"} 12
+saltare_request_duration_seconds_bucket{le="0.005"} 89
+…
+saltare_request_duration_seconds_bucket{le="60"} 1024
+saltare_request_duration_seconds_bucket{le="+Inf"} 1024
+saltare_request_duration_seconds_sum 4.213701
+saltare_request_duration_seconds_count 1024
+```
+
+14 fixed buckets cover 1 ms..60 s. Cost per worker: 14 × `u64` counters = 112 bytes plus 16 bytes of `_sum` accumulator = ~128 B steady-state. Off by default — counter-only `/metrics` keeps the previous footprint.
 
 ### Resource caps
 

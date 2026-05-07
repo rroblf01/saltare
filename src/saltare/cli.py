@@ -346,6 +346,54 @@ def main(argv: list[str] | None = None) -> None:
         help="run gc.collect(0) every N completed dispatches (0 = leave-alone)",
     )
     parser.add_argument(
+        "--response-gzip", action="store_true",
+        help="gzip-encode single-shot responses when client sent Accept-Encoding: gzip (lazy libz)",
+    )
+    parser.add_argument(
+        "--response-gzip-min-bytes", type=int, default=512, metavar="N",
+        help="don't gzip responses smaller than N bytes (default 512)",
+    )
+    parser.add_argument(
+        "--response-gzip-level", type=int, default=6, metavar="N",
+        help="zlib compression level 1-9 (default 6)",
+    )
+    parser.add_argument(
+        "--response-brotli", action="store_true",
+        help="negotiate Accept-Encoding: br (single-shot only; needs libbrotli)",
+    )
+    parser.add_argument(
+        "--response-brotli-quality", type=int, default=4, metavar="N",
+        help="brotli quality 0-11 (default 4)",
+    )
+    parser.add_argument(
+        "--response-zstd", action="store_true",
+        help="negotiate Accept-Encoding: zstd (single-shot only; needs libzstd)",
+    )
+    parser.add_argument(
+        "--response-zstd-level", type=int, default=3, metavar="N",
+        help="zstd compression level 1-22 (default 3)",
+    )
+    parser.add_argument(
+        "--request-decompression", action="store_true",
+        help="decompress request bodies with Content-Encoding: gzip (capped by --max-request-body)",
+    )
+    parser.add_argument(
+        "--max-request-uri", type=int, default=8192, metavar="N",
+        help="reject request-line targets longer than N bytes with 414 (default 8192; 0 disables)",
+    )
+    parser.add_argument(
+        "--max-request-head-bytes", type=int, default=0, metavar="N",
+        help="reject request head sections larger than N bytes with 431 (0 = pool-buffer ceiling)",
+    )
+    parser.add_argument(
+        "--latency-histogram", action="store_true",
+        help="emit Prometheus saltare_request_duration_seconds_bucket on /metrics",
+    )
+    parser.add_argument(
+        "--traceparent-propagation", action="store_true",
+        help="surface W3C Trace Context (traceparent/tracestate) on scope and echo on response",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -399,4 +447,16 @@ def main(argv: list[str] | None = None) -> None:
         ssl_verify_client=args.ssl_verify_client,
         tcp_fastopen_qlen=args.tcp_fastopen_qlen,
         gc_collect_every_n_requests=args.gc_collect_every_n_requests,
+        response_gzip=args.response_gzip,
+        response_gzip_min_bytes=args.response_gzip_min_bytes,
+        response_gzip_level=args.response_gzip_level,
+        response_brotli=args.response_brotli,
+        response_brotli_quality=args.response_brotli_quality,
+        response_zstd=args.response_zstd,
+        response_zstd_level=args.response_zstd_level,
+        request_decompression=args.request_decompression,
+        max_request_uri=args.max_request_uri,
+        max_request_head_bytes=args.max_request_head_bytes,
+        latency_histogram=args.latency_histogram,
+        traceparent_propagation=args.traceparent_propagation,
     )

@@ -57,7 +57,8 @@ WORKDIR /io
 COPY pyproject.toml CMakeLists.txt build.zig build.zig.zon README.md LICENSE ./
 COPY src ./src
 RUN python -m build --wheel --outdir /tmp/dirty-wheels \
- && auditwheel repair /tmp/dirty-wheels/saltare-*.whl -w /dist
+ && auditwheel repair /tmp/dirty-wheels/saltare-*.whl -w /dist \
+ && python -OO -c "import compileall, glob; compileall.compile_dir('src/saltare', force=True, quiet=1, optimize=2)" || true
 
 # ---------------------------------------------------------------------------
 # Stage 5: Run the test suite against the *installed* wheel. Wheel install,

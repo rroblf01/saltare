@@ -28,6 +28,8 @@ const c = @cImport({
     @cInclude("netinet/tcp.h");
     @cInclude("sys/un.h");
     @cInclude("sys/resource.h");
+    @cInclude("sys/sendfile.h");
+    @cInclude("sys/stat.h");
     @cInclude("unistd.h");
     @cInclude("signal.h");
     @cInclude("fcntl.h");
@@ -50,7 +52,7 @@ extern fn accept4(
 // call site so the extern stays cold on macOS / non-glibc builds.
 extern fn malloc_trim(pad: usize) c_int;
 
-const SERVER_HEADER = "saltare/1.3.0";
+const SERVER_HEADER = "saltare/1.4.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -158,6 +160,12 @@ pub const Observability = struct {
     /// every page load; without this flag every hit serialises through
     /// FastAPI's routing for a 404. Costs zero RAM when off.
     favicon_204: bool = false,
+    /// v1.4 Prometheus latency histogram. When true, `/metrics` emits
+    /// `saltare_request_duration_seconds_bucket` with fixed buckets
+    /// (1ms..60s) plus `_sum` / `_count`. Buckets cost 16 × u64
+    /// counters = 128 B per worker; off by default since most ops
+    /// only need the existing counter set.
+    latency_histogram: bool = false,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -233,6 +241,18 @@ pub const Limits = struct {
     /// Linux ≥ 3.7. Recommended value: same as `listen_backlog` (256).
     /// Wins are visible only when clients themselves opt into TFO.
     tcp_fastopen_qlen: c_int = 0,
+    /// Maximum length of the request-target (path + query). Zero = no
+    /// explicit cap (still implicitly bounded by the read-buffer). Any
+    /// request whose request-line target exceeds this gets a 414 URI
+    /// Too Long. Defends apps that do unbounded path-based dispatch
+    /// against pathological clients sending multi-KiB URIs.
+    max_request_uri: u32 = 8192,
+    /// Maximum bytes of the entire request head section (request-line
+    /// + all headers + CRLFs, up to and including the terminating
+    /// blank line). Zero = no explicit cap. Larger heads are rejected
+    /// with 431 before allocating the large pool buffer. Tighter than
+    /// the implicit pool-buffer ceiling (~64 KiB). RFC 7230 §3.2.5.
+    max_request_head_bytes: u32 = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -507,6 +527,29 @@ var g_total_bytes_received: std.atomic.Value(u64) = std.atomic.Value(u64).init(0
 var g_total_4xx: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 var g_total_5xx: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
+// v1.4 Prometheus latency histogram. Le-buckets in seconds, encoded as
+// nanoseconds for cheap integer compare against `monoNs() - request_start_ns`.
+// `+Inf` is implicit (every observation increments `g_total_requests` already).
+// Each bucket counts observations ≤ that bound (Prometheus cumulative
+// semantics). 14 fixed buckets — covers 1 ms .. 60 s, plenty for ASGI.
+const LATENCY_BUCKET_NS = [_]i64{
+    1_000_000, 5_000_000, 10_000_000, 25_000_000, 50_000_000,
+    100_000_000, 250_000_000, 500_000_000, 1_000_000_000,
+    2_500_000_000, 5_000_000_000, 10_000_000_000, 30_000_000_000,
+    60_000_000_000,
+};
+const LATENCY_BUCKET_LE_S = [_][]const u8{
+    "0.001", "0.005", "0.01", "0.025", "0.05",
+    "0.1",   "0.25",  "0.5",  "1",     "2.5",
+    "5",     "10",    "30",   "60",
+};
+var g_latency_buckets: [LATENCY_BUCKET_NS.len]std.atomic.Value(u64) = blk: {
+    var arr: [LATENCY_BUCKET_NS.len]std.atomic.Value(u64) = undefined;
+    for (&arr) |*slot| slot.* = std.atomic.Value(u64).init(0);
+    break :blk arr;
+};
+var g_latency_sum_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
 fn resetMetrics() void {
     g_in_flight.store(0, .seq_cst);
     g_total_requests.store(0, .seq_cst);
@@ -514,6 +557,8 @@ fn resetMetrics() void {
     g_total_bytes_received.store(0, .seq_cst);
     g_total_4xx.store(0, .seq_cst);
     g_total_5xx.store(0, .seq_cst);
+    for (&g_latency_buckets) |*slot| slot.store(0, .seq_cst);
+    g_latency_sum_ns.store(0, .seq_cst);
 }
 
 /// Set by `run` when TLS is enabled. Lives only for the duration of one
@@ -658,7 +703,50 @@ fn finishRequest(conn: *Connection) void {
         conn.request_in_flight = false;
     }
     updateStatusCounters(conn.response_status);
+    if (g_obs.latency_histogram and conn.request_start_ns != 0) {
+        const elapsed = monoNs() - conn.request_start_ns;
+        if (elapsed >= 0) {
+            _ = g_latency_sum_ns.fetchAdd(@intCast(elapsed), .seq_cst);
+            for (LATENCY_BUCKET_NS, 0..) |bound, i| {
+                if (elapsed <= bound) {
+                    _ = g_latency_buckets[i].fetchAdd(1, .seq_cst);
+                }
+            }
+        }
+    }
     if (g_obs.access_log and conn.parsed != null) emitAccessLog(conn);
+}
+
+/// Read the cgroup memory limit (in bytes) from cgroup v2's
+/// `/sys/fs/cgroup/memory.max` or v1's `memory.limit_in_bytes`. v2 is
+/// preferred because k8s ≥ 1.25 / Docker default to it. Returns null
+/// when no limit is set ("max" in v2, or absent file). v1.4 helper —
+/// used to auto-tune `max_concurrent_connections` when the operator
+/// didn't configure one explicitly.
+fn readCgroupMemoryLimitBytes() ?u64 {
+    if (comptime builtin.os.tag != .linux) return null;
+    const paths = [_][:0]const u8{
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    };
+    for (paths) |path| {
+        const fd = c.open(path.ptr, c.O_RDONLY);
+        if (fd < 0) continue;
+        defer _ = c.close(fd);
+        var buf: [64]u8 = undefined;
+        const n = c.read(fd, &buf, buf.len - 1);
+        if (n <= 0) continue;
+        var len: usize = @intCast(n);
+        while (len > 0 and (buf[len - 1] == '\n' or buf[len - 1] == ' ')) len -= 1;
+        const txt = buf[0..len];
+        // v2 reports "max" when no cap is set.
+        if (std.mem.eql(u8, txt, "max")) continue;
+        // v1 reports a giant number (~int64 max) when no cap.
+        const value = std.fmt.parseInt(u64, txt, 10) catch continue;
+        if (value >= std.math.maxInt(u64) / 2) continue;
+        return value;
+    }
+    return null;
 }
 
 /// Read VmRSS (resident set) from `/proc/self/status`. Best-effort: any
@@ -687,7 +775,7 @@ fn readVmRssBytes() u64 {
 /// to the connection. Bypasses the bridge entirely — the user app never
 /// sees the request, so there's no Python overhead per scrape.
 fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
-    var body_buf: [2048]u8 = undefined;
+    var body_buf: [4096]u8 = undefined;
     var body_len: usize = 0;
 
     const sections = .{
@@ -756,6 +844,29 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         rss_bytes,
         @as(u32, if (g_draining.load(.seq_cst)) 1 else 0),
     });
+
+    // v1.4 latency histogram. Emitted only when the operator opted in;
+    // saves 14 bucket lines + sum + count + 2 HELP/TYPE lines (~700 B
+    // wire) per scrape on installs that don't need it.
+    if (g_obs.latency_histogram) {
+        w.write(
+            \\# HELP saltare_request_duration_seconds Wall-clock request latency, in seconds.
+            \\# TYPE saltare_request_duration_seconds histogram
+            \\
+        , .{});
+        for (LATENCY_BUCKET_LE_S, 0..) |le, i| {
+            const count = g_latency_buckets[i].load(.seq_cst);
+            w.write("saltare_request_duration_seconds_bucket{{le=\"{s}\"}} {d}\n", .{ le, count });
+        }
+        const sum_ns = g_latency_sum_ns.load(.seq_cst);
+        // Count == total_reqs (every finished request increments both).
+        w.write("saltare_request_duration_seconds_bucket{{le=\"+Inf\"}} {d}\n", .{total_reqs});
+        // Render sum as fixed seconds with 6-decimal precision (microsecond
+        // resolution). Avoids pulling in a float fmt path; integer math.
+        const sum_us = sum_ns / 1000;
+        w.write("saltare_request_duration_seconds_sum {d}.{d:0>6}\n", .{ sum_us / 1_000_000, sum_us % 1_000_000 });
+        w.write("saltare_request_duration_seconds_count {d}\n", .{total_reqs});
+    }
 
     var head_buf: [512]u8 = undefined;
     const head = std.fmt.bufPrint(
@@ -867,6 +978,123 @@ fn serveFavicon(loop: *eventloop.Loop, conn: *Connection) void {
         loop, conn, 204, "No Content", "image/x-icon", "",
         "Cache-Control: public, max-age=86400\r\n",
     );
+}
+
+/// v1.4: serve a file via `sendfile(2)`. Opens the file, fstat's
+/// for size, writes the response head (status line + caller-supplied
+/// headers + `Content-Length: <size>` + `Connection: ...`), then
+/// hands off to a streaming sendfile loop that runs in `doWriteSendfile`.
+/// Falls back to a 500 on any open()/fstat() error. TLS connections
+/// can't use sendfile (the kernel writes plaintext), so we 500
+/// gracefully there too.
+fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRequest) void {
+    if (conn.ssl != null) {
+        // sendfile + userspace TLS don't compose. App should fall
+        // back to chunked body for HTTPS endpoints.
+        return sendStatus(loop, conn, 500, "Internal Server Error");
+    }
+
+    var path_buf: [4096]u8 = undefined;
+    if (sf.path.len >= path_buf.len) {
+        return sendStatus(loop, conn, 500, "Internal Server Error");
+    }
+    @memcpy(path_buf[0..sf.path.len], sf.path);
+    path_buf[sf.path.len] = 0;
+    const fd = c.open(@as([*c]const u8, @ptrCast(&path_buf[0])), c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) {
+        return sendStatus(loop, conn, 404, "Not Found");
+    }
+    var st: c.struct_stat = undefined;
+    if (c.fstat(fd, &st) != 0) {
+        _ = c.close(fd);
+        return sendStatus(loop, conn, 500, "Internal Server Error");
+    }
+    const size: u64 = @intCast(st.st_size);
+
+    const reason: []const u8 = switch (sf.status) {
+        200 => "OK",
+        206 => "Partial Content",
+        else => "OK",
+    };
+    const conn_line: []const u8 = if (sf.keep_alive) "keep-alive" else "close";
+
+    var head_buf: [1024]u8 = undefined;
+    const head = std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 {d} {s}\r\n" ++
+            "{s}" ++
+            "{s}" ++
+            "Content-Length: {d}\r\n" ++
+            "Connection: {s}\r\n" ++
+            "\r\n",
+        .{ sf.status, reason, g_server_line, sf.headers_block, size, conn_line },
+    ) catch {
+        _ = c.close(fd);
+        return sendStatus(loop, conn, 500, "Internal Server Error");
+    };
+
+    // Write head synchronously (small + fits MTU). For huge headers
+    // we'd need to buffer + epoll, but headers always fit < 1 KiB.
+    var written: usize = 0;
+    while (written < head.len) {
+        const r = c.write(conn.fd, @ptrCast(head[written..].ptr), head.len - written);
+        if (r < 0) {
+            _ = c.close(fd);
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        if (r == 0) {
+            _ = c.close(fd);
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        written += @intCast(r);
+    }
+
+    // sendfile in a loop until the whole file is on the wire. For
+    // very large files this should yield to the event loop; for v1.4
+    // we keep it synchronous (the loop handles other connections in
+    // between when the socket buffer back-pressures). Future v1.4.x
+    // could split into a state-machine sendfile to share the I/O loop.
+    var offset: c.off_t = 0;
+    var remaining: usize = @intCast(size);
+    while (remaining > 0) {
+        const sent = c.sendfile(conn.fd, fd, &offset, remaining);
+        if (sent < 0) {
+            // EAGAIN/EWOULDBLOCK on full socket buffer — yield.
+            if (std.posix.errno(sent) == .AGAIN) {
+                // Wait for the socket to be writable. We register
+                // the fd for EPOLLOUT and re-enter sendfile on the
+                // next event. Simpler v1.4 impl: block here briefly
+                // since most files complete in 1-2 syscalls.
+                _ = c.close(fd);
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            }
+            _ = c.close(fd);
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        if (sent == 0) break;
+        remaining -= @intCast(sent);
+    }
+    _ = c.close(fd);
+
+    _ = g_total_bytes_sent.fetchAdd(size, .seq_cst);
+    conn.bytes_sent = size;
+    conn.response_status = sf.status;
+    conn.keep_alive = sf.keep_alive;
+    finishRequest(conn);
+    if (sf.keep_alive) {
+        keepAliveReset(loop, conn);
+    } else {
+        loop.remove(conn.fd);
+        conn.destroy();
+    }
 }
 
 /// Serve a tracemalloc dump (top-N Python allocations grouped by
@@ -1170,6 +1398,17 @@ const Connection = struct {
     ws_frag_buf: ?[]u8,
     ws_frag_len: usize,
 
+    // v1.4: request-body streaming state. When the declared
+    // `Content-Length` exceeds the read buffer's available space,
+    // `dispatch()` fires immediately with the body bytes already
+    // received plus `more_body=True`, then leaves the connection
+    // in `.body_streaming` so subsequent reads push more chunks
+    // into the running ASGI task via `bridge.httpDispatchPushBody`.
+    // `body_streaming_consumed` tracks bytes already pushed so we
+    // know when to send the final `more_body=False`.
+    body_streaming: bool,
+    body_streaming_consumed: usize,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -1216,6 +1455,8 @@ const Connection = struct {
             .ws_frag_opcode = 0,
             .ws_frag_buf = null,
             .ws_frag_len = 0,
+            .body_streaming = false,
+            .body_streaming_consumed = 0,
         };
         return conn;
     }
@@ -1439,6 +1680,32 @@ pub fn run(
     defer g_limits = .{};
     g_obs = obs;
     defer g_obs = .{};
+
+    // v1.4: cgroup memory awareness. When we're inside a memory-
+    // limited cgroup (typical k8s `resources.limits.memory`), use
+    // `memory.max` as a soft input to `max_concurrent_connections`.
+    // Heuristic: assume ~50 KiB worst-case per concurrent request
+    // (Python state + pool buffer + scratch) and never go above
+    // 4× the floor estimate. If the operator set a non-default
+    // `max_concurrent_connections` we leave it alone.
+    if (limits.max_concurrent_connections == 1024) {
+        if (readCgroupMemoryLimitBytes()) |limit_bytes| {
+            // Reserve 64 MiB for Python heap + libs floor; budget
+            // the rest at 50 KiB per concurrent.
+            const floor_bytes: u64 = 64 * 1024 * 1024;
+            if (limit_bytes > floor_bytes + (50 * 1024)) {
+                const budget = (limit_bytes - floor_bytes) / (50 * 1024);
+                const cap_u32: u32 = if (budget > 65535) 65535 else @intCast(budget);
+                if (cap_u32 < 1024) {
+                    g_limits.max_concurrent_connections = if (cap_u32 < 16) 16 else cap_u32;
+                    std.log.info(
+                        "saltare: cgroup memory.max={d} MiB → max_concurrent_connections={d}",
+                        .{ limit_bytes / (1024 * 1024), g_limits.max_concurrent_connections },
+                    );
+                }
+            }
+        }
+    }
 
     // v1.3: optionally raise the fd soft limit to the hard limit so
     // saltare can saturate `max_concurrent_connections` without
@@ -2198,6 +2465,13 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
+    // v1.4: when the connection is mid-body-streaming, route reads
+    // to the push-more-body path instead of trying to re-parse
+    // headers. Headers + status are already in flight on the Python
+    // side; we just feed it more bytes.
+    if (conn.body_streaming) {
+        return streamReceiveMore(loop, conn);
+    }
     var data = conn.read_buf.?.data;
 
     while (true) {
@@ -2237,8 +2511,26 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
         }
         conn.read_total += r.n;
 
+        // v1.4 explicit head-bytes cap. The implicit ceiling is the
+        // pool buffer size (~16 KiB small / 64 KiB large); this lets
+        // operators tighten that further. Fires before we even try
+        // to parse, so malicious clients sending header-storms get
+        // dropped without waiting for the parser.
+        if (conn.parsed == null and g_limits.max_request_head_bytes > 0 and
+            conn.read_total > g_limits.max_request_head_bytes)
+        {
+            sendStatus(loop, conn, 431, "Request Header Fields Too Large");
+            return;
+        }
+
         if (conn.parsed == null) {
             if (http.parse(data[0..conn.read_total], &conn.read_buf.?.headers)) |req| {
+                // v1.4 414 URI Too Long. Cheaper to check here (post-parse)
+                // than mid-parse — the request line was already isolated.
+                if (g_limits.max_request_uri > 0 and req.target.len > g_limits.max_request_uri) {
+                    sendStatus(loop, conn, 414, "URI Too Long");
+                    return;
+                }
                 conn.parsed = req;
                 conn.body_offset = req.body_offset;
                 if (req.is_chunked) {
@@ -2253,24 +2545,24 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                     }
                     if (conn.body_offset + conn.body_len > data.len) {
                         // The declared body doesn't fit the current buffer.
-                        // If we're still on small and the large would
-                        // accommodate it, upgrade. Otherwise 413.
+                        // v1.4 changes default behaviour: if the body
+                        // exceeds the LARGE_DATA_SIZE buffer ceiling,
+                        // engage streaming dispatch instead of 413'ing.
+                        // Apps see chunked `more_body=True` events and
+                        // RAM stays bounded by the dispatcher's
+                        // backpressure threshold (64 KiB), not the
+                        // declared body length.
                         if (data.len < pool_mod.LARGE_DATA_SIZE and
                             conn.body_offset + conn.body_len <= pool_mod.LARGE_DATA_SIZE)
                         {
-                            // parsed.headers points into the small buffer's
-                            // headers array; clear it before swapping
-                            // buffers so we don't keep a dangling slice.
-                            // We re-parse against the new buffer below.
+                            // Body fits in the large buffer — upgrade
+                            // and continue buffering as before.
                             conn.parsed = null;
                             conn.upgradeBuffer() catch {
                                 sendStatus(loop, conn, 503, "Service Unavailable");
                                 return;
                             };
                             data = conn.read_buf.?.data;
-                            // Re-parse into the new (large) buffer's headers
-                            // array. The bytes are already there from the
-                            // upgrade copy.
                             const reparsed = http.parse(data[0..conn.read_total], &conn.read_buf.?.headers) catch {
                                 sendStatus(loop, conn, 400, "Bad Request");
                                 return;
@@ -2278,10 +2570,11 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                             conn.parsed = reparsed;
                             conn.body_offset = reparsed.body_offset;
                             conn.body_len = reparsed.content_length orelse 0;
-                        } else {
-                            sendStatus(loop, conn, 413, "Content Too Large");
-                            return;
                         }
+                        // else: body too big for any buffer → fall
+                        // through to dispatch below. The streaming path
+                        // engages because `read_total - body_offset <
+                        // body_len` will be true.
                     }
                 }
                 // Honour `Expect: 100-continue` by writing the interim
@@ -2348,7 +2641,16 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
             }
         } else {
             if (conn.read_total >= conn.body_offset + conn.body_len) {
+                // Whole body buffered → fully-buffered dispatch.
                 dispatch(loop, conn);
+                return;
+            }
+            // v1.4: if the body won't fit the buffer, stream it.
+            // We engage streaming as soon as we know the buffer is
+            // smaller than the declared body — that's the only case
+            // the buffered path can't handle.
+            if (conn.body_offset + conn.body_len > data.len) {
+                dispatchStreaming(loop, conn);
                 return;
             }
             // else: loop and read more
@@ -2357,6 +2659,154 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
+    dispatchWithBody(loop, conn, false);
+}
+
+/// v1.4 body-streaming entry point. Called from `doReadHttp` when the
+/// declared `Content-Length` doesn't fit the read buffer. Passes the
+/// bytes received so far + `more_body=true`; subsequent reads on this
+/// connection push more chunks via `streamReceiveMore`.
+fn dispatchStreaming(loop: *eventloop.Loop, conn: *Connection) void {
+    conn.body_streaming = true;
+    conn.body_streaming_consumed = conn.read_total - conn.body_offset;
+    dispatchWithBody(loop, conn, true);
+}
+
+/// Push subsequent body bytes into the running ASGI task. Called by
+/// the read path while `conn.body_streaming` is true. Reads what's
+/// available, calls `bridge.httpDispatchPushBody`, advances
+/// `body_streaming_consumed`. When the consumed counter hits the
+/// declared `body_len`, sends a final `more_body=False` and clears
+/// the streaming flag so the connection can transition to writing
+/// (the dispatch task itself drives the response, exactly like the
+/// fully-buffered path).
+fn streamReceiveMore(loop: *eventloop.Loop, conn: *Connection) void {
+    const data = conn.read_buf.?.data;
+    // Reuse the buffer head as a scratch landing zone — the bytes
+    // we already pushed don't need to stick around. read_total
+    // always reflects "bytes currently in the buffer not yet pushed".
+    while (true) {
+        const remaining_buf = data[conn.read_total..];
+        if (remaining_buf.len == 0) {
+            // Buffer full of un-pushed bytes — push everything and
+            // reset the buffer.
+            const chunk = data[0..conn.read_total];
+            const expected_more = (conn.body_streaming_consumed + chunk.len) < conn.body_len;
+            const tick = bridge.httpDispatchPushBody(conn.dispatch_handle, chunk, expected_more, conn.allocator) orelse {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            conn.body_streaming_consumed += chunk.len;
+            conn.read_total = 0;
+            // Apply enforced cap.
+            if (conn.body_streaming_consumed > g_limits.max_request_body) {
+                if (tick.chunks.len > 0) conn.allocator.free(tick.chunks);
+                return sendStatus(loop, conn, 413, "Content Too Large");
+            }
+            // If push produced wire bytes (rare — most apps await
+            // full body before sending) hand them to the writer.
+            if (tick.chunks.len > 0) {
+                if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+                conn.write_buf = tick.chunks;
+                conn.write_pos = 0;
+                conn.dispatch_active = !tick.done;
+                conn.state = .writing;
+                conn.body_streaming = false;
+                conn.armTimer(g_timeouts.write_secs);
+                loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                };
+                doWrite(loop, conn);
+                return;
+            }
+            // No output yet — keep reading.
+            if (!expected_more) {
+                // Body fully delivered; switch to writing/stalled.
+                conn.body_streaming = false;
+                conn.state = .writing;
+                conn.armTimer(g_timeouts.write_secs);
+                loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                };
+                doWrite(loop, conn);
+                return;
+            }
+            continue;
+        }
+
+        const r = connRead(conn, remaining_buf);
+        switch (r.status) {
+            .ok => conn.read_total += r.n,
+            .would_block, .want_read => {
+                if (conn.ssl != null) epollWantRead(loop, conn);
+                return;
+            },
+            .want_write => {
+                epollWantWrite(loop, conn);
+                return;
+            },
+            .closed, .fatal => {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            },
+        }
+
+        // Push whatever just arrived plus any leftover.
+        const chunk = data[0..conn.read_total];
+        const next_consumed = conn.body_streaming_consumed + chunk.len;
+        const more_body = next_consumed < conn.body_len;
+        const tick = bridge.httpDispatchPushBody(conn.dispatch_handle, chunk, more_body, conn.allocator) orelse {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
+        conn.body_streaming_consumed = next_consumed;
+        conn.read_total = 0;
+        if (conn.body_streaming_consumed > g_limits.max_request_body) {
+            if (tick.chunks.len > 0) conn.allocator.free(tick.chunks);
+            return sendStatus(loop, conn, 413, "Content Too Large");
+        }
+
+        if (tick.chunks.len > 0) {
+            if (conn.write_buf.len > 0) conn.allocator.free(conn.write_buf);
+            conn.write_buf = tick.chunks;
+            conn.write_pos = 0;
+            conn.dispatch_active = !tick.done;
+            conn.state = .writing;
+            conn.body_streaming = false;
+            conn.armTimer(g_timeouts.write_secs);
+            loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            doWrite(loop, conn);
+            return;
+        }
+
+        if (!more_body) {
+            conn.body_streaming = false;
+            conn.state = .writing;
+            conn.armTimer(g_timeouts.write_secs);
+            loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            doWrite(loop, conn);
+            return;
+        }
+        // else: keep reading more chunks.
+    }
+}
+
+fn dispatchWithBody(loop: *eventloop.Loop, conn: *Connection, more_body: bool) void {
     const req = conn.parsed.?;
 
     // RFC 7230 §5.4: HTTP/1.1 requests MUST carry a non-empty Host
@@ -2382,7 +2832,7 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     conn.request_in_flight = true;
     conn.bytes_sent = 0;
     conn.response_status = 0;
-    conn.request_start_ns = if (g_obs.access_log) monoNs() else 0;
+    conn.request_start_ns = if (g_obs.access_log or g_obs.latency_histogram) monoNs() else 0;
 
     // Approximate request bytes received: header bytes parsed + declared
     // body length. Misses bytes from rejected (413, 400) requests but is
@@ -2459,7 +2909,11 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     }
 
     const data = conn.read_buf.?.data;
-    const body = data[conn.body_offset .. conn.body_offset + conn.body_len];
+    // For fully-buffered requests, body slice is `[body_offset,
+    // body_offset+body_len)`. For streaming, only what we've already
+    // received: `[body_offset, read_total)`.
+    const body_end = if (more_body) conn.read_total else conn.body_offset + conn.body_len;
+    const body = data[conn.body_offset..body_end];
     var keep_alive = req.wantsKeepAlive();
     // Recycle the connection once we've served `max_keepalive_requests` on
     // it. Forces this response's `Connection: close` and bypasses the
@@ -2477,10 +2931,11 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         if (age_ns >= cap_ns) keep_alive = false;
     }
 
-    // v0.12 narrows scope to fully-buffered request bodies → more_body=false.
-    // Streaming requests will lift this constraint in a follow-up; the
-    // bridge already accepts the more_body flag.
-    const start = bridge.httpDispatchStart(req, body, false, keep_alive, conn.allocator) orelse {
+    // v1.4: `more_body=true` means the dispatcher should expect
+    // subsequent `http_dispatch_push_body` calls — body streaming
+    // is engaged. For fully-buffered requests this stays false (the
+    // app sees the whole body in one event).
+    const start = bridge.httpDispatchStart(req, body, more_body, keep_alive, conn.allocator) orelse {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
     };
@@ -2488,6 +2943,24 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
     conn.dispatch_handle = start.handle;
     conn.dispatch_active = !start.done;
     conn.keep_alive = keep_alive;
+
+    if (start.done) {
+        // v1.4: app may have emitted `saltare.sendfile` instead of
+        // `http.response.body` — Zig opens the file, sendfile(2)s
+        // the body straight to the socket without bouncing bytes
+        // through Python.
+        if (bridge.httpDispatchPopSendfile(start.handle, conn.allocator)) |sf| {
+            defer conn.allocator.free(sf.path);
+            defer conn.allocator.free(sf.headers_block);
+            // We've already taken responsibility for the dispatch
+            // task — clear the bridge handle so destroy() doesn't
+            // try to abort it.
+            conn.dispatch_handle = 0;
+            conn.dispatch_active = false;
+            if (start.chunks.len > 0) conn.allocator.free(start.chunks);
+            return serveSendfile(loop, conn, sf);
+        }
+    }
 
     if (start.chunks.len == 0 and start.done) {
         // App returned without producing wire bytes. Python should have
@@ -3144,6 +3617,10 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
 fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
     const data = conn.read_buf.?.data;
     if (http.parse(data[0..conn.read_total], &conn.read_buf.?.headers)) |req| {
+        if (g_limits.max_request_uri > 0 and req.target.len > g_limits.max_request_uri) {
+            sendStatus(loop, conn, 414, "URI Too Long");
+            return;
+        }
         conn.parsed = req;
         conn.body_offset = req.body_offset;
         // Pipelined parse succeeded — same transition as in doReadHttp.

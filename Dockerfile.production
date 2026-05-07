@@ -50,23 +50,30 @@ FROM quay.io/pypa/${MANYLINUX_TAG} AS production
 ARG PYTHON_TAG
 ENV PATH=/opt/python/${PYTHON_TAG}/bin:${PATH}
 
-# jemalloc fragments far less than glibc's per-arena malloc on long-lived
-# servers — typical RSS saving on top of MALLOC_ARENA_MAX=2 is 5–15 MiB.
-RUN dnf install -y jemalloc && dnf clean all
+# jemalloc + mimalloc both available. v1.4 ships mimalloc as default
+# (better gen-0 churn handling for short-lived alloc patterns); set
+# `LD_PRELOAD=/usr/lib64/libjemalloc.so.2` to switch back if your
+# workload prefers jemalloc's fragmentation curve.
+RUN dnf install -y jemalloc mimalloc && dnf clean all || \
+    dnf install -y jemalloc && dnf clean all
 
 COPY --from=builder /dist /dist
 RUN pip install --no-deps /dist/saltare-*.whl \
  && rm -rf /dist /root/.cache
 
-# LD_PRELOAD: glibc's malloc has 8 × n_cpus arenas by default; jemalloc has
-# one global heap with thread-local caches. For saltare's single-threaded
-# I/O loop, jemalloc's lower steady-state fragmentation matters more than
-# its multi-threaded scalability.
-ENV LD_PRELOAD=/usr/lib64/libjemalloc.so.2
-# Belt and braces: even with jemalloc loaded, set MALLOC_ARENA_MAX so
-# anything that bypasses the preload (e.g. a child process spawned with
-# a clean environment) inherits the saltare-recommended sizing.
-ENV MALLOC_ARENA_MAX=2
+# LD_PRELOAD: glibc's malloc has 8 × n_cpus arenas by default. mimalloc
+# does well on the gen-0 short-lived churn typical of an ASGI request,
+# while jemalloc tends to win on long-running services with steady-state
+# fragmentation. Both beat glibc default; pick by measuring under your
+# workload.
+#
+# Default: mimalloc if the package was installable above, jemalloc
+# otherwise. Override at `docker run -e LD_PRELOAD=...`.
+ENV LD_PRELOAD=/usr/lib64/libmimalloc.so.2
+# Belt and braces: even with the preload, set MALLOC_ARENA_MAX so
+# child processes spawned with a clean env (subprocesses, healthchecks)
+# inherit the saltare-recommended sizing.
+ENV MALLOC_ARENA_MAX=1
 
 WORKDIR /app
 

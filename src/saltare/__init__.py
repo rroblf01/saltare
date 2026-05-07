@@ -56,6 +56,18 @@ def run(
     ssl_verify_client: bool = False,
     tcp_fastopen_qlen: int = 0,
     gc_collect_every_n_requests: int = 0,
+    response_gzip: bool = False,
+    response_gzip_min_bytes: int = 512,
+    response_gzip_level: int = 6,
+    response_brotli: bool = False,
+    response_brotli_quality: int = 4,
+    response_zstd: bool = False,
+    response_zstd_level: int = 3,
+    request_decompression: bool = False,
+    max_request_uri: int = 8192,
+    max_request_head_bytes: int = 0,
+    latency_histogram: bool = False,
+    traceparent_propagation: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -171,6 +183,19 @@ def run(
     _dispatcher.set_server_timing(bool(server_timing))
     _dispatcher.set_server_header(server_header)
     _dispatcher.set_gc_collect_every_n(int(gc_collect_every_n_requests))
+    # v1.4 zlib wiring. Both off by default — when off, libz stays unloaded.
+    _dispatcher.set_response_gzip(
+        bool(response_gzip),
+        int(response_gzip_min_bytes),
+        int(response_gzip_level),
+    )
+    _dispatcher.set_response_brotli(bool(response_brotli), int(response_brotli_quality))
+    _dispatcher.set_response_zstd(bool(response_zstd), int(response_zstd_level))
+    _dispatcher.set_request_decompression(
+        bool(request_decompression),
+        int(max_request_body),
+    )
+    _dispatcher.set_traceparent_propagation(bool(traceparent_propagation))
 
     # `workers=0` is shorthand for "use what the kernel says we have,
     # capped at 4". Multi-worker past 4 hits diminishing returns under
@@ -224,4 +249,7 @@ def run(
         int(bool(ssl_verify_client)),
         int(tcp_fastopen_qlen),
         int(gc_collect_every_n_requests),
+        int(max_request_uri),
+        int(max_request_head_bytes),
+        int(bool(latency_histogram)),
     )

@@ -39,6 +39,7 @@ threadlocal var g_ws_event: ?*py.PyObject = null;
 threadlocal var g_ws_disconnect: ?*py.PyObject = null;
 threadlocal var g_tracemalloc_dump: ?*py.PyObject = null;
 threadlocal var g_tracemalloc_init: ?*py.PyObject = null;
+threadlocal var g_http_pop_sendfile: ?*py.PyObject = null;
 threadlocal var g_server_host: ?*py.PyObject = null;
 threadlocal var g_server_port: c_int = 0;
 /// "http" or "https" — built once at init so dispatch doesn't reallocate.
@@ -105,6 +106,8 @@ pub fn init(
     if (g_tracemalloc_dump == null) py.PyErr_Clear();
     g_tracemalloc_init = py.PyObject_GetAttrString(mod, "init_tracemalloc");
     if (g_tracemalloc_init == null) py.PyErr_Clear();
+    g_http_pop_sendfile = py.PyObject_GetAttrString(mod, "http_dispatch_pop_sendfile");
+    if (g_http_pop_sendfile == null) py.PyErr_Clear();
 
     g_server_host = py.PyUnicode_FromStringAndSize(
         @as([*c]const u8, @ptrCast(server_host.ptr)),
@@ -359,6 +362,95 @@ pub fn httpGlobalPump() void {
         return;
     };
     py.Py_DecRef(result);
+}
+
+pub const SendfileRequest = struct {
+    /// File path the app asked us to sendfile. Empty = no sendfile.
+    path: []u8,
+    status: u16,
+    keep_alive: bool,
+    /// Pre-formatted response headers ready to write to the wire,
+    /// minus the `Content-Length` (Zig adds that from `fstat`) and
+    /// minus the trailing `\r\n` terminator. Owned by `allocator`.
+    headers_block: []u8,
+};
+
+/// v1.4: after a dispatch completes (`done=true`), check whether the
+/// app emitted `saltare.sendfile`. Returns null when no sendfile was
+/// requested (caller writes the response normally). Otherwise returns
+/// the path, status, keep-alive flag, and a pre-formatted header
+/// block — server.zig opens the file, fstat()s for size, writes the
+/// status line + this header block + `Content-Length` + final `\r\n`,
+/// then `sendfile(2)`s the body.
+pub fn httpDispatchPopSendfile(handle: c_long, allocator: std.mem.Allocator) ?SendfileRequest {
+    if (g_http_pop_sendfile == null) return null;
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+    const result = py.PyObject_CallFunction(g_http_pop_sendfile.?, "l", handle) orelse {
+        py.PyErr_Clear();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+    if (py.PyTuple_Size(result) != 4) return null;
+    const path_obj = py.PyTuple_GetItem(result, 0) orelse return null;
+    var path_len: py.Py_ssize_t = 0;
+    const path_ptr = py.PyUnicode_AsUTF8AndSize(path_obj, &path_len);
+    if (path_ptr == null or path_len == 0) return null;
+
+    const status_obj = py.PyTuple_GetItem(result, 1) orelse return null;
+    const headers_obj = py.PyTuple_GetItem(result, 2) orelse return null;
+    const ka_obj = py.PyTuple_GetItem(result, 3) orelse return null;
+
+    const status_long = py.PyLong_AsLong(status_obj);
+    const status_u16: u16 = @intCast(status_long);
+    const keep_alive = py.PyObject_IsTrue(ka_obj) == 1;
+
+    // Copy path into caller-owned memory.
+    const plen: usize = @intCast(path_len);
+    const path_buf = allocator.alloc(u8, plen) catch return null;
+    @memcpy(path_buf, path_ptr[0..plen]);
+
+    // Build headers block: each header as `Name: Value\r\n`. Caller
+    // appends `Content-Length: <fstat-size>\r\n\r\n` after.
+    var hb: std.ArrayList(u8) = .empty;
+    defer hb.deinit(allocator);
+    const n_headers = py.PyList_Size(headers_obj);
+    var i: py.Py_ssize_t = 0;
+    while (i < n_headers) : (i += 1) {
+        const tup = py.PyList_GetItem(headers_obj, i) orelse break;
+        if (py.PyTuple_Size(tup) != 2) continue;
+        const name_obj = py.PyTuple_GetItem(tup, 0) orelse continue;
+        const value_obj = py.PyTuple_GetItem(tup, 1) orelse continue;
+        var nlen: py.Py_ssize_t = 0;
+        var vlen: py.Py_ssize_t = 0;
+        const nptr = py.PyBytes_AsString(name_obj);
+        nlen = py.PyBytes_Size(name_obj);
+        const vptr = py.PyBytes_AsString(value_obj);
+        vlen = py.PyBytes_Size(value_obj);
+        if (nptr == null or vptr == null) continue;
+        // Skip Content-Length / Transfer-Encoding / Connection — Zig owns these.
+        if (std.ascii.eqlIgnoreCase(nptr[0..@intCast(nlen)], "content-length")) continue;
+        if (std.ascii.eqlIgnoreCase(nptr[0..@intCast(nlen)], "transfer-encoding")) continue;
+        if (std.ascii.eqlIgnoreCase(nptr[0..@intCast(nlen)], "connection")) continue;
+        hb.appendSlice(allocator, nptr[0..@intCast(nlen)]) catch {
+            allocator.free(path_buf);
+            return null;
+        };
+        hb.appendSlice(allocator, ": ") catch {};
+        hb.appendSlice(allocator, vptr[0..@intCast(vlen)]) catch {};
+        hb.appendSlice(allocator, "\r\n") catch {};
+    }
+    const headers_block = hb.toOwnedSlice(allocator) catch {
+        allocator.free(path_buf);
+        return null;
+    };
+
+    return .{
+        .path = path_buf,
+        .status = status_u16,
+        .keep_alive = keep_alive,
+        .headers_block = headers_block,
+    };
 }
 
 /// Issue an internal `GET /` against the user app once lifespan startup
