@@ -70,6 +70,16 @@ keep the v1.3 RAM floor unchanged.
 - **`--traceparent-propagation`** — W3C Trace Context on
   `scope["traceparent"]` / `scope["tracestate"]` and echoed back on
   the response. Length cap on echo defends against header smuggling.
+- **`saltare[django]` extra** — `pip install saltare[django]` pulls
+  Django ≥ 4.2 alongside saltare and unlocks
+  `saltare.contrib.django`. Adding `"saltare.contrib.django"` to
+  `INSTALLED_APPS` (after `django.contrib.staticfiles`) overrides
+  `manage.py runserver` so dev traffic flows through saltare's
+  epoll/Zig core instead of `wsgiref`. Autoreload, `--noreload`, and
+  `STATIC_URL` (via `ASGIStaticFilesHandler` in `DEBUG`) keep
+  working. ASGI app resolution: `SALTARE_ASGI_APPLICATION` →
+  `ASGI_APPLICATION` → `get_asgi_application()`. Dev-only — production
+  still calls the `saltare` CLI directly, no Django dep at runtime.
 
 ### Compression negotiation
 

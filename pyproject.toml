@@ -37,6 +37,14 @@ dev = [
     "fastapi>=0.115",
     "websockets>=13",
 ]
+# `pip install saltare[django]` pulls Django alongside saltare and
+# unlocks the `saltare.contrib.django` integration: add
+# `"saltare.contrib.django"` to INSTALLED_APPS and `manage.py runserver`
+# runs the project under saltare (ASGI) instead of Django's bundled
+# wsgiref dev server. Autoreload + staticfiles handling are preserved.
+django = [
+    "django>=4.2",
+]
 
 [tool.scikit-build]
 minimum-version = "0.11"
