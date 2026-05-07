@@ -20,6 +20,9 @@ import time
 from typing import Any
 
 import httpx
+
+import platform as _platform
+_TIMING_FACTOR: float = 4.0 if _platform.machine() in {"aarch64", "arm64"} else 1.0
 import pytest
 
 
@@ -47,7 +50,7 @@ def _serve(app: Any, port: int, **kwargs) -> None:
         kwargs={"host": "127.0.0.1", "port": port, **kwargs},
         daemon=True,
     ).start()
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + 3.0 * _TIMING_FACTOR
     while time.monotonic() < deadline:
         try:
             with socket.socket() as s:
@@ -79,7 +82,7 @@ def test_max_request_uri_414():
     port = _free_port()
     _serve(_hello, port, max_request_uri=64)
     long_path = "/" + "x" * 200
-    with httpx.Client(timeout=2.0) as client:
+    with httpx.Client(timeout=2.0 * _TIMING_FACTOR) as client:
         r = client.get(f"http://127.0.0.1:{port}{long_path}")
     assert r.status_code == 414
 
@@ -87,7 +90,7 @@ def test_max_request_uri_414():
 def test_max_request_uri_default_allows_normal_paths():
     port = _free_port()
     _serve(_hello, port)
-    r = httpx.get(f"http://127.0.0.1:{port}/users/42", timeout=2.0)
+    r = httpx.get(f"http://127.0.0.1:{port}/users/42", timeout=2.0 * _TIMING_FACTOR)
     assert r.status_code == 200
 
 
@@ -101,7 +104,7 @@ def test_max_request_head_bytes_431():
     port = _free_port()
     _serve(_hello, port, max_request_head_bytes=512)
     big_header_value = "y" * 1024
-    with httpx.Client(timeout=2.0) as client:
+    with httpx.Client(timeout=2.0 * _TIMING_FACTOR) as client:
         r = client.get(
             f"http://127.0.0.1:{port}/",
             headers={"X-Big": big_header_value},
@@ -136,7 +139,7 @@ def test_traceparent_propagation_echo():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"traceparent": tp},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert r.headers.get("traceparent") == tp
@@ -151,7 +154,7 @@ def test_traceparent_disabled_by_default():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"traceparent": tp},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert "traceparent" not in {k.lower() for k in r.headers.keys()}
@@ -167,8 +170,8 @@ def test_latency_histogram_on_metrics():
     port = _free_port()
     _serve(_hello, port, metrics_path="/metrics", latency_histogram=True)
     # Drive at least one request so the histogram has an observation.
-    httpx.get(f"http://127.0.0.1:{port}/", timeout=2.0)
-    r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=2.0)
+    httpx.get(f"http://127.0.0.1:{port}/", timeout=2.0 * _TIMING_FACTOR)
+    r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=2.0 * _TIMING_FACTOR)
     assert r.status_code == 200
     body = r.text
     assert "saltare_request_duration_seconds_bucket" in body
@@ -180,8 +183,8 @@ def test_latency_histogram_on_metrics():
 def test_latency_histogram_disabled_by_default():
     port = _free_port()
     _serve(_hello, port, metrics_path="/metrics")
-    httpx.get(f"http://127.0.0.1:{port}/", timeout=2.0)
-    r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=2.0)
+    httpx.get(f"http://127.0.0.1:{port}/", timeout=2.0 * _TIMING_FACTOR)
+    r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=2.0 * _TIMING_FACTOR)
     body = r.text
     assert "saltare_request_duration_seconds_bucket" not in body
 
@@ -213,7 +216,7 @@ def test_streaming_response_gzip():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"Accept-Encoding": "gzip"},
-        timeout=5.0,
+        timeout=5.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert r.headers.get("content-encoding") == "gzip"

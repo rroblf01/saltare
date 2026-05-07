@@ -18,6 +18,11 @@ from typing import Any
 import httpx
 import pytest
 
+# QEMU-emulated aarch64 in CI runs 3-5× slower than native x86_64;
+# multiply timing budgets so the same tests pass everywhere.
+import platform as _platform
+_TIMING_FACTOR: float = 4.0 if _platform.machine() in {"aarch64", "arm64"} else 1.0
+
 
 def _free_port() -> int:
     with socket.socket() as s:
@@ -43,7 +48,7 @@ def _serve(app: Any, port: int, **kwargs) -> None:
         kwargs={"host": "127.0.0.1", "port": port, **kwargs},
         daemon=True,
     ).start()
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + 3.0 * _TIMING_FACTOR
     while time.monotonic() < deadline:
         try:
             with socket.socket() as s:
@@ -83,7 +88,7 @@ def test_sendfile_get_returns_body(static_file):
         })
 
     _serve(app, port)
-    r = httpx.get(f"http://127.0.0.1:{port}/file", timeout=5.0)
+    r = httpx.get(f"http://127.0.0.1:{port}/file", timeout=5.0 * _TIMING_FACTOR)
     assert r.status_code == 200
     assert r.headers["content-type"] == "application/octet-stream"
     assert int(r.headers["content-length"]) == len(expected)
@@ -107,7 +112,7 @@ def test_sendfile_head_strips_body(static_file):
         })
 
     _serve(app, port)
-    r = httpx.head(f"http://127.0.0.1:{port}/file", timeout=5.0)
+    r = httpx.head(f"http://127.0.0.1:{port}/file", timeout=5.0 * _TIMING_FACTOR)
     assert r.status_code == 200
     assert int(r.headers["content-length"]) == expected_size
     assert r.content == b""
@@ -129,7 +134,7 @@ def test_sendfile_404_when_path_missing():
         })
 
     _serve(app, port)
-    r = httpx.get(f"http://127.0.0.1:{port}/", timeout=5.0)
+    r = httpx.get(f"http://127.0.0.1:{port}/", timeout=5.0 * _TIMING_FACTOR)
     # The server returns a 5xx when it can't open the file. Either 404
     # or 500 is acceptable here; what matters is no body data.
     assert r.status_code >= 400
@@ -157,7 +162,7 @@ def test_sendfile_app_content_length_is_ignored(static_file):
         })
 
     _serve(app, port)
-    r = httpx.get(f"http://127.0.0.1:{port}/file", timeout=5.0)
+    r = httpx.get(f"http://127.0.0.1:{port}/file", timeout=5.0 * _TIMING_FACTOR)
     assert r.status_code == 200
     assert int(r.headers["content-length"]) == len(expected)
     assert r.content == expected

@@ -26,7 +26,15 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
+# Timing budgets are tuned for native x86_64. CI runners that build
+# aarch64 wheels under QEMU emulation are 3-5× slower; multiply
+# everything by `_TIMING_FACTOR` so the same tests pass on both.
+import platform as _platform
+_TIMING_FACTOR: float = 4.0 if _platform.machine() in {"aarch64", "arm64"} else 1.0
+
+
 def _wait_listening(port: int, timeout_s: float = 6.0) -> bool:
+    timeout_s *= _TIMING_FACTOR
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
@@ -88,7 +96,9 @@ def test_reload_supervisor_respawns_on_change(app_dir):
             # respawn cycle runs in seconds, not the prod 30-second
             # default. Otherwise the old child holds the listen
             # socket and the new child never gets a chance to bind.
-            "--shutdown-timeout", "1",
+            # On QEMU-emulated aarch64 in CI everything is 3-5× slower,
+            # so give drain a bit more headroom there.
+            "--shutdown-timeout", "3" if _TIMING_FACTOR > 1 else "1",
         ],
         cwd=str(app_dir),
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -105,9 +115,9 @@ def test_reload_supervisor_respawns_on_change(app_dir):
         contents = target.read_text().replace(b'b"v1"'.decode(), b'b"v2"'.decode())
         target.write_text(contents)
         # Give the supervisor: poll-detect (~0.1 s) + SIGTERM + child
-        # drain (1 s, set above) + respawn + rebind. 12 s is generous
-        # for slow CI hosts; locally it lands in 2–3 s.
-        deadline = time.monotonic() + 12.0
+        # drain + respawn + rebind. 12 s is generous for native hosts;
+        # QEMU-aarch64 multiplies by `_TIMING_FACTOR`.
+        deadline = time.monotonic() + 12.0 * _TIMING_FACTOR
         body = b""
         while time.monotonic() < deadline:
             try:

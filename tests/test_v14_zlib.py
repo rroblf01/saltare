@@ -14,6 +14,9 @@ import time
 from typing import Any
 
 import httpx
+
+import platform as _platform
+_TIMING_FACTOR: float = 4.0 if _platform.machine() in {"aarch64", "arm64"} else 1.0
 import pytest
 
 
@@ -41,7 +44,7 @@ def _serve(app: Any, port: int, **kwargs) -> None:
         kwargs={"host": "127.0.0.1", "port": port, **kwargs},
         daemon=True,
     ).start()
-    deadline = time.monotonic() + 3.0
+    deadline = time.monotonic() + 3.0 * _TIMING_FACTOR
     while time.monotonic() < deadline:
         try:
             with socket.socket() as s:
@@ -127,7 +130,7 @@ def test_response_gzip_compressible_content_type():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"Accept-Encoding": "gzip"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     # httpx auto-decodes by default; we want to see the wire.
@@ -146,7 +149,7 @@ def test_response_gzip_skipped_on_binary_content_type():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"Accept-Encoding": "gzip"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert "content-encoding" not in {k.lower() for k in r.headers.keys()}
@@ -159,7 +162,7 @@ def test_response_gzip_skipped_below_threshold():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"Accept-Encoding": "gzip"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert "content-encoding" not in {k.lower() for k in r.headers.keys()}
@@ -172,7 +175,7 @@ def test_response_gzip_disabled_by_default():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"Accept-Encoding": "gzip"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert "content-encoding" not in {k.lower() for k in r.headers.keys()}
@@ -185,7 +188,7 @@ def test_response_gzip_skipped_when_client_omits_accept_encoding():
     r = httpx.get(
         f"http://127.0.0.1:{port}/",
         headers={"Accept-Encoding": "identity"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert "content-encoding" not in {k.lower() for k in r.headers.keys()}
@@ -206,7 +209,7 @@ def test_request_decompression_gzip_body():
         f"http://127.0.0.1:{port}/",
         content=encoded,
         headers={"Content-Encoding": "gzip", "Content-Type": "application/json"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     assert r.content == payload
@@ -225,7 +228,7 @@ def test_request_decompression_overflow_returns_413():
         f"http://127.0.0.1:{port}/",
         content=encoded,
         headers={"Content-Encoding": "gzip"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 413
 
@@ -240,7 +243,7 @@ def test_request_decompression_disabled_by_default():
         f"http://127.0.0.1:{port}/",
         content=encoded,
         headers={"Content-Encoding": "gzip"},
-        timeout=2.0,
+        timeout=2.0 * _TIMING_FACTOR,
     )
     assert r.status_code == 200
     # App got the raw gzipped bytes (default behaviour preserved).
