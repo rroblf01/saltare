@@ -52,6 +52,10 @@ def run(
     tls_session_cache_size: int = 0,
     startup_request: bool = False,
     server_header: str | None = None,
+    ssl_ca_file: str | None = None,
+    ssl_verify_client: bool = False,
+    tcp_fastopen_qlen: int = 0,
+    gc_collect_every_n_requests: int = 0,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -166,6 +170,7 @@ def run(
     _dispatcher.set_request_id_header(request_id_header)
     _dispatcher.set_server_timing(bool(server_timing))
     _dispatcher.set_server_header(server_header)
+    _dispatcher.set_gc_collect_every_n(int(gc_collect_every_n_requests))
 
     # `workers=0` is shorthand for "use what the kernel says we have,
     # capped at 4". Multi-worker past 4 hits diminishing returns under
@@ -215,4 +220,8 @@ def run(
         int(tls_session_cache_size),
         int(bool(startup_request)),
         server_header,
+        ssl_ca_file,
+        int(bool(ssl_verify_client)),
+        int(tcp_fastopen_qlen),
+        int(gc_collect_every_n_requests),
     )

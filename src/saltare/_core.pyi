@@ -40,4 +40,8 @@ def serve(
     tls_session_cache_size: int = ...,
     startup_request: int = ...,
     server_header: str | None = ...,
+    ssl_ca_file: str | None = ...,
+    ssl_verify_client: int = ...,
+    tcp_fastopen_qlen: int = ...,
+    gc_collect_every_n_requests: int = ...,
 ) -> None: ...

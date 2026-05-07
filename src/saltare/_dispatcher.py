@@ -65,6 +65,14 @@ _request_id_header: bytes | None = None
 # response. Cost ~0 RAM (one float64 per in-flight request); ~1 µs CPU.
 _server_timing_enabled = False
 
+# v1.3: per-N-requests `gc.collect(0)` cadence. 0 = leave gen-0 to
+# CPython's default thresholds. Non-zero means "run a gen-0 sweep
+# every N completed dispatches" — clears short-lived cyclic objects
+# before they get promoted to gen-1, which keeps the gen-1 set small
+# and the eventual full-gen sweep cheap. Each sweep is tens of µs.
+_gc_collect_every_n: int = 0
+_dispatch_counter: int = 0
+
 
 def set_proxy_headers(enabled: bool) -> None:
     """Toggle X-Forwarded-For / X-Forwarded-Proto handling. Called by the
@@ -87,6 +95,12 @@ def set_server_timing(enabled: bool) -> None:
     """Toggle the `Server-Timing: total;dur=<ms>` response header."""
     global _server_timing_enabled
     _server_timing_enabled = bool(enabled)
+
+
+def set_gc_collect_every_n(n: int) -> None:
+    """Schedule `gc.collect(0)` every N dispatches. 0 disables."""
+    global _gc_collect_every_n
+    _gc_collect_every_n = max(0, int(n))
 
 
 def _ensure_state() -> threading.local:
@@ -804,6 +818,16 @@ def _release_http_state(s: "_HttpState") -> None:
         # `task` and `out_headers` are released-by-reset on the next
         # acquire; we don't have to wipe them now. Just append.
         _http_state_pool.append(s)
+    # v1.3: optional periodic gen-0 sweep. Cheap (~tens of µs), keeps
+    # short-lived cyclic objects from accumulating in gen-1. No-op when
+    # disabled (`gc_collect_every_n_requests=0`).
+    if _gc_collect_every_n:
+        global _dispatch_counter
+        _dispatch_counter += 1
+        if _dispatch_counter >= _gc_collect_every_n:
+            _dispatch_counter = 0
+            import gc as _gc
+            _gc.collect(0)
 
 
 class _HttpState:
@@ -1194,14 +1218,22 @@ def http_dispatch_start(
     headers = raw_headers
     effective_scheme = scheme
     effective_client: tuple[str, int] | None = None
+    effective_server: tuple[str, int] = (server_host, server_port)
 
     if _proxy_headers_enabled:
-        # nginx convention: `X-Real-IP` carries a single client IP,
-        # whereas `X-Forwarded-For` is the comma-separated chain. If
-        # both are present, X-Real-IP wins (most-specific). When only
-        # one is set, that one is used.
+        # Source-precedence (most-specific first):
+        #   1. RFC 7239 `Forwarded:` (`for=...;proto=...;host=...`)
+        #   2. nginx `X-Real-IP` (single IP)
+        #   3. `X-Forwarded-For` (comma-separated chain, leftmost = client)
+        # plus optional `X-Forwarded-Proto` and `X-Forwarded-Host` for
+        # scheme + scope["server"]. We trust whatever the immediate
+        # peer (assumed: a hardened reverse proxy) sent.
         x_real_ip: bytes | None = None
         x_forwarded_for: bytes | None = None
+        x_forwarded_host: bytes | None = None
+        forwarded_for: bytes | None = None
+        forwarded_proto: bytes | None = None
+        forwarded_host: bytes | None = None
         for name, value in headers:
             if name == b"x-real-ip":
                 x_real_ip = value
@@ -1211,15 +1243,57 @@ def http_dispatch_start(
                 proto = value.strip().lower()
                 if proto in (b"http", b"https"):
                     effective_scheme = proto.decode("ascii")
-        # Pick the more-specific source.
+            elif name == b"x-forwarded-host":
+                x_forwarded_host = value
+            elif name == b"forwarded":
+                # RFC 7239 — comma-separated list of `key=value;...`.
+                # Take the leftmost element (closest to original client).
+                first = value.split(b",", 1)[0]
+                for part in first.split(b";"):
+                    p = part.strip()
+                    if p.startswith(b"for="):
+                        forwarded_for = p[4:].strip(b"\"")
+                    elif p.startswith(b"proto="):
+                        forwarded_proto = p[6:].strip(b"\"")
+                    elif p.startswith(b"host="):
+                        forwarded_host = p[5:].strip(b"\"")
+        # Apply 7239 `proto=` if present.
+        if forwarded_proto:
+            fp = forwarded_proto.lower()
+            if fp in (b"http", b"https"):
+                effective_scheme = fp.decode("ascii")
+        # Apply 7239 `host=` then fall back to X-Forwarded-Host.
+        host_raw = forwarded_host if forwarded_host is not None else x_forwarded_host
+        if host_raw:
+            try:
+                host_str = host_raw.decode("ascii").strip().strip('"')
+                # `Host: example.com[:port]` form.
+                if ":" in host_str and not host_str.startswith("["):
+                    h, _, p = host_str.rpartition(":")
+                    try:
+                        effective_server = (h, int(p))
+                    except ValueError:
+                        effective_server = (host_str, server_port)
+                else:
+                    effective_server = (host_str, server_port)
+            except UnicodeDecodeError:
+                pass
+        # Client IP precedence.
         client_raw: bytes | None = None
-        if x_real_ip is not None:
+        if forwarded_for is not None:
+            # `for=192.0.2.1` or `for="[2001:db8::1]:42"` — strip
+            # bracket / port best-effort.
+            cf = forwarded_for.strip(b"\"")
+            if cf.startswith(b"["):
+                end = cf.find(b"]")
+                if end != -1:
+                    cf = cf[1:end]
+            elif b":" in cf and cf.count(b":") == 1:
+                cf = cf.split(b":", 1)[0]
+            client_raw = cf
+        elif x_real_ip is not None:
             client_raw = x_real_ip.strip()
         elif x_forwarded_for is not None:
-            # Convention: leftmost IP is the original client; entries
-            # to the right are intermediate proxies. We trust the
-            # whole chain here — saltare assumes the immediate peer
-            # is a trusted proxy that already filtered spoofed values.
             client_raw = x_forwarded_for.split(b",", 1)[0].strip()
         if client_raw:
             try:
@@ -1248,7 +1322,7 @@ def http_dispatch_start(
         "raw_path": raw_path,
         "query_string": query_string,
         "headers": headers,
-        "server": (server_host, server_port),
+        "server": effective_server,
         "client": effective_client,
         "root_path": "",
     }

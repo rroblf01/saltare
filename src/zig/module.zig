@@ -24,6 +24,23 @@ const c = @cImport({
     @cInclude("signal.h");
 });
 
+/// Set the process short-name visible in `ps -e -o comm`, `top`,
+/// `htop`. Linux-only (glibc `prctl(PR_SET_NAME)`); silently no-ops
+/// elsewhere. Truncated to 15 chars. v1.3 cosmetic helper for ops.
+fn setProcName(name: []const u8) void {
+    if (comptime builtin.os.tag != .linux) return;
+    var buf: [16]u8 = std.mem.zeroes([16]u8);
+    const n = @min(name.len, 15);
+    @memcpy(buf[0..n], name[0..n]);
+    _ = c.prctl(
+        c.PR_SET_NAME,
+        @as(c_ulong, @intFromPtr(&buf)),
+        @as(c_ulong, 0),
+        @as(c_ulong, 0),
+        @as(c_ulong, 0),
+    );
+}
+
 // glibc-only. We guard the call site with `builtin.os.tag == .linux` so the
 // extern reference is dead-code-eliminated on macOS / non-glibc targets and
 // the symbol is never resolved at link time on those platforms.
@@ -142,10 +159,14 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var tls_session_cache: c_uint = 0;
     var startup_request_flag: c_int = 0;
     var server_header_z: [*c]const u8 = null;
+    var ssl_ca_z: [*c]const u8 = null;
+    var ssl_verify_client_flag: c_int = 0;
+    var tcp_fastopen_qlen: c_int = 0;
+    var gc_collect_every_n: c_uint = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIiz",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiI",
         &app,
         &host_z,
         &port,
@@ -184,6 +205,10 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &tls_session_cache,
         &startup_request_flag,
         &server_header_z,
+        &ssl_ca_z,
+        &ssl_verify_client_flag,
+        &tcp_fastopen_qlen,
+        &gc_collect_every_n,
     ) == 0) {
         return null;
     }
@@ -220,6 +245,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .tcp_user_timeout_ms = tcp_user_timeout_ms,
         .auto_raise_nofile = auto_raise_nofile_flag != 0,
         .max_connection_lifetime_secs = @intCast(max_conn_lifetime),
+        .tcp_fastopen_qlen = tcp_fastopen_qlen,
     };
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
@@ -256,7 +282,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     // serve() time with a clear Python exception, not at first connection.
     var tls_ctx: ?*tls.Ctx = null;
     if (both_set) {
-        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache) catch |err| {
+        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache, ssl_ca_z, ssl_verify_client_flag != 0) catch |err| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(
                 &msg_buf,
@@ -286,6 +312,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
 
     // Single-worker path. Identical to v0.18 except `inherited_listen_fd`
     // is now an explicit `null` instead of an absent argument.
+    setProcName("saltare");
     return runSingleWorker(app.?, host, port, both_set, tls_ctx, timeouts, limits, obs, uds_path, null);
 }
 
@@ -397,6 +424,7 @@ fn runMultiWorker(
     // perma-shared, so the first GC cycle in each worker doesn't dirty
     // pages the kernel could otherwise keep CoW'd across all workers.
     freezePython();
+    setProcName("saltare:master");
 
     var spawned: usize = 0;
     while (spawned < n) : (spawned += 1) {
@@ -425,6 +453,12 @@ fn runMultiWorker(
             if (comptime builtin.os.tag == .linux) {
                 _ = c.prctl(c.PR_SET_PDEATHSIG, @as(c_ulong, c.SIGTERM), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
             }
+            // Operational ergonomics: rename in `ps` / `top` so
+            // operators see `saltare:wkr0` instead of the full
+            // `python -OO -m saltare main:app ...` command line.
+            var name_buf: [16]u8 = undefined;
+            const wname = std.fmt.bufPrint(&name_buf, "saltare:wkr{d}", .{spawned}) catch "saltare:wkr";
+            setProcName(wname);
             const result = runSingleWorker(app, host, port, is_tls, tls_ctx, timeouts, limits, obs, uds_path, listen_fd);
             // Child must exit — we don't return up the Python call stack.
             // Use the conventional `_exit` to skip atexit handlers (which

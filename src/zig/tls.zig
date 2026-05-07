@@ -49,6 +49,8 @@ const Funcs = struct {
     SSL_CTX_use_certificate_chain_file: *const fn (*Ctx, [*c]const u8) callconv(.c) c_int,
     SSL_CTX_use_PrivateKey_file: *const fn (*Ctx, [*c]const u8, c_int) callconv(.c) c_int,
     SSL_CTX_check_private_key: *const fn (*Ctx) callconv(.c) c_int,
+    SSL_CTX_load_verify_locations: *const fn (*Ctx, [*c]const u8, [*c]const u8) callconv(.c) c_int,
+    SSL_CTX_set_verify: *const fn (*Ctx, c_int, ?*anyopaque) callconv(.c) void,
     SSL_new: *const fn (*Ctx) callconv(.c) ?*Ssl,
     SSL_free: *const fn (*Ssl) callconv(.c) void,
     SSL_set_fd: *const fn (*Ssl, c_int) callconv(.c) c_int,
@@ -59,6 +61,10 @@ const Funcs = struct {
     SSL_pending: *const fn (*Ssl) callconv(.c) c_int,
     SSL_get_error: *const fn (*Ssl, c_int) callconv(.c) c_int,
 };
+
+const SSL_VERIFY_NONE: c_int = 0x00;
+const SSL_VERIFY_PEER: c_int = 0x01;
+const SSL_VERIFY_FAIL_IF_NO_PEER_CERT: c_int = 0x02;
 
 var funcs: ?Funcs = null;
 var libssl_handle: ?*anyopaque = null;
@@ -123,6 +129,8 @@ pub fn newContext(
     cert_file: [*c]const u8,
     key_file: [*c]const u8,
     session_cache_size: u32,
+    ca_file: [*c]const u8,
+    verify_client: bool,
 ) InitError!*Ctx {
     if (!loadFuncs()) return InitError.LibSslNotFound;
     const f = funcs.?;
@@ -149,6 +157,23 @@ pub fn newContext(
     }
     if (f.SSL_CTX_check_private_key(ctx) != 1) {
         return InitError.PrivateKeyMismatch;
+    }
+
+    // mTLS: load the CA bundle the operator wants to verify clients
+    // against. With `verify_client=true` we set
+    // `SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT` so any
+    // connection without a valid client cert is rejected at handshake.
+    if (ca_file != null) {
+        if (f.SSL_CTX_load_verify_locations(ctx, ca_file, null) != 1) {
+            return InitError.LoadCert;
+        }
+    }
+    if (verify_client) {
+        f.SSL_CTX_set_verify(
+            ctx,
+            SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+            null,
+        );
     }
 
     return ctx;

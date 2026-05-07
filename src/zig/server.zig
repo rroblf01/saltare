@@ -227,6 +227,12 @@ pub const Limits = struct {
     /// app or pinning Python heap fragments. Stricter than
     /// `max_keepalive_requests`, which is request-count based.
     max_connection_lifetime_secs: u32 = 0,
+    /// `TCP_FASTOPEN` server-side queue length. Zero disables. When
+    /// set, the kernel issues TFO cookies; subsequent connections
+    /// from the same client carry payload in the SYN, saving 1 RTT.
+    /// Linux ≥ 3.7. Recommended value: same as `listen_backlog` (256).
+    /// Wins are visible only when clients themselves opt into TFO.
+    tcp_fastopen_qlen: c_int = 0,
 };
 
 // ---------------------------------------------------------------------------
@@ -735,6 +741,9 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         \\# HELP saltare_process_resident_memory_bytes RSS of the worker, from /proc/self/status (Linux only; 0 elsewhere).
         \\# TYPE saltare_process_resident_memory_bytes gauge
         \\saltare_process_resident_memory_bytes {d}
+        \\# HELP saltare_health_state 0=healthy, 1=draining (SIGTERM received).
+        \\# TYPE saltare_health_state gauge
+        \\saltare_health_state {d}
         \\
     , .{
         open_conns,
@@ -745,6 +754,7 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         total_bytes_sent,
         total_bytes_recv,
         rss_bytes,
+        @as(u32, if (g_draining.load(.seq_cst)) 1 else 0),
     });
 
     var head_buf: [512]u8 = undefined;
@@ -953,12 +963,14 @@ fn dumpStats() void {
     const in_flight = g_in_flight.load(.seq_cst);
     const total_reqs = g_total_requests.load(.seq_cst);
     const rss_kib: u64 = if (comptime builtin.os.tag == .linux) (readVmRssBytes() / 1024) else 0;
+    const draining = g_draining.load(.seq_cst);
     var buf: [512]u8 = undefined;
     const out = std.fmt.bufPrint(
         &buf,
         "{{\"event\":\"saltare.stats\",\"open_conns\":{d},\"in_flight\":{d}," ++
-            "\"requests_total\":{d},\"rss_kib\":{d},\"rl_table_size\":{d}}}\n",
-        .{ open_conns, in_flight, total_reqs, rss_kib, g_rl_count },
+            "\"requests_total\":{d},\"rss_kib\":{d},\"rl_table_size\":{d}," ++
+            "\"draining\":{}}}\n",
+        .{ open_conns, in_flight, total_reqs, rss_kib, g_rl_count, draining },
     ) catch return;
     _ = c.write(2, out.ptr, out.len);
 }
@@ -1149,6 +1161,15 @@ const Connection = struct {
     /// what `max_keepalive_requests` (request-count based) catches.
     accepted_ns: i64,
 
+    // WebSocket fragmentation reassembly (RFC 6455 §5.4). Initial frame
+    // with FIN=0 saves its opcode here; subsequent continuation frames
+    // append to `ws_frag_buf`. The final continuation (FIN=1, opcode=0)
+    // delivers the reassembled message and frees the buffer. Capped to
+    // 1 MiB so a slow producer can't OOM us.
+    ws_frag_opcode: u8,
+    ws_frag_buf: ?[]u8,
+    ws_frag_len: usize,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -1192,6 +1213,9 @@ const Connection = struct {
             .request_in_flight = false,
             .last_activity_ns = 0,
             .accepted_ns = monoNs(),
+            .ws_frag_opcode = 0,
+            .ws_frag_buf = null,
+            .ws_frag_len = 0,
         };
         return conn;
     }
@@ -1213,6 +1237,7 @@ const Connection = struct {
         if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b, monoNs());
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
+        if (self.ws_frag_buf) |b| self.allocator.free(b);
         _ = c.close(self.fd);
         // Pair the per-IP connection counter inc'd at accept (no-op
         // when the cap was disabled or the peer is UDS).
@@ -1317,6 +1342,12 @@ fn bindTcpSocket(host: []const u8, port: u16) !c_int {
         return error.SetsockoptFailed;
     }
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    // TCP_FASTOPEN: opt-in. Kernel needs `net.ipv4.tcp_fastopen` set
+    // to a value that includes server-side support (3 enables both).
+    if (g_limits.tcp_fastopen_qlen > 0) {
+        var qlen = g_limits.tcp_fastopen_qlen;
+        _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_FASTOPEN, @ptrCast(&qlen), @sizeOf(c_int));
+    }
     if (c.listen(fd, g_limits.listen_backlog) != 0) return error.ListenFailed;
     return fd;
 }
@@ -1342,6 +1373,12 @@ fn bindTcpSocketV6(host: []const u8, port: u16) !c_int {
         return error.SetsockoptFailed;
     }
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    // TCP_FASTOPEN: opt-in. Kernel needs `net.ipv4.tcp_fastopen` set
+    // to a value that includes server-side support (3 enables both).
+    if (g_limits.tcp_fastopen_qlen > 0) {
+        var qlen = g_limits.tcp_fastopen_qlen;
+        _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_FASTOPEN, @ptrCast(&qlen), @sizeOf(c_int));
+    }
     if (c.listen(fd, g_limits.listen_backlog) != 0) return error.ListenFailed;
     return fd;
 }
@@ -1374,6 +1411,12 @@ fn bindUnixSocket(path: []const u8) !c_int {
     }
 
     if (c.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) != 0) return error.BindFailed;
+    // TCP_FASTOPEN: opt-in. Kernel needs `net.ipv4.tcp_fastopen` set
+    // to a value that includes server-side support (3 enables both).
+    if (g_limits.tcp_fastopen_qlen > 0) {
+        var qlen = g_limits.tcp_fastopen_qlen;
+        _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_FASTOPEN, @ptrCast(&qlen), @sizeOf(c_int));
+    }
     if (c.listen(fd, g_limits.listen_backlog) != 0) return error.ListenFailed;
     return fd;
 }
@@ -2702,15 +2745,16 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                 return;
             },
             .ok => |hdr| {
-                if (!hdr.fin or !hdr.masked) {
-                    // Continuation frames and unmasked client frames are
-                    // out of scope for v0.10 — close with protocol error.
+                if (!hdr.masked) {
+                    // RFC 6455: client→server frames MUST be masked.
                     wsTeardown(loop, conn);
                     return;
                 }
                 const total = hdr.header_len + hdr.payload_len;
                 if (total > data.len) {
-                    // Frame bigger than our buffer.
+                    // Frame bigger than our buffer. Will retry as
+                    // fragmentation handler if it's the start of a
+                    // legit fragmented message.
                     wsTeardown(loop, conn);
                     return;
                 }
@@ -2720,6 +2764,54 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                     // Inbound frame counts as activity for the keepalive
                     // gate — including pongs from earlier server pings.
                     conn.last_activity_ns = monoNs();
+                    // RFC 6455 §5.4: fragmented messages span multiple
+                    // frames. Control frames (opcode ≥ 8) interleave
+                    // and aren't allowed to be fragmented.
+                    const is_control = (hdr.opcode_raw & 0x08) != 0;
+                    if (!is_control) {
+                        if (!hdr.fin) {
+                            // First or middle fragment.
+                            if (handleWsFragment(conn, hdr, payload)) {
+                                // Compact and continue.
+                            } else {
+                                wsTeardown(loop, conn);
+                                return;
+                            }
+                            // Compact and read more.
+                            const leftover = conn.read_total - total;
+                            if (leftover > 0) {
+                                std.mem.copyForwards(u8, data[0..leftover], data[total..total + leftover]);
+                            }
+                            conn.read_total = leftover;
+                            continue;
+                        }
+                        if (hdr.opcode_raw == 0) {
+                            // Final continuation: assemble + deliver.
+                            if (!handleWsFragment(conn, hdr, payload)) {
+                                wsTeardown(loop, conn);
+                                return;
+                            }
+                            const assembled_op = conn.ws_frag_opcode;
+                            const assembled = conn.ws_frag_buf.?[0..conn.ws_frag_len];
+                            // Hand off to wsDeliverToApp; it copies
+                            // bytes to the Python side, so freeing
+                            // after is safe.
+                            wsDeliverToApp(loop, conn, assembled_op, assembled);
+                            conn.allocator.free(conn.ws_frag_buf.?);
+                            conn.ws_frag_buf = null;
+                            conn.ws_frag_len = 0;
+                            conn.ws_frag_opcode = 0;
+                            const leftover2 = conn.read_total - total;
+                            if (leftover2 > 0) {
+                                std.mem.copyForwards(u8, data[0..leftover2], data[total..total + leftover2]);
+                            }
+                            conn.read_total = leftover2;
+                            if (conn.protocol != .websocket) return;
+                            if (conn.state == .writing) return;
+                            continue;
+                        }
+                        // Single-frame text/binary (FIN=1, opcode 1|2).
+                    }
                     handleWsFrame(loop, conn, hdr, payload);
                     if (conn.protocol != .websocket) return;
 
@@ -2767,6 +2859,39 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
             },
         }
     }
+}
+
+/// RFC 6455 §5.4 fragmentation reassembly. Returns false on protocol
+/// violation (continuation without start, oversize, etc.) — caller
+/// tears down the connection. Successful return appends `payload` to
+/// the per-conn fragment buffer and tracks the original opcode.
+fn handleWsFragment(conn: *Connection, hdr: ws.Header, payload: []u8) bool {
+    const WS_FRAG_MAX: usize = 1024 * 1024; // 1 MiB cap
+    if (hdr.opcode_raw == 0) {
+        // Continuation frame — must follow a start.
+        if (conn.ws_frag_buf == null) return false;
+    } else if (hdr.opcode_raw == 1 or hdr.opcode_raw == 2) {
+        // Start of a new fragmented message — must NOT follow another
+        // unfinished start.
+        if (conn.ws_frag_buf != null) return false;
+        const buf = conn.allocator.alloc(u8, @max(payload.len, 4096)) catch return false;
+        conn.ws_frag_buf = buf;
+        conn.ws_frag_len = 0;
+        conn.ws_frag_opcode = hdr.opcode_raw;
+    } else {
+        return false;
+    }
+    const new_len = conn.ws_frag_len + payload.len;
+    if (new_len > WS_FRAG_MAX) return false;
+    var buf = conn.ws_frag_buf.?;
+    if (new_len > buf.len) {
+        const grown = conn.allocator.realloc(buf, @min(WS_FRAG_MAX, new_len * 2)) catch return false;
+        conn.ws_frag_buf = grown;
+        buf = grown;
+    }
+    @memcpy(buf[conn.ws_frag_len .. conn.ws_frag_len + payload.len], payload);
+    conn.ws_frag_len = new_len;
+    return true;
 }
 
 fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, payload: []u8) void {

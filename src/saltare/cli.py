@@ -64,6 +64,10 @@ def _ensure_optimized() -> None:
     # Setting it here, before exec, beats calling mallopt() mid-process
     # because the bootstrap allocations themselves stay in one arena.
     new_env.setdefault("MALLOC_ARENA_MAX", "1")
+    # CPython faulthandler dumps a stack on segfault / SIGABRT to
+    # stderr — invaluable for diagnosing native-extension crashes
+    # in production. Free; no measurable cost when nothing crashes.
+    new_env.setdefault("PYTHONFAULTHANDLER", "1")
     os.execvpe(
         sys.executable,
         [sys.executable, "-OO", "-m", "saltare"] + sys.argv[1:],
@@ -325,6 +329,23 @@ def main(argv: list[str] | None = None) -> None:
         help="override the `Server:` response header (empty string omits it entirely)",
     )
     parser.add_argument(
+        "--ssl-ca-file", type=str, default=None, metavar="PATH",
+        help="CA bundle for client-cert verification (mTLS)",
+    )
+    parser.add_argument(
+        "--ssl-verify-client",
+        action="store_true",
+        help="require + verify client cert against --ssl-ca-file (mTLS)",
+    )
+    parser.add_argument(
+        "--tcp-fastopen-qlen", type=int, default=0, metavar="N",
+        help="TCP_FASTOPEN server-side queue length (0 = disabled)",
+    )
+    parser.add_argument(
+        "--gc-collect-every-n-requests", type=int, default=0, metavar="N",
+        help="run gc.collect(0) every N completed dispatches (0 = leave-alone)",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -374,4 +395,8 @@ def main(argv: list[str] | None = None) -> None:
         tls_session_cache_size=args.tls_session_cache_size,
         startup_request=args.startup_request,
         server_header=args.server_header,
+        ssl_ca_file=args.ssl_ca_file,
+        ssl_verify_client=args.ssl_verify_client,
+        tcp_fastopen_qlen=args.tcp_fastopen_qlen,
+        gc_collect_every_n_requests=args.gc_collect_every_n_requests,
     )

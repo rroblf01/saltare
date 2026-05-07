@@ -23,6 +23,11 @@ pub const Opcode = enum(u4) {
 pub const Header = struct {
     fin: bool,
     opcode: Opcode,
+    /// Raw 4-bit opcode value as read from the wire. v1.3 added so the
+    /// fragmentation reassembler can distinguish "continuation"
+    /// (opcode_raw == 0) from "binary"/"text" (1, 2) without going via
+    /// the `Opcode` enum (whose `_` catch-all hides the distinction).
+    opcode_raw: u4,
     masked: bool,
     payload_len: usize,
     mask_key: [4]u8,
@@ -76,6 +81,7 @@ pub fn parseHeader(buf: []const u8) ParseResult {
     return .{ .ok = .{
         .fin = fin,
         .opcode = @enumFromInt(opcode_raw),
+        .opcode_raw = opcode_raw,
         .masked = masked,
         .payload_len = payload_len,
         .mask_key = mask_key,
