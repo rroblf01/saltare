@@ -33,6 +33,9 @@ def run(
     workers: int = 1,
     health_path: str | None = None,
     cors_preflight_allow_all: bool = False,
+    rate_limit_per_sec: int = 0,
+    rate_limit_burst: int = 100,
+    tracemalloc_path: str | None = None,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -118,6 +121,20 @@ def run(
                                Only enable if your app's CORS policy is
                                actually permissive — Zig doesn't read
                                your allow-list.
+        rate_limit_per_sec   — per-IP request rate ceiling. 0 disables.
+                               When set, peer IPs that exceed the rate get
+                               a 429 from Zig before the app sees them.
+                               Token bucket: refilled at this rate up to
+                               `rate_limit_burst`. Tracks up to 4096 IPs;
+                               beyond that, oldest entries evict.
+        rate_limit_burst     — burst ceiling for the rate limiter. Default
+                               100. Applied per IP.
+        tracemalloc_path     — if set (e.g. "/debug/tracemalloc"), saltare
+                               starts `tracemalloc.start(25)` at server
+                               init and answers that path with the top-30
+                               Python allocations. Diagnostic only;
+                               tracking has CPU + RAM cost (~5-10% RSS).
+                               The user app never sees the request.
 
     Listening on IPv6: pass an IPv6 address (with or without brackets)
     in `host`, e.g. `host="::"` to listen on all v6 interfaces or
@@ -152,4 +169,7 @@ def run(
         int(workers),
         health_path,
         int(bool(cors_preflight_allow_all)),
+        int(rate_limit_per_sec),
+        int(rate_limit_burst),
+        tracemalloc_path,
     )

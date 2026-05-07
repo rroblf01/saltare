@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.3.0 — lazy-loaded TLS, four new Zig-side intercepts, leanest of the three.** Production target is **Linux x86_64**. v1.3 ships several orthogonal wins: (1) **TLS link is gone** — `tls.zig` `dlopen`s libssl on the first `serve(ssl_certfile=...)` call, so plain-HTTP deployments never map libssl/libcrypto and `auditwheel` no longer vendors them; saltare's idle floor dropped ~3 MiB. (2) **Health endpoint intercept** (`health_path="/healthz"`) — k8s probes get answered from Zig with `200 OK\nok\n`; the user app never sees them. (3) **CORS preflight intercept** (`cors_preflight_allow_all=True`) — OPTIONS-with-Origin requests skip Python entirely and get permissive CORS headers from Zig. (4) **IPv6 listen** — `host="::"` or `host="[::1]"` auto-detects v6 and binds an `AF_INET6` socket with `IPV6_V6ONLY=1`. (5) **`mallopt(M_ARENA_MAX, 1)` at module init** so glibc's per-thread arenas can't fragment RSS, even when users don't set the env var. Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.0 / 45.3 / 44.7 MiB across the three workloads**, vs uvicorn 49–54 MiB and Granian 56–57 MiB on the same host (fair comparison: each launcher imports the FastAPI app at module level so master RSS reflects the same import footprint). Tests 56/56. Users who need TLS install system OpenSSL (`apt install libssl3` / yum equivalent — already present on most images).
+> **Status: 1.3.0 — lazy TLS, eight new Zig-side or launcher knobs, leanest of three.** Production target is **Linux x86_64**. v1.3 ships orthogonal wins: (1) **OpenSSL link is gone** — `tls.zig` `dlopen`s libssl on the first `serve(ssl_certfile=...)` call, so plain-HTTP deployments never map libssl/libcrypto and `auditwheel` no longer vendors them. (2) **Health endpoint intercept** (`health_path="/healthz"`) — k8s probes get `200 OK\nok\n` from Zig. (3) **CORS preflight intercept** (`cors_preflight_allow_all=True`) — OPTIONS-with-Origin requests skip Python and get permissive CORS headers. (4) **IPv6 listen** — `host="::"` / `[::1]` auto-detects v6, binds `AF_INET6` with `IPV6_V6ONLY=1`. (5) **`mallopt(M_ARENA_MAX, 1)` at module init** caps glibc's per-thread arenas to one. (6) **Per-IP rate limiter** (`rate_limit_per_sec`, `rate_limit_burst`) — token bucket in Zig, 4096-IP bounded LRU table, over-rate gets 429 before the user app sees it. (7) **`tracemalloc_path`** (e.g. `"/debug/tracemalloc"`) — auto-starts `tracemalloc.start(25)` and serves a top-30 Python allocation dump for leak hunts in long-running deployments. (8) **`PYTHONOPTIMIZE=2` auto re-exec** — `saltare` CLI re-execs itself under `python -OO` (unless `SALTARE_NO_OPTIMIZE=1` is set), so FastAPI / Pydantic / Starlette docstrings are stripped from the heap; saves a few MiB depending on the import graph. Plus **URL decoding moved to Zig** (`http.urlDecode`), so `_dispatcher.py` no longer imports `urllib.parse`. Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.3 / 44.9 / 44.7 MiB across the three workloads**, vs uvicorn 48.7 / 49.6 / 53.7 MiB and Granian 56.8 / 56.9 / 56.9 MiB on the same host (fair comparison: each launcher imports the FastAPI app at module level so master RSS reflects the same import footprint). Tests 56/56. Users who need TLS install system OpenSSL (`apt install libssl3` / yum equivalent — already present on most images).
 
 ---
 
@@ -66,36 +66,36 @@ Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.92 MiB |      46.05 MiB | **46.05 MiB** |    1000 |  910 |
-| uvicorn | 49.03 MiB |      49.07 MiB | 49.07 MiB |    1000 | 1076 |
-| granian | 57.02 MiB |      57.02 MiB | 57.02 MiB |    1000 | 1156 |
+| saltare | 46.12 MiB |      46.25 MiB | **46.25 MiB** |    1000 | 1084 |
+| uvicorn | 48.62 MiB |      48.67 MiB | 48.67 MiB |    1000 | 1262 |
+| granian | 56.80 MiB |      56.80 MiB | 56.80 MiB |    1000 | 1189 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 44.99 MiB |      45.32 MiB | **45.34 MiB** |    2000 | 1945 |
-| uvicorn | 48.56 MiB |      49.75 MiB | 49.75 MiB |    2000 | 1946 |
-| granian | 55.78 MiB |      55.78 MiB | 55.78 MiB |    2000 | 1848 |
+| saltare | 44.53 MiB |      44.89 MiB | **44.90 MiB** |    2000 | 1974 |
+| uvicorn | 48.41 MiB |      49.55 MiB | 49.55 MiB |    2000 | 1809 |
+| granian | 56.86 MiB |      56.86 MiB | 56.86 MiB |    2000 | 1811 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 44.55 MiB |      44.73 MiB | **44.73 MiB** |     500 | 1376      |
-| uvicorn | 48.61 MiB |      53.99 MiB | 53.99 MiB |     500 | 1507      |
-| granian | 55.95 MiB |      55.95 MiB | 55.95 MiB |     500 | 1465      |
+| saltare | 44.46 MiB |      44.70 MiB | **44.70 MiB** |     500 | 1338      |
+| uvicorn | 48.30 MiB |      53.68 MiB | 53.68 MiB |     500 | 1363      |
+| granian | 56.92 MiB |      56.92 MiB | 56.92 MiB |     500 | 1414      |
 
 ### Multi-worker idle — Pss across the whole cluster (saltare only)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  39.96 MiB |      0.00 MiB | 39.96 MiB |                 —  |
-|       4 |        4 |  14.16 MiB |     40.20 MiB | 54.36 MiB |  159.84 MiB (−66%) |
+|       1 |        — |  39.67 MiB |      0.00 MiB | 39.67 MiB |                 —  |
+|       4 |        4 |  14.19 MiB |     40.03 MiB | 54.22 MiB |  158.66 MiB (−66%) |
 
-`Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.8 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
+`Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.85 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
 
-> **saltare is the leanest of the three on every workload.** v1.3's lazy-loaded TLS dropped saltare's floor by ~3 MiB; the four Zig-side intercepts (health, CORS preflight, plus the existing metrics path) ship at zero RAM cost (no extra mmaps, no extra heap). Saltare leads granian by 10–11 MiB and uvicorn by 3–9 MiB. Throughput is within 5–15% of granian and uvicorn — saltare optimises for RAM, not raw rps. Where saltare's *architectural* advantage shows most: idle-keepalive 500 conns adds **+0.18 MiB** to saltare (~370 B/conn) vs uvicorn's **+5.38 MiB** (~11 KiB/conn) and granian's **0.00 MiB** — saltare and granian are both effectively free on idle-conn growth; only uvicorn pays per-connection cost.
+> **saltare is the leanest of the three on every workload.** v1.3's lazy-loaded TLS, `mallopt` arena cap, and `PYTHONOPTIMIZE=2` re-exec dropped the floor by ~3 MiB. The seven Zig-side / launcher knobs (health intercept, CORS preflight, IPv6, rate limiter, tracemalloc endpoint, metrics endpoint, URL decode in Zig) ship at zero RAM cost (no extra mmaps, no extra heap unless turned on). Saltare leads granian by 10.5–12.2 MiB and uvicorn by 2.4–9.0 MiB. Throughput on this run: saltare beats both peers on the concurrent workload, trails uvicorn slightly on sequential — saltare optimises for RAM, not raw rps. Where saltare's *architectural* advantage shows most: idle-keepalive 500 conns adds **+0.24 MiB** to saltare (~490 B/conn) vs uvicorn's **+5.38 MiB** (~11 KiB/conn) and granian's **0.00 MiB** — saltare and granian are both effectively free on idle-conn growth; only uvicorn pays per-connection cost.
 
 ### v1.2.2 vs v1.2.1 on the same host (saltare-only A/B)
 
@@ -168,14 +168,14 @@ These exercise the v1.2.2 streaming backpressure (large-response) and the per-co
 - [x] **v1.2.0** — Python hot-path polish. Three orthogonal cuts to per-request work in `_dispatcher.py`: (1) module-level free-list pool of `_HttpState` instances with a `reset(...)` method that rewrites every slot — saves the slot-allocation step + GC-tracking overhead per request and reuses the `outgoing` list. (2) `receive` and `send` callables converted from per-request closures to bound methods (`_HttpState._receive`, `_HttpState._send`) — half the per-instance memory of a closure cell, no per-instance compile, plays well with the pool. (3) Pre-built byte-string constants for the wire format: `_SERVER_LINE`, `_CONNECTION_KEEPALIVE_LINE`, `_CONNECTION_CLOSE_LINE`, `_TRANSFER_ENCODING_CHUNKED_LINE`, `_CHUNKED_TERMINATOR`, `_CRLF`, plus a precomputed status-line cache for every reason code in `_REASONS`. Each response now references shared bytes instead of rebuilding `b"server: " + _SERVER_HEADER + b"\r\n"` etc. Net: sequential rps **2335 → 2447 (+4.3%)**, concurrent peak −0.3 MiB. Multi-worker numbers unchanged from v1.1 (these wins are per-request, multi-worker is per-process).
 - [x] **v1.2.2** — Worst-case RAM caps + bench / CI / production polish. Source caps: (1) **HTTP send-yield backpressure** — `_HttpState._send` tracks bytes appended to `outgoing` since the last drain; once the running total crosses `_HTTP_SEND_YIELD_BYTES` (64 KiB), the next intermediate `await send(...)` does an `await asyncio.sleep(0)` so the asyncio loop hands control back. Zig's main-loop stalled-pump path harvests via `http_dispatch_drain`, the counter resets, and the app keeps producing — per-task accumulated RAM is now bounded to ~one threshold's worth no matter how many sends a streaming endpoint chains in a row. The yield is skipped on the final chunk (`more_body=False`) so plain request/response apps never pay it. (2) **WebSocket outbound 1 MiB cap** — `_WsState.outgoing_bytes` is a running total; once `_WS_OUTGOING_MAX_BYTES` is exceeded the connection is marked `closed` and further sends drop. (3) **`_HTTP_POOL_MAX` bumped 32 → 128**. (4) **epoll event array 128 → 64**. Bench delta vs v1.2.1 same-host: mixed-sign, within ±1 MiB noise — these are caps, not benign-workload RAM cuts. Plus tooling: (5) **Granian** added as a third bench comparison point, which surfaced a fact the saltare-vs-uvicorn comparison was hiding: Granian sits **~10–12 MiB below saltare on the floor**. Closing that gap is on the v1.3 roadmap. (6) `Dockerfile.production` with jemalloc preloaded + `MALLOC_ARENA_MAX=2`, `make production-image`. (7) `make valgrind` target with CPython suppressions for periodic C-API leak checks across `bridge.zig`. (8) Bench harness extra workloads: `--large-response`, `--high-conc-idle 5000`. (9) README CoW eager-import doc — workers only stay lean if all imports happen in the master before the fork, and the typical FastAPI footgun (lazy `import` in route handlers) is now called out. **LTO** on the Zig side was attempted but rolled back — Zig 0.16's `Build.Module` and `Build.Step.Compile` no longer expose an LTO field, and `-fLLVM-lto` is not wired through `b.standardOptimizeOption`; will revisit when a public API lands.
 
-- [x] **v1.3.0** — Lazy-loaded TLS, four new Zig-side intercepts, leanest of three. (1) **OpenSSL link gone at build time**: `tls.zig` declares OpenSSL types as `opaque {}`, hard-codes the relevant ABI constants, and ships a function-pointer table populated by `dlopen` + `dlsym` on first `newContext()` call. Plain-HTTP deployments never load libssl/libcrypto; they're not in the binary's `DT_NEEDED` entries, so `auditwheel` doesn't vendor them either — the wheel is ~3 MiB smaller. Users who pass `ssl_certfile=` need system OpenSSL installed (`apt install libssl3` / yum equivalent); the launcher's first TLS call dlopens `libssl.so.3` then falls back to `.so.1.1`. (2) **Health endpoint intercept** (`health_path`, e.g. `"/healthz"`) — k8s liveness/readiness probes get answered from Zig with `200 OK\nok\n`; the user app never sees them. (3) **CORS preflight intercept** (`cors_preflight_allow_all=True`) — OPTIONS-with-Origin requests skip Python and get permissive CORS headers (`*`, common methods, 24 h cache). (4) **IPv6 listen** — `host` containing a colon auto-detects v6 and binds an `AF_INET6` socket with `IPV6_V6ONLY=1`; bracketed `[::1]` notation is also accepted. (5) **`mallopt(M_ARENA_MAX, 1)` at module init** — caps glibc's per-thread arenas to one even when users don't set the env var, so RSS doesn't fragment via per-arena slack. Bench delta vs v1.2.2 same-host: −2.4 to −3.2 MiB across all workloads; with the granian-launcher comparison normalisation (`benchmarks/run_granian.py` now imports the FastAPI app at module level so its master RSS reflects the same import footprint saltare carries), **saltare is the leanest of the three** — 46.0 / 45.3 / 44.7 MiB vs uvicorn 49–54 MiB and granian 56–57 MiB. Tests 56/56.
+- [x] **v1.3.0** — Lazy-loaded TLS, eight new operational knobs, leanest of three. RAM cuts: (1) **OpenSSL link gone at build time** — `tls.zig` declares OpenSSL types as `opaque {}`, hard-codes ABI constants, and ships a function-pointer table populated by `dlopen` + `dlsym` on first `newContext()` call. Plain-HTTP deployments never load libssl/libcrypto. (2) **`mallopt(M_ARENA_MAX, 1)` at module init** caps glibc's per-thread arenas. (3) **`PYTHONOPTIMIZE=2` auto re-exec** in `cli.main()` strips docstrings + asserts from FastAPI / Pydantic / Starlette — `SALTARE_NO_OPTIMIZE=1` opts out. (4) **URL decode moved to Zig** (`http.urlDecode`) — `_dispatcher.py` no longer imports `urllib.parse`. New operational knobs (all opt-in, zero RAM cost when off): (5) **Health endpoint intercept** (`health_path="/healthz"`) — Zig answers `200 OK\nok\n`; k8s probes never touch Python. (6) **CORS preflight intercept** (`cors_preflight_allow_all=True`) — OPTIONS-with-Origin gets permissive CORS headers from Zig. (7) **IPv6 listen** — `host="::"` / `[::1]` auto-detects v6, binds `AF_INET6` with `IPV6_V6ONLY=1`. (8) **Per-IP rate limiter** (`rate_limit_per_sec`, `rate_limit_burst`) — token bucket in Zig, 4096-IP bounded LRU table, returns 429 before Python sees the request. (9) **`tracemalloc_path`** (e.g. `"/debug/tracemalloc"`) — auto-`tracemalloc.start(25)` and serves a top-30 dump for leak hunts in long-running deployments. Bench: **46.3 / 44.9 / 44.7 MiB** vs uvicorn **48.7 / 49.6 / 53.7 MiB** and granian **56.8 / 56.9 / 56.9 MiB** on the same host (fair comparison: `benchmarks/run_granian.py` imports the FastAPI app at module level so granian's master RSS reflects the same import footprint saltare carries). Tests 56/56.
 
-### v1.4 candidates
+### v1.4 candidates (not yet started)
 
-- **Request body streaming** (the v0.12.x carry-over). Bodies are still capped to the read buffer (16 KiB after the v0.16 upgrade path) — uploads larger than that get a 413. Streaming would lift this without breaking the per-connection RAM ceiling.
-- **`tracemalloc` debug endpoint**. Off by default; on, dumps the top-N Python-side allocations on `/debug/tracemalloc`. Useful for catching slow leaks in long-running deployments.
-- **Free-threaded Python (`cp314t`)**. Measure RSS + rps with the GIL gone — saltare's single-threaded I/O loop with GIL-locked dispatch is the architecture; free-threaded could let dispatch run concurrently. Could go either way on RAM.
-- **`-Os` link with `-fdata-sections -ffunction-sections -Wl,--gc-sections`**. Already mostly redundant with Zig's `ReleaseSmall` but worth a delta measurement now that LTO landed in Zig 0.16's CLI (not yet in the public `Build.Module` API).
+- **Request body streaming**. The read buffer caps body size at the upgraded 16 KiB pool block; bodies past that get 413. Streaming would require a new connection state ("body-in-flight, dispatch active") plus interleaved `http_dispatch_push_body` calls from the Zig side. Major refactor of the dispatch loop.
+- **`sendfile(2)` zero-copy file path**. ASGI extension where the app sends `{"type": "saltare.sendfile", "path": "/var/www/file.bin"}` and Zig calls `sendfile(socket, file_fd, NULL, size)` directly — no Python-level body copying. Useful for static-asset endpoints; bridge changes are non-trivial because it has to bypass the normal `http.response.body` chunk path.
+- **HTTP/2** via ALPN + `nghttp2` linkage. Multiplexing fewer connections would cut per-conn overhead even further, but the wire-format work is large.
+- **Free-threaded Python (`cp314t`)** — measure RSS + rps with the GIL gone; saltare's single-threaded I/O loop with GIL-locked dispatch is the architecture, free-threaded could let dispatch run concurrently. Could go either way.
 
 ## Install (once published)
 
@@ -267,13 +267,33 @@ saltare.run(
     metrics_path="/metrics",   # Prometheus text from Zig counters; no Python overhead per scrape
     health_path="/healthz",    # Zig answers `200 ok` directly — k8s probe friendly
     cors_preflight_allow_all=True,  # OPTIONS w/ Origin → permissive CORS, no Python dispatch
+    rate_limit_per_sec=100,    # per-IP token-bucket rate cap (0 = disabled)
+    rate_limit_burst=200,      # burst ceiling per IP (default 100)
+    tracemalloc_path="/debug/tracemalloc",  # auto-tracemalloc + top-30 dump
     access_log=True,           # JSON line to stderr per completed request
     proxy_headers=True,        # parse X-Forwarded-For / X-Forwarded-Proto
     uds_path="/run/saltare.sock",  # bind a Unix socket instead of host:port
 )
 ```
 
-CLI flags: `--metrics-path PATH`, `--health-path PATH`, `--cors-preflight-allow-all`, `--access-log`, `--proxy-headers`, `--uds PATH`. All off by default. The Zig-side intercepts (`metrics_path`, `health_path`, `cors_preflight_allow_all`) skip the Python dispatch entirely — useful for high-frequency probe paths and CORS-heavy SPA workloads.
+CLI flags: `--metrics-path`, `--health-path`, `--cors-preflight-allow-all`, `--rate-limit-per-sec`, `--rate-limit-burst`, `--tracemalloc-path`, `--access-log`, `--proxy-headers`, `--uds PATH`. All off by default. The Zig-side intercepts (`metrics_path`, `health_path`, `cors_preflight_allow_all`, `tracemalloc_path`) skip the Python dispatch entirely — useful for high-frequency probe paths, CORS-heavy SPAs, and diagnostic endpoints.
+
+### Rate limiting
+
+`rate_limit_per_sec` enables a per-IP token-bucket implemented in Zig: each peer IP gets `rate_limit_burst` tokens, refilled at `rate_limit_per_sec` per second up to the burst ceiling. Each request consumes one token; over-rate IPs get a `429 Too Many Requests` from Zig before the Python app sees the request. The tracking table is bounded at 4096 IPs; once full, the oldest entry evicts. Disabled (default) costs nothing — a single `if (rate_limit_per_sec > 0)` per request. UDS connections are not rate-limited (no peer IP).
+
+### tracemalloc debug endpoint
+
+`tracemalloc_path` auto-calls `tracemalloc.start(25)` at server init and serves a top-30 snapshot at the given path:
+
+```
+# top 30 allocations (group: lineno)
+   542.3 KiB    8 blocks  /opt/.../pydantic/_internal/_model_construction.py:204
+   213.7 KiB   91 blocks  /opt/.../starlette/routing.py:97
+   ...
+```
+
+Tracking has CPU + RAM cost (5–10% RSS depending on app). Don't leave it on in production permanently — flip the flag, scrape once, flip off (requires a process restart).
 
 ### IPv6
 

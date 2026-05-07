@@ -112,10 +112,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var workers: c_uint = 1;
     var health_path_z: [*c]const u8 = null;
     var cors_preflight_flag: c_int = 0;
+    var rate_limit_per_sec: c_uint = 0;
+    var rate_limit_burst: c_uint = 100;
+    var tracemalloc_path_z: [*c]const u8 = null;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIzi",
+        "Osizz|IIIIIIKIzziIIziIIz",
         &app,
         &host_z,
         &port,
@@ -136,6 +139,9 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &workers,
         &health_path_z,
         &cors_preflight_flag,
+        &rate_limit_per_sec,
+        &rate_limit_burst,
+        &tracemalloc_path_z,
     ) == 0) {
         return null;
     }
@@ -162,10 +168,13 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .max_request_body = @intCast(max_body),
         .max_concurrent_connections = @intCast(max_concurrent),
         .max_keepalive_requests = @intCast(max_keepalive),
+        .rate_limit_per_sec = @intCast(rate_limit_per_sec),
+        .rate_limit_burst = @intCast(rate_limit_burst),
     };
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
         .health_path = if (health_path_z != null) std.mem.span(health_path_z) else null,
+        .tracemalloc_path = if (tracemalloc_path_z != null) std.mem.span(tracemalloc_path_z) else null,
         .access_log = access_log_flag != 0,
         .proxy_headers = false, // Python wrapper handles this; not threaded through.
         .cors_preflight_allow_all = cors_preflight_flag != 0,
@@ -237,6 +246,13 @@ fn runSingleWorker(
 ) ?*py.PyObject {
     if (!bridge.init(app, host, port, is_tls)) {
         return null;
+    }
+
+    // Auto-enable tracemalloc tracking when the operator opted in via
+    // `tracemalloc_path`. Initialising before lifespan means we capture
+    // imports + warm-up allocations in the snapshot too.
+    if (obs.tracemalloc_path != null) {
+        bridge.tracemallocInit();
     }
 
     if (!bridge.lifespanStartup()) {

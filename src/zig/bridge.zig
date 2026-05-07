@@ -37,6 +37,8 @@ threadlocal var g_lifespan_shutdown: ?*py.PyObject = null;
 threadlocal var g_ws_open: ?*py.PyObject = null;
 threadlocal var g_ws_event: ?*py.PyObject = null;
 threadlocal var g_ws_disconnect: ?*py.PyObject = null;
+threadlocal var g_tracemalloc_dump: ?*py.PyObject = null;
+threadlocal var g_tracemalloc_init: ?*py.PyObject = null;
 threadlocal var g_server_host: ?*py.PyObject = null;
 threadlocal var g_server_port: c_int = 0;
 /// "http" or "https" — built once at init so dispatch doesn't reallocate.
@@ -97,6 +99,12 @@ pub fn init(
     g_ws_open = py.PyObject_GetAttrString(mod, "ws_open") orelse return false;
     g_ws_event = py.PyObject_GetAttrString(mod, "ws_event") orelse return false;
     g_ws_disconnect = py.PyObject_GetAttrString(mod, "ws_disconnect") orelse return false;
+    // Optional: only present when tracemalloc_path is configured. Failing
+    // here would be fatal; we tolerate absence by clearing the error.
+    g_tracemalloc_dump = py.PyObject_GetAttrString(mod, "dump_tracemalloc");
+    if (g_tracemalloc_dump == null) py.PyErr_Clear();
+    g_tracemalloc_init = py.PyObject_GetAttrString(mod, "init_tracemalloc");
+    if (g_tracemalloc_init == null) py.PyErr_Clear();
 
     g_server_host = py.PyUnicode_FromStringAndSize(
         @as([*c]const u8, @ptrCast(server_host.ptr)),
@@ -252,16 +260,32 @@ pub fn httpDispatchStart(
     const headers_obj = buildHeadersList(req.headers) orelse return null;
     defer py.Py_DecRef(headers_obj);
 
-    // Args: (app, method, raw_path, query, headers, initial_body,
-    //        more_body, host, port, keep_alive, scheme)
+    // v1.3: percent-decode the path in Zig instead of having Python call
+    // `urllib.parse.unquote_to_bytes`. Drops the urllib import (saves
+    // a couple hundred KiB of stdlib mappings) plus a per-request Python-
+    // level pass over the path. Common case (no '%' in the path) skips
+    // the allocation entirely and reuses raw_path's buffer.
+    var decoded_buf_owned: ?[]u8 = null;
+    defer if (decoded_buf_owned) |b| allocator.free(b);
+    const decoded_path: []const u8 = if (http.needsUrlDecode(raw_path)) blk: {
+        const buf = allocator.alloc(u8, raw_path.len) catch break :blk raw_path;
+        decoded_buf_owned = buf;
+        const n = http.urlDecode(raw_path, buf);
+        break :blk buf[0..n];
+    } else raw_path;
+
+    // Args: (app, method, raw_path, decoded_path, query, headers,
+    //        initial_body, more_body, host, port, keep_alive, scheme)
     const result = py.PyObject_CallFunction(
         g_http_start.?,
-        "Os#y#y#Oy#iOiiO",
+        "Os#y#y#y#Oy#iOiiO",
         g_app.?,
         @as([*c]const u8, @ptrCast(req.method.ptr)),
         @as(py.Py_ssize_t, @intCast(req.method.len)),
         @as([*c]const u8, @ptrCast(raw_path.ptr)),
         @as(py.Py_ssize_t, @intCast(raw_path.len)),
+        @as([*c]const u8, @ptrCast(decoded_path.ptr)),
+        @as(py.Py_ssize_t, @intCast(decoded_path.len)),
         @as([*c]const u8, @ptrCast(query.ptr)),
         @as(py.Py_ssize_t, @intCast(query.len)),
         headers_obj,
@@ -337,6 +361,34 @@ pub fn httpGlobalPump() void {
     py.Py_DecRef(result);
 }
 
+/// Start Python's tracemalloc tracker. Called once at server startup
+/// when `tracemalloc_path` is configured. Idempotent — safe to call
+/// even if tracemalloc was already started by something else.
+pub fn tracemallocInit() void {
+    if (g_tracemalloc_init == null) return;
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+    const result = py.PyObject_CallNoArgs(g_tracemalloc_init.?) orelse {
+        py.PyErr_Clear();
+        return;
+    };
+    py.Py_DecRef(result);
+}
+
+/// Build a top-N tracemalloc snapshot text dump. Returns the bytes
+/// (caller-owned, via `allocator`). Empty slice on error.
+pub fn tracemallocDump(allocator: std.mem.Allocator) []u8 {
+    if (g_tracemalloc_dump == null) return &[_]u8{};
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+    const result = py.PyObject_CallNoArgs(g_tracemalloc_dump.?) orelse {
+        py.PyErr_Clear();
+        return &[_]u8{};
+    };
+    defer py.Py_DecRef(result);
+    return copyBytes(result, allocator) orelse &[_]u8{};
+}
+
 pub fn httpDispatchAbort(handle: c_long) void {
     const gstate = py.PyGILState_Ensure();
     defer py.PyGILState_Release(gstate);
@@ -408,14 +460,25 @@ pub fn wsOpen(req: http.Request, allocator: std.mem.Allocator) ?WsOpen {
     const headers_obj = buildHeadersList(req.headers) orelse return null;
     defer py.Py_DecRef(headers_obj);
 
+    var decoded_buf_owned: ?[]u8 = null;
+    defer if (decoded_buf_owned) |b| allocator.free(b);
+    const decoded_path: []const u8 = if (http.needsUrlDecode(raw_path)) blk: {
+        const buf = allocator.alloc(u8, raw_path.len) catch break :blk raw_path;
+        decoded_buf_owned = buf;
+        const n = http.urlDecode(raw_path, buf);
+        break :blk buf[0..n];
+    } else raw_path;
+
     const result = py.PyObject_CallFunction(
         g_ws_open.?,
-        "Os#y#y#OOiO",
+        "Os#y#y#y#OOiO",
         g_app.?,
         @as([*c]const u8, @ptrCast(req.method.ptr)),
         @as(py.Py_ssize_t, @intCast(req.method.len)),
         @as([*c]const u8, @ptrCast(raw_path.ptr)),
         @as(py.Py_ssize_t, @intCast(raw_path.len)),
+        @as([*c]const u8, @ptrCast(decoded_path.ptr)),
+        @as(py.Py_ssize_t, @intCast(decoded_path.len)),
         @as([*c]const u8, @ptrCast(query.ptr)),
         @as(py.Py_ssize_t, @intCast(query.len)),
         headers_obj,

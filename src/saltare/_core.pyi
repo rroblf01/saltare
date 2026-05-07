@@ -22,4 +22,7 @@ def serve(
     workers: int = ...,
     health_path: str | None = ...,
     cors_preflight_allow_all: int = ...,
+    rate_limit_per_sec: int = ...,
+    rate_limit_burst: int = ...,
+    tracemalloc_path: str | None = ...,
 ) -> None: ...

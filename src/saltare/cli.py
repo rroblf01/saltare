@@ -4,10 +4,46 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
 from typing import Any
 
-from saltare import __version__, run
+
+def _ensure_optimized() -> None:
+    """If we're not running with `python -OO` (`sys.flags.optimize >= 2`),
+    re-exec ourselves with that flag set. CPython strips both `assert`
+    statements and docstrings under `-OO`, which trims the heap by a few
+    MiB once FastAPI / Starlette / Pydantic finish importing — those
+    libraries carry hundreds of multi-line docstrings each.
+
+    Skip the re-exec if the user explicitly opts out via `SALTARE_NO_OPTIMIZE=1`
+    (some apps inspect `__doc__` at runtime). Also skip if we've already
+    re-execed once (`SALTARE_REEXECED=1`), to avoid an infinite loop in
+    bizarre environments where `-OO` doesn't lift `sys.flags.optimize`.
+    """
+    if sys.flags.optimize >= 2:
+        return
+    if os.environ.get("SALTARE_NO_OPTIMIZE", "").lower() in {"1", "true", "yes"}:
+        return
+    if os.environ.get("SALTARE_REEXECED") == "1":
+        return
+    new_env = os.environ.copy()
+    new_env["SALTARE_REEXECED"] = "1"
+    new_env["PYTHONOPTIMIZE"] = "2"
+    os.execvpe(
+        sys.executable,
+        [sys.executable, "-OO", "-m", "saltare"] + sys.argv[1:],
+        new_env,
+    )
+
+
+# Re-exec runs as early as possible — before importing `saltare` (which
+# pulls _core, the dispatcher, etc.) — so that those imports themselves
+# happen under -OO and shed their docstrings.
+_ensure_optimized()
+
+
+from saltare import __version__, run  # noqa: E402
 
 
 def _load_app(target: str) -> Any:
@@ -137,6 +173,30 @@ def main(argv: list[str] | None = None) -> None:
              "headers — skips Python for browser preflight",
     )
     parser.add_argument(
+        "--rate-limit-per-sec",
+        type=int,
+        default=0,
+        metavar="N",
+        help="per-IP request rate ceiling (0 = disabled). Token bucket "
+             "implemented in Zig; over-rate IPs get 429 before Python.",
+    )
+    parser.add_argument(
+        "--rate-limit-burst",
+        type=int,
+        default=100,
+        metavar="N",
+        help="burst ceiling for the per-IP rate limiter (default 100)",
+    )
+    parser.add_argument(
+        "--tracemalloc-path",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="enable tracemalloc tracking and serve a top-30 Python "
+             "allocation dump at PATH (e.g. '/debug/tracemalloc'). "
+             "Diagnostic only — has CPU + RAM cost.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -167,4 +227,7 @@ def main(argv: list[str] | None = None) -> None:
         workers=args.workers,
         health_path=args.health_path,
         cors_preflight_allow_all=args.cors_preflight_allow_all,
+        rate_limit_per_sec=args.rate_limit_per_sec,
+        rate_limit_burst=args.rate_limit_burst,
+        tracemalloc_path=args.tracemalloc_path,
     )

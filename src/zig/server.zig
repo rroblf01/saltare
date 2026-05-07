@@ -109,6 +109,12 @@ pub const Observability = struct {
     /// enable if your app's CORS policy actually IS permissive — Zig
     /// doesn't read your app's allow-list.
     cors_preflight_allow_all: bool = false,
+    /// If non-null, requests to this path return a top-N tracemalloc
+    /// dump (Python heap allocations grouped by source line). Setting
+    /// this also auto-enables `tracemalloc.start()` at startup so the
+    /// snapshots are populated. Diagnostic only — leak hunts in
+    /// long-running deployments. The user app never sees the request.
+    tracemalloc_path: ?[]const u8 = null,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -131,7 +137,114 @@ pub const Limits = struct {
     /// CPython's pymalloc arenas by amortising any per-request fragmentation
     /// across many shorter-lived TCP connections.
     max_keepalive_requests: u32 = 1000,
+    /// Per-IP request rate ceiling (requests / second). Zero disables.
+    /// When set, each request's source IP is tracked in a bounded
+    /// hash table; bursts beyond `rate_limit_burst` consecutive requests
+    /// in less than `1/rate_limit_per_sec` seconds get a 429 response
+    /// from Zig before the user app sees them. Token bucket: refilled at
+    /// `rate_limit_per_sec` tokens / second up to `rate_limit_burst`.
+    rate_limit_per_sec: u32 = 0,
+    rate_limit_burst: u32 = 100,
 };
+
+// ---------------------------------------------------------------------------
+// Per-IP token-bucket rate limiter (v1.3). Single-threaded, bounded size.
+// Each entry is (peer [16]u8, tokens f32, last_refill_ns i64) → ~32 B per
+// tracked IP. Cap at 4096 entries; once full we evict the oldest. Lookups
+// + inserts are O(N) linear scan over the array — fast at this size, no
+// hash table allocation noise. The IO loop is single-threaded, so no
+// locking. Active only when `g_limits.rate_limit_per_sec > 0`.
+const RateLimitEntry = struct {
+    peer: [16]u8,
+    tokens: f32,
+    last_refill_ns: i64,
+};
+
+const RATE_LIMIT_MAX_IPS: usize = 4096;
+var g_rl_entries: [RATE_LIMIT_MAX_IPS]RateLimitEntry = undefined;
+var g_rl_count: usize = 0;
+
+fn rateLimitReset() void {
+    g_rl_count = 0;
+}
+
+/// Encode an IPv4 or IPv6 peer address into a uniform 16-byte key. v4
+/// maps to the v4-in-v6 form (top 80 bits zero, then 0xFFFF, then the
+/// v4 32 bits) so a v4 client and a v6 client with the same numeric ID
+/// don't collide. Returns null on AF_UNIX (UDS connections — rate
+/// limiting on a Unix socket would limit by what, the kernel's user? —
+/// out of scope).
+fn peerKey(addr_storage: *const c.struct_sockaddr_storage) ?[16]u8 {
+    const sa: *const c.struct_sockaddr = @ptrCast(@alignCast(addr_storage));
+    var key: [16]u8 = std.mem.zeroes([16]u8);
+    if (sa.sa_family == c.AF_INET) {
+        const sin: *const c.struct_sockaddr_in = @ptrCast(@alignCast(addr_storage));
+        // v4-mapped: ::ffff:a.b.c.d → bytes 10-11 = 0xff,0xff; bytes 12-15 = v4.
+        key[10] = 0xff;
+        key[11] = 0xff;
+        const src: [*]const u8 = @ptrCast(&sin.sin_addr.s_addr);
+        @memcpy(key[12..16], src[0..4]);
+        return key;
+    }
+    if (sa.sa_family == c.AF_INET6) {
+        const sin6: *const c.struct_sockaddr_in6 = @ptrCast(@alignCast(addr_storage));
+        const src: [*]const u8 = @ptrCast(&sin6.sin6_addr);
+        @memcpy(&key, src[0..16]);
+        return key;
+    }
+    return null;
+}
+
+/// Returns true if the request is allowed; false if it should be 429'd.
+/// Implements a per-peer token bucket: refilled at `rate_per_sec` tokens
+/// per second up to a `burst` ceiling. Each allowed request consumes one
+/// token. New peers get a fresh `burst` allocation. When the table is
+/// full, evicts the entry with the oldest `last_refill_ns` (rough LRU).
+fn rateLimitAllow(peer: *const [16]u8, now_ns: i64) bool {
+    const rate = g_limits.rate_limit_per_sec;
+    if (rate == 0) return true;
+    const burst: f32 = @floatFromInt(g_limits.rate_limit_burst);
+    const rate_f: f32 = @floatFromInt(rate);
+
+    // Linear scan. At 4096 entries this is one cache line every few
+    // iterations; well under a microsecond on modern hardware.
+    for (g_rl_entries[0..g_rl_count]) |*entry| {
+        if (!std.mem.eql(u8, &entry.peer, peer)) continue;
+        const elapsed_ns = now_ns - entry.last_refill_ns;
+        const refill = rate_f * @as(f32, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+        entry.tokens = @min(burst, entry.tokens + refill);
+        entry.last_refill_ns = now_ns;
+        if (entry.tokens < 1.0) return false;
+        entry.tokens -= 1.0;
+        return true;
+    }
+
+    // Not in table. Insert (or evict + insert).
+    if (g_rl_count < RATE_LIMIT_MAX_IPS) {
+        g_rl_entries[g_rl_count] = .{
+            .peer = peer.*,
+            .tokens = burst - 1.0,
+            .last_refill_ns = now_ns,
+        };
+        g_rl_count += 1;
+        return true;
+    }
+    // Evict oldest. Linear scan again — tolerable at 4096.
+    var oldest_idx: usize = 0;
+    var oldest_ns: i64 = g_rl_entries[0].last_refill_ns;
+    for (g_rl_entries[1..], 1..) |entry, i| {
+        if (entry.last_refill_ns < oldest_ns) {
+            oldest_ns = entry.last_refill_ns;
+            oldest_idx = i;
+        }
+    }
+    g_rl_entries[oldest_idx] = .{
+        .peer = peer.*,
+        .tokens = burst - 1.0,
+        .last_refill_ns = now_ns,
+    };
+    return true;
+}
 
 // Listener fd bookkeeping for the signal-driven shutdown.
 var g_listen_fd: std.atomic.Value(c_int) = std.atomic.Value(c_int).init(-1);
@@ -517,6 +630,17 @@ fn serveHealth(loop: *eventloop.Loop, conn: *Connection) void {
     serveFixedBody(loop, conn, 200, "OK", "text/plain; charset=utf-8", "ok\n", "");
 }
 
+/// Serve a tracemalloc dump (top-N Python allocations grouped by
+/// `lineno`). Allocates a body via the bridge, copies into a heap
+/// response, and sends. Body is ~few KiB for typical N=30. The user
+/// app never sees this path.
+fn serveTracemalloc(loop: *eventloop.Loop, conn: *Connection) void {
+    const body = bridge.tracemallocDump(conn.allocator);
+    defer if (body.len > 0) conn.allocator.free(body);
+    const safe_body: []const u8 = if (body.len > 0) body else "tracemalloc not available\n";
+    serveFixedBody(loop, conn, 200, "OK", "text/plain; charset=utf-8", safe_body, "");
+}
+
 /// CORS preflight intercept. Answers OPTIONS-with-Origin from Zig with a
 /// permissive policy (`*` origins, common methods + headers, 24h cache).
 /// The user app never sees preflight requests — useful for SPA workloads
@@ -651,6 +775,17 @@ const Connection = struct {
     fd: c_int,
     state: ConnState,
 
+    /// Peer IP (v4-in-v6 mapped) captured at accept time. Used by the
+    /// rate limiter. [16]u8 instead of u128 so the struct keeps a
+    /// 8-byte alignment (u128 forces 16-byte align, which breaks the
+    /// `@fieldParentPtr("timer_node", ...)` upcast in `fireExpired`).
+    peer_key: [16]u8,
+    /// True when peer_key is populated. False for UDS connections
+    /// (where rate-limiting by peer IP makes no sense) and for the
+    /// brief moment between Connection.create and the accept path
+    /// stamping the address.
+    has_peer_key: bool,
+
     /// Borrowed from the pool while a request is in flight, returned to the
     /// pool when the connection goes idle (between keep-alive requests).
     /// Null means "no request in progress, no buffer reserved".
@@ -756,6 +891,8 @@ const Connection = struct {
         conn.* = .{
             .fd = fd,
             .state = .reading,
+            .peer_key = std.mem.zeroes([16]u8),
+            .has_peer_key = false,
             .read_buf = null,
             .read_total = 0,
             .parsed = null,
@@ -958,6 +1095,7 @@ pub fn run(
     g_active_conns.store(0, .seq_cst);
     defer g_active_conns.store(0, .seq_cst);
     resetMetrics();
+    rateLimitReset();
 
     // Multi-worker (v1.0): the master process binds + listens, then forks
     // N children that inherit the fd. When `inherited_listen_fd` is set we
@@ -1150,7 +1288,14 @@ fn acceptAll(
     wheel: *timer.Wheel,
 ) void {
     while (true) {
-        const client = accept4(listen_fd, null, null, c.SOCK_NONBLOCK | c.SOCK_CLOEXEC);
+        var addr_storage: c.struct_sockaddr_storage = undefined;
+        var addr_len: c_uint = @sizeOf(c.struct_sockaddr_storage);
+        const client = accept4(
+            listen_fd,
+            @ptrCast(&addr_storage),
+            &addr_len,
+            c.SOCK_NONBLOCK | c.SOCK_CLOEXEC,
+        );
         if (client < 0) return; // EAGAIN: drained the backlog
 
         // Bound the number of in-flight connections. We have to accept the
@@ -1169,6 +1314,10 @@ fn acceptAll(
             _ = g_active_conns.fetchSub(1, .seq_cst);
             continue;
         };
+        if (peerKey(&addr_storage)) |key| {
+            conn.peer_key = key;
+            conn.has_peer_key = true;
+        }
 
         // For TLS: attach a fresh SSL session to the new fd and start the
         // handshake on the next event. SSL_accept will signal WANT_READ on
@@ -1542,11 +1691,23 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
             return serveHealth(loop, conn);
         }
     }
+    if (g_obs.tracemalloc_path) |path| {
+        if (std.mem.eql(u8, req.target, path)) {
+            return serveTracemalloc(loop, conn);
+        }
+    }
     if (g_obs.cors_preflight_allow_all and
         std.mem.eql(u8, req.method, "OPTIONS") and
         req.header("origin") != null)
     {
         return serveCorsPreflight(loop, conn);
+    }
+
+    // Per-IP rate limit. Cheap when disabled (single u32 compare).
+    if (g_limits.rate_limit_per_sec > 0 and conn.has_peer_key) {
+        if (!rateLimitAllow(&conn.peer_key, monoNs())) {
+            return sendStatus(loop, conn, 429, "Too Many Requests");
+        }
     }
 
     const data = conn.read_buf.?.data;

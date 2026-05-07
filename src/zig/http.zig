@@ -121,6 +121,50 @@ fn connectionTokenPresent(value: []const u8, needle: []const u8) bool {
 // still get a clean 431 via the parser's "too many headers" path.
 pub const max_headers = 32;
 
+/// Percent-decode `src` into `dst`. Returns the number of decoded bytes
+/// written. `dst` must be at least `src.len` bytes long (decoded length is
+/// always ≤ source length). Invalid `%XX` sequences (non-hex, truncated)
+/// are passed through verbatim so we never reject a request whose path the
+/// user app might still understand. v1.3 addition — replaces the
+/// `urllib.parse.unquote_to_bytes` call in `_dispatcher.py`, dropping the
+/// urllib import entirely.
+pub fn urlDecode(src: []const u8, dst: []u8) usize {
+    std.debug.assert(dst.len >= src.len);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < src.len) {
+        const b = src[i];
+        if (b == '%' and i + 2 < src.len) {
+            const hi = std.fmt.charToDigit(src[i + 1], 16) catch {
+                dst[w] = b;
+                w += 1;
+                i += 1;
+                continue;
+            };
+            const lo = std.fmt.charToDigit(src[i + 2], 16) catch {
+                dst[w] = b;
+                w += 1;
+                i += 1;
+                continue;
+            };
+            dst[w] = (hi << 4) | lo;
+            w += 1;
+            i += 3;
+        } else {
+            dst[w] = b;
+            w += 1;
+            i += 1;
+        }
+    }
+    return w;
+}
+
+/// Fast pass: returns true if `s` contains any byte we'd actually need to
+/// decode. Caller can short-circuit allocation when false.
+pub inline fn needsUrlDecode(s: []const u8) bool {
+    return std.mem.indexOfScalar(u8, s, '%') != null;
+}
+
 pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
     // Locate the end of the head section. Without it the request is incomplete.
     const head_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.Incomplete;

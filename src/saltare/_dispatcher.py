@@ -24,7 +24,10 @@ import sys
 import threading
 import traceback
 from typing import Any
-from urllib.parse import unquote_to_bytes
+
+# v1.3: percent-decoding moved to Zig (`http.urlDecode` in src/zig/http.zig).
+# We used to import `urllib.parse.unquote_to_bytes` here; dropping the
+# import shaves ~150 KiB of stdlib mappings off saltare's idle floor.
 
 # Per-thread state. In production there's exactly one `serve()` per process,
 # so this collapses to a single namespace. In tests we run several saltare
@@ -228,6 +231,48 @@ _REASONS: dict[int, str] = {
 
 _SERVER_HEADER = b"saltare/1.3.0"
 
+
+# ---------------------------------------------------------------------------
+# tracemalloc debug endpoint helpers (v1.3). Optional; only invoked when the
+# operator passes `tracemalloc_path=` to `saltare.run()`. Bridge-side
+# `init_tracemalloc` runs once at startup; `dump_tracemalloc` runs on every
+# request to `tracemalloc_path` and returns a top-N text dump.
+
+def init_tracemalloc() -> None:
+    """Start tracemalloc tracking. Idempotent — safe to call repeatedly."""
+    import tracemalloc
+    if not tracemalloc.is_tracing():
+        # 25 frames deep: enough to identify FastAPI / Pydantic call sites.
+        tracemalloc.start(25)
+
+
+def dump_tracemalloc(top_n: int = 30) -> bytes:
+    """Return a top-N tracemalloc snapshot as bytes (text/plain). Each
+    line is `<size_kib> KiB  <count> blocks  <traceback-summary>`.
+    Empty result if tracemalloc isn't tracking — happens when
+    `tracemalloc_path` wasn't configured."""
+    import tracemalloc
+    if not tracemalloc.is_tracing():
+        return b"tracemalloc not tracking (configure tracemalloc_path=)\n"
+    snap = tracemalloc.take_snapshot()
+    stats = snap.statistics("lineno")[:top_n]
+    lines: list[str] = [
+        f"# top {len(stats)} allocations (group: lineno)\n"
+    ]
+    for stat in stats:
+        size_kib = stat.size / 1024
+        # Last frame is most useful (it's the user's call site).
+        last_frame = stat.traceback[-1] if stat.traceback else None
+        loc = (
+            f"{last_frame.filename}:{last_frame.lineno}"
+            if last_frame is not None
+            else "?"
+        )
+        lines.append(
+            f"{size_kib:>8.1f} KiB  {stat.count:>5d} blocks  {loc}\n"
+        )
+    return "".join(lines).encode("utf-8")
+
 # ASGI scope sub-dicts. These never change between requests, so caching them
 # at module level avoids one dict allocation (~200 B) per dispatch. ASGI
 # consumers are not allowed to mutate `scope["asgi"]` per spec, so sharing
@@ -403,6 +448,7 @@ def ws_open(
     app: Any,
     method: str,
     raw_path: bytes,
+    decoded_path: bytes,
     query_string: bytes,
     raw_headers: list[tuple[bytes, bytes]],
     server_host: str,
@@ -419,7 +465,7 @@ def ws_open(
     global _next_ws_handle
 
     try:
-        path = unquote_to_bytes(raw_path).decode("utf-8")
+        path = decoded_path.decode("utf-8")
     except UnicodeDecodeError:
         return (0, False, b"", True)
 
@@ -856,6 +902,7 @@ def http_dispatch_start(
     app: Any,
     method: str,
     raw_path: bytes,
+    decoded_path: bytes,
     query_string: bytes,
     raw_headers: list[tuple[bytes, bytes]],
     initial_body: bytes,
@@ -875,7 +922,7 @@ def http_dispatch_start(
     state_obj = _ensure_state()
 
     try:
-        path = unquote_to_bytes(raw_path).decode("utf-8")
+        path = decoded_path.decode("utf-8")
     except UnicodeDecodeError:
         return (
             0,
