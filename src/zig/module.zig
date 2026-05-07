@@ -115,7 +115,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("1.2.0");
+    return py.PyUnicode_FromString("1.5.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -169,10 +169,12 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var max_request_uri: c_uint = 8192;
     var max_request_head_bytes: c_uint = 0;
     var latency_histogram_flag: c_int = 0;
+    var dispatch_path_z: [*c]const u8 = null;
+    var runtime_config_path_z: [*c]const u8 = null;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIi",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizz",
         &app,
         &host_z,
         &port,
@@ -218,6 +220,8 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &max_request_uri,
         &max_request_head_bytes,
         &latency_histogram_flag,
+        &dispatch_path_z,
+        &runtime_config_path_z,
     ) == 0) {
         return null;
     }
@@ -275,6 +279,8 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .server_header = if (server_header_z != null) std.mem.span(server_header_z) else null,
         .startup_request = startup_request_flag != 0,
         .latency_histogram = latency_histogram_flag != 0,
+        .dispatch_path = if (dispatch_path_z != null) std.mem.span(dispatch_path_z) else null,
+        .runtime_config_path = if (runtime_config_path_z != null) std.mem.span(runtime_config_path_z) else null,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 
@@ -595,6 +601,26 @@ fn saltareGunzip(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObje
     return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
 }
 
+/// compression_metric_inc(encoding: str, bytes_in: int, bytes_out: int).
+/// Called by the Python dispatcher after each successful response encode.
+fn saltareCompressionMetricInc(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var enc_z: [*c]const u8 = null;
+    var bytes_in: c_ulonglong = 0;
+    var bytes_out: c_ulonglong = 0;
+    if (py.PyArg_ParseTuple(args, "sKK", &enc_z, &bytes_in, &bytes_out) == 0) return null;
+    server.compressionMetricInc(std.mem.span(enc_z), @intCast(bytes_in), @intCast(bytes_out));
+    return pyReturnNone();
+}
+
+/// compression_metric_skip(reason: str). Called by the Python
+/// dispatcher when a candidate response was passed through identity.
+fn saltareCompressionMetricSkip(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var reason_z: [*c]const u8 = null;
+    if (py.PyArg_ParseTuple(args, "s", &reason_z) == 0) return null;
+    server.compressionMetricSkip(std.mem.span(reason_z));
+    return pyReturnNone();
+}
+
 var methods = [_]py.PyMethodDef{
     .{
         .ml_name = "version",
@@ -643,6 +669,18 @@ var methods = [_]py.PyMethodDef{
         .ml_meth = @ptrCast(&saltareZstdDecode),
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "zstd_decode(payload: bytes, max_size: int) -> bytes | None.",
+    },
+    .{
+        .ml_name = "compression_metric_inc",
+        .ml_meth = @ptrCast(&saltareCompressionMetricInc),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "compression_metric_inc(encoding: str, bytes_in: int, bytes_out: int) -> None.",
+    },
+    .{
+        .ml_name = "compression_metric_skip",
+        .ml_meth = @ptrCast(&saltareCompressionMetricSkip),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "compression_metric_skip(reason: str) -> None.",
     },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };

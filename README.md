@@ -2,7 +2,9 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.4.0 — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. **Dev autoreload**: `--reload` watches code and `SIGTERM`s + respawns the child on change (poll-based, no `inotify` dep — works inside containers / overlayfs / NFS). Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
+> **Status: 1.5.0 — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
+
+> **Status: 1.4.0 (historical entry) — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. **Dev autoreload**: `--reload` watches code and `SIGTERM`s + respawns the child on change (poll-based, no `inotify` dep — works inside containers / overlayfs / NFS). Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
 
 ### v1.4.x candidates (still pending)
 
@@ -74,32 +76,32 @@ Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 46.39 MiB |      46.52 MiB | **46.52 MiB** |    1000 | 1067 |
-| uvicorn | 48.87 MiB |      48.91 MiB | 48.91 MiB |    1000 | 1260 |
-| granian | 52.90 MiB |      52.90 MiB | 52.90 MiB |    1000 | 1129 |
+| saltare | 46.19 MiB |      46.32 MiB | **46.32 MiB** |    1000 | 1051 |
+| uvicorn | 48.41 MiB |      48.46 MiB | 48.46 MiB |    1000 | 1240 |
+| granian | 56.87 MiB |      56.87 MiB | 56.87 MiB |    1000 | 1109 |
 
 ### Concurrent — 100 clients × 20 requests (2000 total)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 44.85 MiB |      45.22 MiB | **45.24 MiB** |    2000 | 1855 |
-| uvicorn | 48.77 MiB |      49.86 MiB | 49.86 MiB |    2000 | 1862 |
-| granian | 50.26 MiB |      50.26 MiB | 50.26 MiB |    2000 | 1819 |
+| saltare | 44.68 MiB |      44.97 MiB | **45.00 MiB** |    2000 | 1881 |
+| uvicorn | 48.36 MiB |      49.34 MiB | 49.34 MiB |    2000 | 1849 |
+| granian | 50.83 MiB |      50.83 MiB | 50.83 MiB |    2000 | 1760 |
 
 ### Idle keep-alive — 500 connections held open
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 44.94 MiB |      45.29 MiB | **45.29 MiB** |     500 | 1446      |
-| uvicorn | 49.18 MiB |      54.55 MiB | 54.55 MiB |     500 | 1427      |
-| granian | 49.78 MiB |      49.78 MiB | 49.78 MiB |     500 | 1322      |
+| saltare | 44.71 MiB |      45.05 MiB | **45.05 MiB** |     500 | 1334      |
+| uvicorn | 48.56 MiB |      53.93 MiB | 53.93 MiB |     500 | 1412      |
+| granian | 49.86 MiB |      49.86 MiB | 49.86 MiB |     500 |  943      |
 
 ### Multi-worker idle — Pss across the whole cluster (saltare only)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  39.95 MiB |      0.00 MiB | 39.95 MiB |                 —  |
-|       4 |        4 |  14.34 MiB |     39.76 MiB | 54.10 MiB |  159.78 MiB (−66%) |
+|       1 |        — |  39.58 MiB |      0.00 MiB | 39.58 MiB |                 —  |
+|       4 |        4 |  14.61 MiB |     39.26 MiB | 53.88 MiB |  158.31 MiB (−66%) |
 
 `Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.85 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
 
@@ -721,6 +723,67 @@ Autoreload, `--noreload`, and `STATIC_URL` (via `ASGIStaticFilesHandler` in `DEB
 
 The integration is dev-only — production deployments call the `saltare` CLI directly against `myproject.asgi:application`; no Django dependency needed at runtime.
 
+### Dispatch introspection endpoint (`--dispatch-path`, v1.5)
+
+Dev / debugging probe. JSON snapshot of the dispatcher's runtime state — same fields as the `SIGUSR1` stats dump but reachable via HTTP. No GIL is acquired during the response, so a deadlocked Python dispatcher still answers the probe.
+
+```bash
+saltare app:app --dispatch-path /debug/dispatch
+curl http://127.0.0.1:8000/debug/dispatch
+# {"open_conns":3,"in_flight":1,"requests_total":847,"responses_4xx":2,
+#  "responses_5xx":0,"bytes_sent":124871,"bytes_received":18432,
+#  "rl_table_size":12,"draining":0,"rss_bytes":48472064}
+```
+
+Off by default. Recommend gating behind a sidecar / network policy in production — it leaks no secrets but does expose RSS + connection counts.
+
+### Hot config reload (`--runtime-config-path` + `SIGHUP`, v1.5)
+
+A subset of `Limits` / `Observability` is re-readable from a `key=value` file on `SIGHUP` without restarting the process. Useful for canary tuning of rate limits or toggling access-log under load.
+
+Supported keys:
+
+- `rate_limit_per_sec`
+- `rate_limit_burst`
+- `max_connections_per_ip`
+- `max_connection_lifetime_secs`
+- `access_log` (`true` / `false`)
+
+```ini
+# /etc/saltare/runtime.cfg
+rate_limit_per_sec=200
+rate_limit_burst=400
+access_log=true
+# anything else is silently ignored — `# comments` allowed
+```
+
+```bash
+saltare app:app --runtime-config-path /etc/saltare/runtime.cfg
+# … later, after editing the file …
+kill -HUP $(pidof saltare)
+# stderr: saltare: SIGHUP: applied 3 key(s), 0 unknown
+```
+
+Unknown keys + parse errors log a warning and keep the previous value — a typo never crashes the running server.
+
+### Compression counters on `/metrics` (v1.5)
+
+When any response encoder is enabled (`--response-gzip` / `-brotli` / `-zstd`), `/metrics` automatically grows four families:
+
+```
+saltare_response_compression_total{encoding="gzip"}        12431
+saltare_response_compression_total{encoding="br"}              0
+saltare_response_compression_total{encoding="zstd"}            0
+saltare_response_compression_bytes_in_total{encoding="gzip"}   18943210
+saltare_response_compression_bytes_out_total{encoding="gzip"}   2102983
+saltare_response_compression_skipped_total{reason="small_body"}      4892
+saltare_response_compression_skipped_total{reason="non_compressible"} 1132
+saltare_response_compression_skipped_total{reason="encoder_unavailable"} 0
+saltare_response_compression_skipped_total{reason="not_smaller"}        87
+```
+
+Counters live in Zig atomics — the `/metrics` scrape never acquires the GIL. Operators can validate "is gzip actually doing work?" by computing `bytes_in / bytes_out` per encoding from the rates.
+
 ### CLI reference
 
 ```
@@ -794,6 +857,10 @@ Development (v1.4)
   --reload-include GLOB             fnmatch glob to include (repeatable; default: '*.py')
   --reload-exclude GLOB             fnmatch glob to exclude (repeatable)
   --reload-poll-secs SECS           poll interval (default 0.5)
+
+Operational depth (v1.5)
+  --dispatch-path PATH              JSON dispatch-state snapshot endpoint
+  --runtime-config-path FILE        key=value file re-read on SIGHUP for hot config swap
 
 Compression (v1.4; lazy dlopen — libs only loaded when flags are on)
   --response-gzip                   negotiate Accept-Encoding: gzip (single-shot + streaming)

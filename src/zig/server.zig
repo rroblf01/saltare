@@ -52,7 +52,7 @@ extern fn accept4(
 // call site so the extern stays cold on macOS / non-glibc builds.
 extern fn malloc_trim(pad: usize) c_int;
 
-const SERVER_HEADER = "saltare/1.4.0";
+const SERVER_HEADER = "saltare/1.5.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -166,6 +166,28 @@ pub const Observability = struct {
     /// counters = 128 B per worker; off by default since most ops
     /// only need the existing counter set.
     latency_histogram: bool = false,
+    /// v1.5 dispatch introspection endpoint. When set (e.g.
+    /// `/debug/dispatch`) saltare answers with a JSON snapshot of
+    /// in-flight dispatch state: open connections, in-flight requests,
+    /// stalled list, draining flag, RSS, rate-limit table size. Same
+    /// info as the SIGUSR1 dump but reachable from a probe / curl;
+    /// useful in containers where signals are awkward.
+    dispatch_path: ?[]const u8 = null,
+    /// v1.5 hot-reload runtime config. When set, on `SIGHUP` saltare
+    /// re-reads this file and atomically swaps a small subset of
+    /// `Limits` / `Observability` fields without a process restart.
+    /// Format is `key=value` lines (one per line, `#` for comments):
+    ///
+    ///     rate_limit_per_sec=100
+    ///     rate_limit_burst=200
+    ///     max_connections_per_ip=50
+    ///     access_log=true
+    ///
+    /// Unknown keys / parse errors log a warning and keep the previous
+    /// value. The connection-handler hot path reads these via plain
+    /// loads on `g_limits` / `g_obs`, so the swap is observed on the
+    /// next request without locking.
+    runtime_config_path: ?[]const u8 = null,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -550,6 +572,58 @@ var g_latency_buckets: [LATENCY_BUCKET_NS.len]std.atomic.Value(u64) = blk: {
 };
 var g_latency_sum_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
+// v1.5 response-compression metrics. The dispatcher (Python) calls
+// `_core.compression_metric_inc(encoding, bytes_in, bytes_out)` after
+// every successful encode and `_core.compression_metric_skip(reason)`
+// when a candidate response is passed through identity. Atomics live
+// in Zig so the `/metrics` scrape path doesn't acquire the GIL.
+//
+// Encoding is one of `gzip` / `br` / `zstd`; skip-reason is one of
+// `small_body` (under min-bytes), `non_compressible` (content-type
+// not in the whitelist), `encoder_unavailable` (libbrotli/libzstd
+// missing), `not_smaller` (encoded payload was bigger than raw).
+pub var g_comp_bytes_in_gzip: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_bytes_out_gzip: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_count_gzip: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_bytes_in_br: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_bytes_out_br: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_count_br: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_bytes_in_zstd: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_bytes_out_zstd: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_count_zstd: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_skip_small: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_skip_noncomp: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_skip_unavail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_comp_skip_not_smaller: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn compressionMetricInc(encoding: []const u8, bytes_in: u64, bytes_out: u64) void {
+    if (std.mem.eql(u8, encoding, "gzip")) {
+        _ = g_comp_bytes_in_gzip.fetchAdd(bytes_in, .seq_cst);
+        _ = g_comp_bytes_out_gzip.fetchAdd(bytes_out, .seq_cst);
+        _ = g_comp_count_gzip.fetchAdd(1, .seq_cst);
+    } else if (std.mem.eql(u8, encoding, "br")) {
+        _ = g_comp_bytes_in_br.fetchAdd(bytes_in, .seq_cst);
+        _ = g_comp_bytes_out_br.fetchAdd(bytes_out, .seq_cst);
+        _ = g_comp_count_br.fetchAdd(1, .seq_cst);
+    } else if (std.mem.eql(u8, encoding, "zstd")) {
+        _ = g_comp_bytes_in_zstd.fetchAdd(bytes_in, .seq_cst);
+        _ = g_comp_bytes_out_zstd.fetchAdd(bytes_out, .seq_cst);
+        _ = g_comp_count_zstd.fetchAdd(1, .seq_cst);
+    }
+}
+
+pub fn compressionMetricSkip(reason: []const u8) void {
+    if (std.mem.eql(u8, reason, "small_body")) {
+        _ = g_comp_skip_small.fetchAdd(1, .seq_cst);
+    } else if (std.mem.eql(u8, reason, "non_compressible")) {
+        _ = g_comp_skip_noncomp.fetchAdd(1, .seq_cst);
+    } else if (std.mem.eql(u8, reason, "encoder_unavailable")) {
+        _ = g_comp_skip_unavail.fetchAdd(1, .seq_cst);
+    } else if (std.mem.eql(u8, reason, "not_smaller")) {
+        _ = g_comp_skip_not_smaller.fetchAdd(1, .seq_cst);
+    }
+}
+
 fn resetMetrics() void {
     g_in_flight.store(0, .seq_cst);
     g_total_requests.store(0, .seq_cst);
@@ -775,7 +849,7 @@ fn readVmRssBytes() u64 {
 /// to the connection. Bypasses the bridge entirely — the user app never
 /// sees the request, so there's no Python overhead per scrape.
 fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
-    var body_buf: [4096]u8 = undefined;
+    var body_buf: [8192]u8 = undefined;
     var body_len: usize = 0;
 
     const sections = .{
@@ -866,6 +940,60 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         const sum_us = sum_ns / 1000;
         w.write("saltare_request_duration_seconds_sum {d}.{d:0>6}\n", .{ sum_us / 1_000_000, sum_us % 1_000_000 });
         w.write("saltare_request_duration_seconds_count {d}\n", .{total_reqs});
+    }
+
+    // v1.5 response-compression metrics. Always emitted when the
+    // operator opted into any encoder; the labels are populated only
+    // by the codec that ran, so a gzip-only deployment shows zero
+    // counters for `br` / `zstd`. Same shape as nginx's stub_status:
+    // helps verify "is the feature actually doing work" at a glance.
+    if (g_obs.metrics_path != null and (
+        g_comp_count_gzip.load(.seq_cst) +
+        g_comp_count_br.load(.seq_cst) +
+        g_comp_count_zstd.load(.seq_cst) +
+        g_comp_skip_small.load(.seq_cst) +
+        g_comp_skip_noncomp.load(.seq_cst) +
+        g_comp_skip_unavail.load(.seq_cst) +
+        g_comp_skip_not_smaller.load(.seq_cst)) > 0)
+    {
+        w.write(
+            \\# HELP saltare_response_compression_total Successful response encodes by codec.
+            \\# TYPE saltare_response_compression_total counter
+            \\saltare_response_compression_total{{encoding="gzip"}} {d}
+            \\saltare_response_compression_total{{encoding="br"}} {d}
+            \\saltare_response_compression_total{{encoding="zstd"}} {d}
+            \\# HELP saltare_response_compression_bytes_in_total Pre-encode body bytes.
+            \\# TYPE saltare_response_compression_bytes_in_total counter
+            \\saltare_response_compression_bytes_in_total{{encoding="gzip"}} {d}
+            \\saltare_response_compression_bytes_in_total{{encoding="br"}} {d}
+            \\saltare_response_compression_bytes_in_total{{encoding="zstd"}} {d}
+            \\# HELP saltare_response_compression_bytes_out_total Post-encode body bytes.
+            \\# TYPE saltare_response_compression_bytes_out_total counter
+            \\saltare_response_compression_bytes_out_total{{encoding="gzip"}} {d}
+            \\saltare_response_compression_bytes_out_total{{encoding="br"}} {d}
+            \\saltare_response_compression_bytes_out_total{{encoding="zstd"}} {d}
+            \\# HELP saltare_response_compression_skipped_total Encode-candidate responses passed through identity.
+            \\# TYPE saltare_response_compression_skipped_total counter
+            \\saltare_response_compression_skipped_total{{reason="small_body"}} {d}
+            \\saltare_response_compression_skipped_total{{reason="non_compressible"}} {d}
+            \\saltare_response_compression_skipped_total{{reason="encoder_unavailable"}} {d}
+            \\saltare_response_compression_skipped_total{{reason="not_smaller"}} {d}
+            \\
+        , .{
+            g_comp_count_gzip.load(.seq_cst),
+            g_comp_count_br.load(.seq_cst),
+            g_comp_count_zstd.load(.seq_cst),
+            g_comp_bytes_in_gzip.load(.seq_cst),
+            g_comp_bytes_in_br.load(.seq_cst),
+            g_comp_bytes_in_zstd.load(.seq_cst),
+            g_comp_bytes_out_gzip.load(.seq_cst),
+            g_comp_bytes_out_br.load(.seq_cst),
+            g_comp_bytes_out_zstd.load(.seq_cst),
+            g_comp_skip_small.load(.seq_cst),
+            g_comp_skip_noncomp.load(.seq_cst),
+            g_comp_skip_unavail.load(.seq_cst),
+            g_comp_skip_not_smaller.load(.seq_cst),
+        });
     }
 
     var head_buf: [512]u8 = undefined;
@@ -1137,6 +1265,41 @@ fn serveTracemalloc(loop: *eventloop.Loop, conn: *Connection) void {
     serveFixedBody(loop, conn, 200, "OK", "text/plain; charset=utf-8", safe_body, "");
 }
 
+/// v1.5 dispatch introspection. Renders the same fields as the
+/// SIGUSR1 stats dump as a single-line JSON document. Bypasses
+/// Python entirely (no GIL acquired) so even a deadlocked dispatcher
+/// answers the probe.
+fn serveDispatch(loop: *eventloop.Loop, conn: *Connection) void {
+    var body_buf: [768]u8 = undefined;
+    const open_conns = g_active_conns.load(.seq_cst);
+    const in_flight = g_in_flight.load(.seq_cst);
+    const total_reqs = g_total_requests.load(.seq_cst);
+    const total_4xx = g_total_4xx.load(.seq_cst);
+    const total_5xx = g_total_5xx.load(.seq_cst);
+    const total_bytes_sent = g_total_bytes_sent.load(.seq_cst);
+    const total_bytes_recv = g_total_bytes_received.load(.seq_cst);
+    const draining: u32 = if (g_draining.load(.seq_cst)) 1 else 0;
+    const rss_bytes: u64 = if (comptime builtin.os.tag == .linux) readVmRssBytes() else 0;
+    const body = std.fmt.bufPrint(
+        &body_buf,
+        "{{\"open_conns\":{d},\"in_flight\":{d}," ++
+            "\"requests_total\":{d},\"responses_4xx\":{d},\"responses_5xx\":{d}," ++
+            "\"bytes_sent\":{d},\"bytes_received\":{d}," ++
+            "\"rl_table_size\":{d}," ++
+            "\"draining\":{d},\"rss_bytes\":{d}}}\n",
+        .{
+            open_conns,    in_flight, total_reqs, total_4xx, total_5xx,
+            total_bytes_sent, total_bytes_recv,
+            g_rl_count,
+            draining, rss_bytes,
+        },
+    ) catch {
+        sendStatus(loop, conn, 500, "Internal Server Error");
+        return;
+    };
+    serveFixedBody(loop, conn, 200, "OK", "application/json; charset=utf-8", body, "");
+}
+
 /// CORS preflight intercept. Answers OPTIONS-with-Origin from Zig with a
 /// permissive policy (`*` origins, common methods + headers, 24h cache).
 /// The user app never sees preflight requests — useful for SPA workloads
@@ -1210,6 +1373,93 @@ fn installSignalHandlers() void {
     _ = c.signal(c.SIGTERM, &onSignal);
     _ = c.signal(c.SIGPIPE, &ignoreSignal);
     _ = c.signal(c.SIGUSR1, &onUsr1);
+    _ = c.signal(c.SIGHUP, &onHup);
+}
+
+/// SIGHUP → main loop will re-parse `runtime_config_path`.
+var g_runtime_reload_pending: std.atomic.Value(bool) =
+    std.atomic.Value(bool).init(false);
+
+fn onHup(_: c_int) callconv(.c) void {
+    g_runtime_reload_pending.store(true, .seq_cst);
+}
+
+/// Parse one `key=value` line and apply to the live limits/obs.
+/// Returns true if the key was recognised.
+fn applyRuntimeKey(key: []const u8, value: []const u8) bool {
+    if (std.mem.eql(u8, key, "rate_limit_per_sec")) {
+        const v = std.fmt.parseInt(u32, value, 10) catch return false;
+        g_limits.rate_limit_per_sec = v;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "rate_limit_burst")) {
+        const v = std.fmt.parseInt(u32, value, 10) catch return false;
+        g_limits.rate_limit_burst = v;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "max_connections_per_ip")) {
+        const v = std.fmt.parseInt(u32, value, 10) catch return false;
+        g_limits.max_connections_per_ip = v;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "max_connection_lifetime_secs")) {
+        const v = std.fmt.parseInt(u32, value, 10) catch return false;
+        g_limits.max_connection_lifetime_secs = v;
+        return true;
+    }
+    if (std.mem.eql(u8, key, "access_log")) {
+        g_obs.access_log = std.mem.eql(u8, value, "true") or
+            std.mem.eql(u8, value, "1") or
+            std.mem.eql(u8, value, "yes");
+        return true;
+    }
+    return false;
+}
+
+/// Re-read `runtime_config_path` and apply any recognised keys. Runs
+/// only on the I/O loop thread (after observing `g_runtime_reload_pending`)
+/// so direct writes to `g_limits` / `g_obs` are safe — workers read these
+/// fields via plain loads on the same thread on every request.
+fn reloadRuntimeConfig() void {
+    const path_z = if (g_obs.runtime_config_path) |p| p else return;
+    var path_buf: [4096]u8 = undefined;
+    if (path_z.len >= path_buf.len) return;
+    @memcpy(path_buf[0..path_z.len], path_z);
+    path_buf[path_z.len] = 0;
+    const fd = c.open(@as([*c]const u8, @ptrCast(&path_buf[0])), c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) {
+        var err_buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&err_buf, "saltare: SIGHUP: cannot open {s}\n", .{path_z}) catch return;
+        _ = c.write(2, msg.ptr, msg.len);
+        return;
+    }
+    defer _ = c.close(fd);
+    var buf: [4096]u8 = undefined;
+    const n = c.read(fd, &buf, buf.len);
+    if (n <= 0) return;
+    const text = buf[0..@intCast(n)];
+    var applied: u32 = 0;
+    var unknown: u32 = 0;
+    var iter = std.mem.splitScalar(u8, text, '\n');
+    while (iter.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const key = std.mem.trim(u8, line[0..eq], " \t");
+        const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+        if (applyRuntimeKey(key, value)) {
+            applied += 1;
+        } else {
+            unknown += 1;
+        }
+    }
+    var msg_buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(
+        &msg_buf,
+        "saltare: SIGHUP: applied {d} key(s), {d} unknown\n",
+        .{ applied, unknown },
+    ) catch return;
+    _ = c.write(2, msg.ptr, msg.len);
 }
 
 /// Emit a one-line JSON snapshot of saltare's runtime state on stderr.
@@ -1919,6 +2169,7 @@ pub fn run(
         // SIGUSR1 stats dump — triggered by the operator via `kill -USR1`.
         // Single-line JSON to stderr; never throws.
         if (g_dump_stats.swap(false, .seq_cst)) dumpStats();
+        if (g_runtime_reload_pending.swap(false, .seq_cst)) reloadRuntimeConfig();
 
         // Sweep expired connections. With a 100 ms epoll poll, the worst-
         // case lag past a 1 s deadline is one bucket; granularity of all
@@ -2885,6 +3136,11 @@ fn dispatchWithBody(loop: *eventloop.Loop, conn: *Connection, more_body: bool) v
     if (g_obs.tracemalloc_path) |path| {
         if (std.mem.eql(u8, req.target, path)) {
             return serveTracemalloc(loop, conn);
+        }
+    }
+    if (g_obs.dispatch_path) |path| {
+        if (std.mem.eql(u8, req.target, path)) {
+            return serveDispatch(loop, conn);
         }
     }
     if (g_obs.cors_preflight_allow_all and

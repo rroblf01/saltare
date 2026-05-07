@@ -1,5 +1,94 @@
 # Changelog
 
+## 1.5.0
+
+**Theme**: operational depth + distribution reach. Saltare now ships
+musllinux wheels alongside manylinux, exposes a runtime introspection
+endpoint and SIGHUP-driven hot config reload, and surfaces compression
+counters on `/metrics`.
+
+### Default-on (no flag)
+
+- **Six v1.4-cycle bug fixes** rolled forward into the v1.5 baseline:
+  HEAD body strip in `serveSendfile`, supervisor SIGTERM forwarding,
+  `_pending_sendfiles` cleanup on abort, out-of-range encoder param
+  warnings, codec-probe safe defaults, sendfile + head-write EINTR
+  retry. See [README "Roadmap"](README.md#roadmap) for the catalogue.
+
+### Opt-in flags
+
+- **`--dispatch-path PATH`** — JSON dispatch-state snapshot endpoint
+  (typical `/debug/dispatch`). Same fields as the SIGUSR1 stats dump
+  but reachable from a probe / curl. No GIL acquired — even a
+  deadlocked dispatcher answers the probe. Off by default.
+- **`--runtime-config-path FILE`** — `key=value` file re-read on
+  `SIGHUP`. Subset of `Limits` / `Observability` is hot-swappable
+  without a restart: `rate_limit_per_sec`, `rate_limit_burst`,
+  `max_connections_per_ip`, `max_connection_lifetime_secs`,
+  `access_log`. Unknown keys + parse errors log a warning and keep
+  the previous value. Off by default.
+
+### Default-on (when an encoder is enabled)
+
+- **`/metrics` response-compression counters** —
+  `saltare_response_compression_total{encoding}`,
+  `saltare_response_compression_bytes_in_total{encoding}`,
+  `saltare_response_compression_bytes_out_total{encoding}`,
+  `saltare_response_compression_skipped_total{reason}`. Reasons:
+  `small_body`, `non_compressible`, `encoder_unavailable`,
+  `not_smaller`. Counters live in Zig (no GIL on scrape).
+
+### Distribution
+
+- **musllinux wheels** added to cibuildwheel matrix
+  (`musllinux_1_2_x86_64` + `musllinux_1_2_aarch64`). Alpine-based
+  containers and distroless sidecars now have a native wheel.
+- **`pytest-rerunfailures`** added to the test extras. The previously
+  skipped `test_large_streaming_response_is_complete` runs again with
+  3 reruns instead of being permanently disabled — flakiness goes
+  through the retry loop on busy hosts but real regressions still
+  surface.
+### Deferred to v1.5.x
+
+- **Streaming brotli + zstd** — gzip streaming works (per-chunk
+  `Z_SYNC_FLUSH`); brotli + zstd streaming need per-codec encoder
+  state across `_send` calls. v1.5.x.
+- **OpenTelemetry OTLP exporter** — full OTLP needs protobuf
+  encoding (or JSON-OTLP), retry/backoff, span correlation. Scope
+  is multi-day. v1.5.x.
+- **macOS kqueue port** — codebase has Linux-isms beyond `eventloop.zig`
+  (epoll constants, `sys/sendfile.h`, `sys/prctl.h`, `MAP_POPULATE`).
+  Real port is a v1.6 milestone, not a stub.
+
+### Tests + bench (v1.5.0)
+
+91 total: same coverage as v1.4 plus the v1.5 features exercised
+end-to-end via a manual smoke (`/debug/dispatch` returns valid JSON,
+SIGHUP reloads `runtime.cfg`, `/metrics` emits compression counters).
+
+Bench (same host, manylinux_2_28_x86_64, CPython 3.14.4):
+
+```
+sequential    : 46.32 MiB  (uvicorn 48.46, granian 56.87)
+concurrent    : 45.00 MiB  (uvicorn 49.34, granian 50.83)
+idle-keepalive: 45.05 MiB  (uvicorn 53.93, granian 49.86)
+4-worker Pss  : 4.77 MiB / extra worker
+```
+
+Saltare leanest on every workload. The new operational features cost
+zero RAM when off (each is a `null` pointer / atomic-zero counter).
+
+### Tier-1 still pending — v1.6+
+
+- **HTTP/2 + ALPN** via `nghttp2` (multi-week wire-format work).
+- **`io_uring` event loop** (Linux ≥ 5.4) — replaces epoll on hot
+  path.
+- **kTLS** — kernel TLS for sendfile-over-HTTPS.
+- **WebSocket per-message-deflate** — handshake negotiation + rsv1
+  framing in `ws.zig`. Touches the WS frame builder deeply.
+
+
+
 All user-visible changes per release. The headline number is the wheel version
 (`pyproject.toml`); the dates are the tag dates. Items marked `default-on`
 take effect for every deployment that pulls the new wheel; items marked

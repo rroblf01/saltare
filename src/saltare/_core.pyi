@@ -47,7 +47,15 @@ def serve(
     max_request_uri: int = ...,
     max_request_head_bytes: int = ...,
     latency_histogram: int = ...,
+    dispatch_path: str | None = ...,
+    runtime_config_path: str | None = ...,
 ) -> None: ...
+
+# v1.5 compression metric counters. Atomic state lives in Zig; the
+# Python dispatcher calls these to record encode outcomes so /metrics
+# emits the saltare_response_compression_* families.
+def compression_metric_inc(encoding: str, bytes_in: int, bytes_out: int) -> None: ...
+def compression_metric_skip(reason: str) -> None: ...
 
 # v1.4 lazy-dlopen codec helpers. All four return None when the
 # corresponding shared library can't be loaded (musl images without

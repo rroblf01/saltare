@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "saltare"
-version = "1.4.0"
+version = "1.5.0"
 description = "Low-RAM ASGI HTTP server with a Zig backbone."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -56,9 +56,10 @@ wheel.exclude = ["**/*.zig", "**/*.zon"]
 
 [tool.cibuildwheel]
 build = ["cp310-*", "cp311-*", "cp312-*", "cp313-*", "cp314-*"]
-skip = ["*-musllinux_*", "pp*", "*-win32", "*_i686"]
+# v1.5: keep PyPy / win32 / i686 out, but ship musllinux too.
+skip = ["pp*", "*-win32", "*_i686"]
 build-verbosity = 1
-test-requires = ["pytest", "httpx", "fastapi", "websockets"]
+test-requires = ["pytest", "httpx", "fastapi", "websockets", "pytest-rerunfailures"]
 test-command = "pytest -q {project}/tests"
 
 [tool.cibuildwheel.linux]
@@ -74,6 +75,16 @@ archs = ["x86_64", "aarch64"]
 # images that some saltare TLS APIs may not match.
 manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
+musllinux-x86_64-image = "musllinux_1_2"
+musllinux-aarch64-image = "musllinux_1_2"
+
+# v1.5: musllinux wheels for Alpine-based images (k8s sidecars,
+# distroless containers). Alpine uses apk + openssl-dev (not -devel),
+# so override the before-all on that selector. Tests still run against
+# the same source tree.
+[[tool.cibuildwheel.overrides]]
+select = "*-musllinux*"
+before-all = "bash {project}/scripts/install-zig.sh && apk add --no-cache openssl-dev"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

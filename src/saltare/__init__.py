@@ -73,6 +73,8 @@ def run(
     reload_includes: list[str] | tuple[str, ...] | None = None,
     reload_excludes: list[str] | tuple[str, ...] | None = None,
     reload_poll_secs: float = 0.5,
+    dispatch_path: str | None = None,
+    runtime_config_path: str | None = None,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -314,4 +316,6 @@ def run(
         int(max_request_uri),
         int(max_request_head_bytes),
         int(bool(latency_histogram)),
+        dispatch_path,
+        runtime_config_path,
     )

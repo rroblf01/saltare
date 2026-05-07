@@ -46,7 +46,7 @@ RUN pip install --upgrade pip build
 # Stage 3: Test environment. Adds pytest+httpx once; the wheel install gets a
 # separate layer below so it can invalidate independently.
 FROM build-env AS test-env
-RUN pip install pytest httpx fastapi websockets
+RUN pip install pytest httpx fastapi websockets pytest-rerunfailures
 
 # ---------------------------------------------------------------------------
 # Stage 4: Build the wheel. Re-runs only when build inputs change. We copy

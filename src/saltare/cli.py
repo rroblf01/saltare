@@ -414,6 +414,14 @@ def main(argv: list[str] | None = None) -> None:
         help="reloader poll interval in seconds (default 0.5)",
     )
     parser.add_argument(
+        "--dispatch-path", type=str, default=None, metavar="PATH",
+        help="JSON dispatch-state snapshot endpoint (e.g. /debug/dispatch); off by default",
+    )
+    parser.add_argument(
+        "--runtime-config-path", type=str, default=None, metavar="FILE",
+        help="key=value file re-read on SIGHUP to hot-update rate limits / access log",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -484,4 +492,6 @@ def main(argv: list[str] | None = None) -> None:
         reload_includes=args.reload_include,
         reload_excludes=args.reload_exclude,
         reload_poll_secs=args.reload_poll_secs,
+        dispatch_path=args.dispatch_path,
+        runtime_config_path=args.runtime_config_path,
     )

@@ -1113,6 +1113,11 @@ class _HttpState:
         # the chunked transfer-encoding wrapper. The final chunk uses
         # `Z_FINISH` to flush the gzip trailer.
         "_gzip_co",
+        # Cumulative pre/post-encode byte totals for the streaming
+        # gzip path. Fired into `_core.compression_metric_inc` when
+        # the stream closes (`more_body=False`).
+        "_gzip_bytes_in",
+        "_gzip_bytes_out",
     )
 
     def __init__(
@@ -1142,6 +1147,8 @@ class _HttpState:
         self._negotiated_encoding: bytes = b""
         self._traceparent_echo: bytes = b""
         self._gzip_co: Any = None
+        self._gzip_bytes_in: int = 0
+        self._gzip_bytes_out: int = 0
         # Filled in when http.response.start arrives.
         self.status: int = 500
         self.out_headers: list[tuple[bytes, bytes]] = []
@@ -1263,11 +1270,23 @@ class _HttpState:
                         # Single-shot path: encode in one go, rewrite
                         # headers, no streaming state needed.
                         chunk = self._maybe_compress_response(chunk)
+                    elif not more and chunk:
+                        # Body smaller than the threshold — skip metric
+                        # for visibility ("are we leaving compressible
+                        # bytes on the table?" answerable from /metrics).
+                        from saltare import _core as _c
+                        _c.compression_metric_skip("small_body")
                     elif more and self._negotiated_encoding == b"gzip":
-                        # Streaming path: only gzip supports per-chunk
-                        # `Z_SYNC_FLUSH` here; brotli/zstd streaming-encode
-                        # is deferred (one-shot only for those in v1.4).
+                        # Streaming gzip: per-chunk Z_SYNC_FLUSH +
+                        # Z_FINISH at end.
                         self._maybe_init_streaming_gzip()
+                    elif more and self._negotiated_encoding in (b"br", b"zstd"):
+                        # Streaming brotli/zstd not yet wired —
+                        # encoders need per-state objects across `_send`
+                        # calls (analogous to `_gzip_co`). Pass through
+                        # identity for this response. v1.5.x.
+                        from saltare import _core as _c
+                        _c.compression_metric_skip("encoder_unavailable")
                 # HEAD: same headers as GET but no body. Force single-
                 # shot mode (no chunked) and use the first chunk's
                 # length as Content-Length unless the app explicitly
@@ -1288,11 +1307,17 @@ class _HttpState:
                 # so decompressors see decoded bytes promptly; Z_FINISH on
                 # the final chunk flushes the gzip trailer (CRC + isize).
                 import zlib as _zlib
+                self._gzip_bytes_in += len(chunk)
                 if more:
                     encoded = self._gzip_co.compress(chunk) + self._gzip_co.flush(_zlib.Z_SYNC_FLUSH)
                 else:
                     encoded = self._gzip_co.compress(chunk) + self._gzip_co.flush(_zlib.Z_FINISH)
+                self._gzip_bytes_out += len(encoded)
                 chunk = encoded
+                if not more:
+                    # End of stream — record the cumulative ratio.
+                    from saltare import _core as _c
+                    _c.compression_metric_inc("gzip", self._gzip_bytes_in, self._gzip_bytes_out)
             if chunk and not self._is_head:
                 if self.chunked:
                     framed = _encode_chunk(chunk)
@@ -1389,14 +1414,16 @@ class _HttpState:
             if name.lower() == b"content-type":
                 ctype = value
                 break
+        from saltare import _core
         if not _is_gzippable_content_type(ctype):
+            _core.compression_metric_skip("non_compressible")
             return chunk
         # Skip if app already encoded it (e.g. upstream brotli or
         # nginx-side encoding).
         for name, _value in self.out_headers:
             if name.lower() == b"content-encoding":
+                _core.compression_metric_skip("non_compressible")
                 return chunk
-        from saltare import _core
         if enc == b"gzip":
             encoded = _core.gzip_encode(chunk, _response_gzip_level)
         elif enc == b"br":
@@ -1405,8 +1432,13 @@ class _HttpState:
             encoded = _core.zstd_encode(chunk, _response_zstd_level)
         else:
             return chunk
-        if encoded is None or len(encoded) >= len(chunk):
+        if encoded is None:
+            _core.compression_metric_skip("encoder_unavailable")
             return chunk
+        if len(encoded) >= len(chunk):
+            _core.compression_metric_skip("not_smaller")
+            return chunk
+        _core.compression_metric_inc(enc.decode("ascii"), len(chunk), len(encoded))
         # Rewrite headers: drop CL / CE, append our own + Vary.
         new_headers: list[tuple[bytes, bytes]] = []
         have_vary = False
@@ -1459,6 +1491,8 @@ class _HttpState:
         self._negotiated_encoding = b""
         self._traceparent_echo = b""
         self._gzip_co = None
+        self._gzip_bytes_in = 0
+        self._gzip_bytes_out = 0
         self.status = 500
         self.out_headers = []
         self.headers_sent = False
