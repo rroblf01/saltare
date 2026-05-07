@@ -25,6 +25,7 @@ const timer = @import("timer.zig");
 const c = @cImport({
     @cInclude("sys/socket.h");
     @cInclude("netinet/in.h");
+    @cInclude("netinet/tcp.h");
     @cInclude("sys/un.h");
     @cInclude("unistd.h");
     @cInclude("signal.h");
@@ -193,6 +194,45 @@ fn peerKey(addr_storage: *const c.struct_sockaddr_storage) ?[16]u8 {
         return key;
     }
     return null;
+}
+
+/// Parse the leftmost address in an X-Forwarded-For header value into a
+/// 16-byte key matching the v4-mapped form `peerKey` produces. Tolerates
+/// surrounding whitespace and bracketed IPv6 (`[::1]`). Returns null if
+/// no parseable address is found — caller falls back to TCP peer IP.
+fn parseFirstForwardedIp(value: []const u8) ?[16]u8 {
+    // Take the substring before the first comma — that's the originating
+    // client per RFC 7239 / de-facto X-Forwarded-For convention.
+    var slice = value;
+    if (std.mem.indexOfScalar(u8, slice, ',')) |i| slice = slice[0..i];
+    slice = std.mem.trim(u8, slice, " \t");
+    if (slice.len == 0) return null;
+    // Strip optional IPv6 brackets.
+    if (slice.len >= 2 and slice[0] == '[' and slice[slice.len - 1] == ']') {
+        slice = slice[1 .. slice.len - 1];
+    }
+
+    var nul_buf: [64]u8 = undefined;
+    if (slice.len >= nul_buf.len) return null;
+    @memcpy(nul_buf[0..slice.len], slice);
+    nul_buf[slice.len] = 0;
+
+    var key: [16]u8 = std.mem.zeroes([16]u8);
+    // Decide v4 vs v6 by presence of a colon — matches `isIpv6`.
+    if (std.mem.indexOfScalar(u8, slice, ':') == null) {
+        var v4_addr: c.struct_in_addr = undefined;
+        if (c.inet_pton(c.AF_INET, &nul_buf[0], &v4_addr) != 1) return null;
+        key[10] = 0xff;
+        key[11] = 0xff;
+        const src: [*]const u8 = @ptrCast(&v4_addr.s_addr);
+        @memcpy(key[12..16], src[0..4]);
+        return key;
+    }
+    var v6_addr: c.struct_in6_addr = undefined;
+    if (c.inet_pton(c.AF_INET6, &nul_buf[0], &v6_addr) != 1) return null;
+    const src: [*]const u8 = @ptrCast(&v6_addr);
+    @memcpy(&key, src[0..16]);
+    return key;
 }
 
 /// Returns true if the request is allowed; false if it should be 429'd.
@@ -1318,6 +1358,18 @@ fn acceptAll(
             conn.peer_key = key;
             conn.has_peer_key = true;
         }
+        // Disable Nagle: most ASGI responses are a single small chunk,
+        // so coalescing 40 ms before flushing only adds latency. Best-
+        // effort — failure isn't worth tearing the connection down. UDS
+        // sockets ignore this option (TCP-only setsockopt).
+        var tcp_nodelay: c_int = 1;
+        _ = c.setsockopt(
+            client,
+            c.IPPROTO_TCP,
+            c.TCP_NODELAY,
+            @ptrCast(&tcp_nodelay),
+            @sizeOf(c_int),
+        );
 
         // For TLS: attach a fresh SSL session to the new fd and start the
         // handshake on the next event. SSL_accept will signal WANT_READ on
@@ -1703,10 +1755,30 @@ fn dispatch(loop: *eventloop.Loop, conn: *Connection) void {
         return serveCorsPreflight(loop, conn);
     }
 
-    // Per-IP rate limit. Cheap when disabled (single u32 compare).
-    if (g_limits.rate_limit_per_sec > 0 and conn.has_peer_key) {
-        if (!rateLimitAllow(&conn.peer_key, monoNs())) {
-            return sendStatus(loop, conn, 429, "Too Many Requests");
+    // Per-IP rate limit. Cheap when disabled (single u32 compare). When
+    // `proxy_headers` is enabled and the request carries an X-Forwarded-
+    // For, we rate-limit by the leftmost forwarded address rather than
+    // the TCP peer IP — otherwise every request behind a reverse proxy
+    // gets bucketed under the proxy's IP and the limit is meaningless.
+    if (g_limits.rate_limit_per_sec > 0) {
+        var rl_key: [16]u8 = undefined;
+        var rl_have_key = false;
+        if (g_obs.proxy_headers) {
+            if (req.header("x-forwarded-for")) |xff| {
+                if (parseFirstForwardedIp(xff)) |xff_key| {
+                    rl_key = xff_key;
+                    rl_have_key = true;
+                }
+            }
+        }
+        if (!rl_have_key and conn.has_peer_key) {
+            rl_key = conn.peer_key;
+            rl_have_key = true;
+        }
+        if (rl_have_key) {
+            if (!rateLimitAllow(&rl_key, monoNs())) {
+                return sendStatus(loop, conn, 429, "Too Many Requests");
+            }
         }
     }
 

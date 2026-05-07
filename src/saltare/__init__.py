@@ -172,4 +172,5 @@ def run(
         int(rate_limit_per_sec),
         int(rate_limit_burst),
         tracemalloc_path,
+        int(bool(proxy_headers)),
     )

@@ -9,17 +9,45 @@ import sys
 from typing import Any
 
 
+def _is_saltare_main_entry() -> bool:
+    """True iff this process was started as a saltare CLI invocation
+    (either the pip-installed `saltare` console script, or `python -m
+    saltare`). Importing `saltare.cli` from a third-party script must
+    NOT trigger the re-exec — that would surprise everyone."""
+    arg0 = sys.argv[0] if sys.argv else ""
+    base = os.path.basename(arg0)
+    # pip's console_scripts wrapper is named exactly "saltare" (or
+    # "saltare-script.py" on Windows). Strip a trailing extension to
+    # match either form.
+    base_stem = base.split(".")[0] if base else ""
+    if base_stem == "saltare":
+        return True
+    # `python -m saltare` resolves argv[0] to the saltare package's
+    # __main__.py, e.g. `/.../site-packages/saltare/__main__.py`.
+    if arg0.endswith("__main__.py") and "saltare" in arg0:
+        return True
+    return False
+
+
 def _ensure_optimized() -> None:
     """If we're not running with `python -OO` (`sys.flags.optimize >= 2`),
     re-exec ourselves with that flag set. CPython strips both `assert`
     statements and docstrings under `-OO`, which trims the heap by a few
     MiB once FastAPI / Starlette / Pydantic finish importing — those
-    libraries carry hundreds of multi-line docstrings each.
+    libraries carry hundreds of multi-line docstrings each. We also set
+    `MALLOC_ARENA_MAX=1` in the re-exec environment so glibc's per-
+    thread arena state lands in a single arena from process start
+    (calling `mallopt(M_ARENA_MAX, 1)` later in PyInit__core only
+    affects future allocations, not arenas already populated by
+    CPython's bootstrap).
 
     Skip the re-exec if the user explicitly opts out via `SALTARE_NO_OPTIMIZE=1`
     (some apps inspect `__doc__` at runtime). Also skip if we've already
     re-execed once (`SALTARE_REEXECED=1`), to avoid an infinite loop in
     bizarre environments where `-OO` doesn't lift `sys.flags.optimize`.
+    Finally, skip when this module is imported by code that isn't a
+    saltare CLI invocation — re-execing somebody else's script would be
+    rude.
     """
     if sys.flags.optimize >= 2:
         return
@@ -27,9 +55,15 @@ def _ensure_optimized() -> None:
         return
     if os.environ.get("SALTARE_REEXECED") == "1":
         return
+    if not _is_saltare_main_entry():
+        return
     new_env = os.environ.copy()
     new_env["SALTARE_REEXECED"] = "1"
     new_env["PYTHONOPTIMIZE"] = "2"
+    # Bound glibc's per-thread arenas before CPython runs any malloc.
+    # Setting it here, before exec, beats calling mallopt() mid-process
+    # because the bootstrap allocations themselves stay in one arena.
+    new_env.setdefault("MALLOC_ARENA_MAX", "1")
     os.execvpe(
         sys.executable,
         [sys.executable, "-OO", "-m", "saltare"] + sys.argv[1:],
@@ -39,7 +73,9 @@ def _ensure_optimized() -> None:
 
 # Re-exec runs as early as possible — before importing `saltare` (which
 # pulls _core, the dispatcher, etc.) — so that those imports themselves
-# happen under -OO and shed their docstrings.
+# happen under -OO and shed their docstrings. The `_is_saltare_main_entry`
+# gate makes this safe for third-party callers who import `saltare.cli`
+# without intending to run it.
 _ensure_optimized()
 
 

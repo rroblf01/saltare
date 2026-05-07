@@ -115,10 +115,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var rate_limit_per_sec: c_uint = 0;
     var rate_limit_burst: c_uint = 100;
     var tracemalloc_path_z: [*c]const u8 = null;
+    var proxy_headers_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIz",
+        "Osizz|IIIIIIKIzziIIziIIzi",
         &app,
         &host_z,
         &port,
@@ -142,6 +143,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &rate_limit_per_sec,
         &rate_limit_burst,
         &tracemalloc_path_z,
+        &proxy_headers_flag,
     ) == 0) {
         return null;
     }
@@ -176,7 +178,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .health_path = if (health_path_z != null) std.mem.span(health_path_z) else null,
         .tracemalloc_path = if (tracemalloc_path_z != null) std.mem.span(tracemalloc_path_z) else null,
         .access_log = access_log_flag != 0,
-        .proxy_headers = false, // Python wrapper handles this; not threaded through.
+        // The Python dispatcher consumes this for `scope["client"]` and
+        // `scope["scheme"]`. Zig also reads it to use the X-Forwarded-For
+        // address as the rate-limit key when set, so requests behind a
+        // trusted proxy aren't all coalesced into the proxy's TCP peer IP.
+        .proxy_headers = proxy_headers_flag != 0,
         .cors_preflight_allow_all = cors_preflight_flag != 0,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
