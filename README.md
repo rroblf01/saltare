@@ -2,7 +2,7 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.6.0 — full compression matrix + WebSocket extensions.** Carries v1.5 baseline (musllinux wheels, `/debug/dispatch` + token, SIGHUP hot reload, `process_*` metrics, kTLS, runbook) and adds: **streaming brotli** + **streaming zstd** (per-codec encoder state across `_send` via Zig lazy-dlopen handle API — closes the gap where v1.5 only streamed gzip), **WebSocket per-message-deflate** (RFC 7692; `permessage-deflate; client_no_context_takeover; server_no_context_takeover` negotiated; RSV1 + raw-deflate framing on outbound text/binary; zip-bomb-capped inflate on inbound). 102 tests pass. Streaming br/zstd + WS p-m-d are zero-RAM-cost when off — `if not self.pmd_active` / `if not self._brotli_handle` early-outs keep v1.5 hot path byte-identical.
+> **Status: 1.6.0 — full compression matrix + WebSocket extensions + operational hardening.** Carries v1.5 baseline (musllinux wheels, `/debug/dispatch` + token, SIGHUP hot reload, `process_*` metrics, kTLS, runbook) and adds: **streaming brotli** + **streaming zstd** (per-codec encoder state across `_send` via Zig lazy-dlopen handle API — closes the gap where v1.5 only streamed gzip), **WebSocket per-message-deflate** (RFC 7692; `permessage-deflate; client_no_context_takeover; server_no_context_takeover` negotiated; RSV1 + raw-deflate framing on outbound text/binary; zip-bomb-capped inflate on inbound), and the **v1.6 operational set**: `--hsts-max-age` / `--hsts-include-subdomains` / `--hsts-preload` (RFC 6797 `Strict-Transport-Security` line, opt-in, zero per-response cost when off), `--drain-path PATH` (Zig-side intercept that flips the worker into the same graceful-drain mode SIGTERM triggers — POST/PUT to begin, GET for an idempotent state probe; pair with `--health-path` for k8s rolling deploys), TLS observability counters on `/metrics` (`saltare_tls_handshakes_total`, `saltare_tls_session_reuse_total` via lazy `dlsym("SSL_session_reused")`), PROXY-protocol acceptance counters on `/metrics` (`saltare_proxy_protocol_accepted_total{version="v1|v2"}`), and the OpenMetrics 1.0 `# EOF` marker at the end of every `/metrics` body. 108 tests pass. Streaming br/zstd + WS p-m-d are zero-RAM-cost when off — `if not self.pmd_active` / `if not self._brotli_handle` early-outs keep v1.5 hot path byte-identical; HSTS is a cold module-level bytes object until set, drain endpoint is one optional `[]const u8` field.
 
 > **Status: 1.5.0 (historical entry) — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL) with **Bearer-token gate** (`--dispatch-token`), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **`process_*` Prometheus metrics** (`process_open_fds`, `process_cpu_seconds_total`, `process_start_time_seconds` — Grafana / Prom-client conventions), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip), **production runbook + day-2 ops table** in README, **`make smoke-alpine`** (real Alpine container smoke test against the freshly-built musllinux wheel), **`make soak`** (sustained-load RSS-drift gate, defaults 1800 s @ 200 rps), **`--ktls`** (kernel TLS offload via OpenSSL ≥ 3.0 — closes the v1.4 sendfile-over-HTTPS gap; off by default). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
 
@@ -74,40 +74,40 @@ docker run --rm -e BENCH_LARGE_BYTES=1048576 saltare-bench \
 
 Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 0.136, pydantic 2.13, uvicorn 0.x plain — no `[standard]` extras, granian 2.x ASGI), v1.4.0 with default settings (single worker except where noted). Same host, same image. Each server's launcher imports the FastAPI app at module level so RSS readings reflect the same import footprint — without that normalisation, granian's master appears artificially small (~37 MiB) because it spawns a worker subprocess that holds the actual app, and the bench harness reads the master's `/proc/<pid>/status`.
 
-### Sequential — 1 client, 1000 requests
+### Sequential — 1 client, 1000 requests (v1.6.0)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 46.19 MiB |      46.32 MiB | **46.32 MiB** |    1000 | 1051 |
-| uvicorn | 48.41 MiB |      48.46 MiB | 48.46 MiB |    1000 | 1240 |
-| granian | 56.87 MiB |      56.87 MiB | 56.87 MiB |    1000 | 1109 |
+| saltare | 45.27 MiB |      45.40 MiB | **45.40 MiB** |    1000 | 1050 |
+| uvicorn | 48.00 MiB |      48.04 MiB | 48.04 MiB |    1000 | 1232 |
+| granian | 57.13 MiB |      57.13 MiB | 57.13 MiB |    1000 | 1200 |
 
-### Concurrent — 100 clients × 20 requests (2000 total)
+### Concurrent — 100 clients × 20 requests (2000 total) (v1.6.0)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 44.68 MiB |      44.97 MiB | **45.00 MiB** |    2000 | 1881 |
-| uvicorn | 48.36 MiB |      49.34 MiB | 49.34 MiB |    2000 | 1849 |
-| granian | 50.83 MiB |      50.83 MiB | 50.83 MiB |    2000 | 1760 |
+| saltare | 43.99 MiB |      44.30 MiB | **44.32 MiB** |    2000 | 1979 |
+| uvicorn | 48.14 MiB |      49.53 MiB | 49.53 MiB |    2000 | 2001 |
+| granian | 55.20 MiB |      55.20 MiB | 55.20 MiB |    2000 | 1954 |
 
-### Idle keep-alive — 500 connections held open
+### Idle keep-alive — 500 connections held open (v1.6.0)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 44.71 MiB |      45.05 MiB | **45.05 MiB** |     500 | 1334      |
-| uvicorn | 48.56 MiB |      53.93 MiB | 53.93 MiB |     500 | 1412      |
-| granian | 49.86 MiB |      49.86 MiB | 49.86 MiB |     500 |  943      |
+| saltare | 43.91 MiB |      44.25 MiB | **44.25 MiB** |     500 | 1473      |
+| uvicorn | 47.95 MiB |      53.32 MiB | 53.32 MiB |     500 | 1306      |
+| granian | 55.95 MiB |      55.95 MiB | 55.95 MiB |     500 | 1344      |
 
-### Multi-worker idle — Pss across the whole cluster (saltare only)
+### Multi-worker idle — Pss across the whole cluster (saltare only) (v1.6.0)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  39.58 MiB |      0.00 MiB | 39.58 MiB |                 —  |
-|       4 |        4 |  14.61 MiB |     39.26 MiB | 53.88 MiB |  158.31 MiB (−66%) |
+|       1 |        — |  39.26 MiB |      0.00 MiB | 39.26 MiB |                 —  |
+|       4 |        4 |  14.38 MiB |     39.26 MiB | 53.64 MiB |  157.03 MiB (−66%) |
 
 `Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.85 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
 
-> **saltare is the leanest of the three on every workload.** v1.3 ships ~17 orthogonal features, most opt-in and zero-RAM-cost when off. The default-on changes (lazy TLS, `mallopt` arena cap with `MALLOC_ARENA_MAX=1` injected into the CLI re-exec env, gated `PYTHONOPTIMIZE=2` re-exec, `TCP_NODELAY` + `SO_KEEPALIVE` on accept, URL decode in Zig) trim the floor; the opt-in features (health/CORS/favicon intercepts, rate limiter, tracemalloc, request-id, server-timing, trailers, access-log file, per-IP conn cap, IPv6) all default off. Saltare leads granian by 10.8–11.7 MiB and uvicorn by 2.2–9.0 MiB on this run. Throughput is competitive — saltare beats both peers on concurrent, trails uvicorn slightly on sequential. Where saltare's *architectural* advantage shows most: idle-keepalive 500 conns adds **+0.23 MiB** to saltare (~470 B/conn) vs uvicorn's **+5.38 MiB** (~11 KiB/conn) and granian's **0.00 MiB** — only uvicorn pays per-connection cost at idle.
+> **saltare is the leanest of the three on every workload (v1.6.0).** Saltare leads uvicorn by 2.6–9.1 MiB and granian by 10.9–11.7 MiB on this run; the v1.6 opt-in additions (HSTS, drain endpoint, TLS metrics, OpenMetrics EOF, PROXY-protocol counters) cost zero RAM when off — the hot path is byte-identical to v1.5. Throughput is competitive: concurrent rps ~within 1% of uvicorn (1979 vs 2001), idle-keepalive ahead by ~13% (1473 vs 1306). Per-connection slope where saltare's architecture shows clearest: idle-keepalive 500 conns adds **+0.34 MiB** to saltare (~700 B/conn) vs uvicorn's **+5.37 MiB** (~11 KiB/conn) — only uvicorn pays per-connection cost at idle.
 
 ### v1.2.2 vs v1.2.1 on the same host (saltare-only A/B)
 

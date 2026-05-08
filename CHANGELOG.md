@@ -2,11 +2,18 @@
 
 ## 1.6.0
 
-**Theme**: complete the compression matrix + WebSocket extensions.
+**Theme**: complete the compression matrix + WebSocket extensions +
+operational hardening (HSTS, drain endpoint, TLS / PROXY-protocol
+observability, OpenMetrics 1.0 conformance).
 v1.4 shipped one-shot brotli/zstd; v1.5 shipped streaming gzip;
 v1.6 closes the diagonal — brotli + zstd now compress chunked
 responses end-to-end, and WebSocket connections that offer
-`permessage-deflate` get RFC 7692 compressed frames.
+`permessage-deflate` get RFC 7692 compressed frames. v1.6 also
+lands the deployment knobs ops asked for: a Strict-Transport-Security
+header, an HTTP graceful-drain trigger to pair with k8s rolling
+deploys, and per-counter visibility into TLS handshakes / session
+reuse and PROXY-protocol acceptance — closing observability gaps
+that previously needed external tooling.
 
 ### Default-on (no flag)
 
@@ -63,13 +70,49 @@ responses end-to-end, and WebSocket connections that offer
   `extensions: []u8` + `pmd_active: bool`. `wsEvent` signature gains
   `rsv1: bool` (Python side: `ws_event(handle, opcode, payload, rsv1)`).
 
+### Operational additions (v1.6 polish)
+
+- **`--hsts-max-age SECS`** + **`--hsts-include-subdomains`** +
+  **`--hsts-preload`** — emits a pre-rendered
+  `Strict-Transport-Security` header line on every response. RFC 6797.
+  Empty by default (zero per-response cost). Operator-owned: we don't
+  gate on `scope["scheme"]` because real deployments terminate TLS at
+  a reverse proxy and saltare sees plain HTTP via X-Forwarded-Proto.
+- **`--drain-path PATH`** — POST/PUT to PATH (e.g. `/admin/drain`)
+  flips the worker into the same graceful-drain mode SIGTERM
+  triggers: stop accepting, let in-flight finish, exit cleanly. GET
+  is an idempotent state probe; other verbs return 405. Pair with
+  `--health-path` so k8s readiness fails before connections drain
+  out — closes the v1.5 SIGHUP gap (config reload only, not
+  lifecycle). Zig-side intercept; no Python dispatch.
+- **TLS metrics on `/metrics`** —
+  `saltare_tls_handshakes_total` + `saltare_tls_session_reuse_total`.
+  Emitted only when TLS is configured for the worker. Direct
+  evidence of whether `--tls-session-cache-size` is paying its
+  keep, and a sanity check that connections actually negotiated
+  TLS rather than falling through to plaintext. Reused-session
+  detection via lazy `dlsym("SSL_session_reused")`.
+- **PROXY-protocol counters on `/metrics`** —
+  `saltare_proxy_protocol_accepted_total{version="v1|v2"}`. Emitted
+  only when `--proxy-protocol` is on. v1 (text) and v2 (binary)
+  paths increment independently; either being non-zero confirms the
+  L4 LB integration is actually reaching saltare.
+- **OpenMetrics `# EOF` marker** — every `/metrics` body ends with
+  `# EOF\n`. Prometheus 2.x already accepts it; openmetrics-client /
+  m3 / strict OpenMetrics 1.0 tooling required it. Three bytes.
+
 ### Tests
 
-102 total — 6 new at [tests/test_v16.py](tests/test_v16.py):
-streaming brotli body decoded, streaming zstd header check, WS pmd
-handshake echoes the extension, WS no-pmd doesn't, WS pmd outbound
-RSV1 + decompresses to the original, WS pmd inbound inflates a
-client-compressed frame.
+108 total — 6 new at [tests/test_v16.py](tests/test_v16.py) for the
+compression / WS pmd diagonal (streaming brotli body decoded,
+streaming zstd header check, WS pmd handshake echoes the extension,
+WS no-pmd doesn't, WS pmd outbound RSV1 + decompresses to the
+original, WS pmd inbound inflates a client-compressed frame) plus 5
+covering the operational additions: HSTS header rendered with
+includeSubDomains + preload, HSTS off when max-age=0, OpenMetrics
+EOF marker present on `/metrics`, drain endpoint GET returns the
+state without flipping, drain endpoint DELETE returns 405 with an
+`Allow:` header.
 
 Brotli + zstd tests skip gracefully when libbrotlienc / libzstd
 aren't present in the test image (test-image dnf only lazy-deps

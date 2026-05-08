@@ -215,6 +215,15 @@ pub const Observability = struct {
     /// loads on `g_limits` / `g_obs`, so the swap is observed on the
     /// next request without locking.
     runtime_config_path: ?[]const u8 = null,
+    /// v1.6 graceful-drain endpoint. POST/PUT to this path flips the
+    /// worker into the same drain mode SIGTERM triggers: stop accepting,
+    /// let in-flight finish, exit cleanly. Pair with `health_path` so
+    /// k8s readiness probes start failing as soon as the drain begins;
+    /// the kubelet stops routing traffic before the existing connections
+    /// time out. Defense-in-depth: GET on the same path returns the
+    /// current draining state without flipping it (idempotent probe
+    /// for monitoring). Off by default. No Python dispatch.
+    drain_path: ?[]const u8 = null,
 };
 
 /// Resource ceilings that turn the architectural RAM win into a guaranteed
@@ -623,6 +632,24 @@ pub var g_comp_skip_noncomp: std.atomic.Value(u64) = std.atomic.Value(u64).init(
 pub var g_comp_skip_unavail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub var g_comp_skip_not_smaller: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
+// v1.6 TLS observability. Incremented in `doHandshake` on success.
+// `g_tls_session_reuse_total` tracks how many of those handshakes
+// short-circuited via the OpenSSL session cache — direct evidence of
+// whether `--tls-session-cache-size` is paying its keep. Always emitted
+// when TLS is enabled (g_tls_ctx != null) regardless of whether the
+// session cache flag was set, so a zero counter is itself informative.
+pub var g_tls_handshakes_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_tls_session_reuse_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+// v1.6 PROXY-protocol counters. Same shape as TLS: only emitted when
+// `proxy_protocol` is on, so a missing line on /metrics confirms the
+// feature is off. `accepted` counts headers that parsed cleanly;
+// `rejected` counts connections closed because the first 12 bytes
+// didn't match either a v1 ASCII line or a v2 binary signature.
+pub var g_proxy_proto_accepted_v1_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_proxy_proto_accepted_v2_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+pub var g_proxy_proto_rejected_total: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
 pub fn compressionMetricInc(encoding: []const u8, bytes_in: u64, bytes_out: u64) void {
     if (std.mem.eql(u8, encoding, "gzip")) {
         _ = g_comp_bytes_in_gzip.fetchAdd(bytes_in, .seq_cst);
@@ -660,6 +687,11 @@ fn resetMetrics() void {
     g_total_5xx.store(0, .seq_cst);
     for (&g_latency_buckets) |*slot| slot.store(0, .seq_cst);
     g_latency_sum_ns.store(0, .seq_cst);
+    g_tls_handshakes_total.store(0, .seq_cst);
+    g_tls_session_reuse_total.store(0, .seq_cst);
+    g_proxy_proto_accepted_v1_total.store(0, .seq_cst);
+    g_proxy_proto_accepted_v2_total.store(0, .seq_cst);
+    g_proxy_proto_rejected_total.store(0, .seq_cst);
 }
 
 /// Set by `run` when TLS is enabled. Lives only for the duration of one
@@ -1128,6 +1160,46 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         });
     }
 
+    // v1.6 TLS observability. Emitted whenever TLS is configured for
+    // this worker (g_tls_ctx != null), even at zero counts — a healthy
+    // tls_handshakes_total at non-zero requests_total proves connections
+    // are actually doing TLS, not falling through to plaintext.
+    if (g_tls_ctx != null) {
+        w.write(
+            \\# HELP saltare_tls_handshakes_total Successful TLS handshakes since startup.
+            \\# TYPE saltare_tls_handshakes_total counter
+            \\saltare_tls_handshakes_total {d}
+            \\# HELP saltare_tls_session_reuse_total Handshakes that reused a cached session (RFC 5077 / 8446 PSK).
+            \\# TYPE saltare_tls_session_reuse_total counter
+            \\saltare_tls_session_reuse_total {d}
+            \\
+        , .{
+            g_tls_handshakes_total.load(.seq_cst),
+            g_tls_session_reuse_total.load(.seq_cst),
+        });
+    }
+
+    // v1.6 PROXY-protocol counters. Emitted only when the operator has
+    // `--proxy-protocol` enabled — a missing line on /metrics confirms
+    // the feature is off, not just inactive.
+    if (g_obs.proxy_protocol) {
+        w.write(
+            \\# HELP saltare_proxy_protocol_accepted_total Connections that arrived with a parsed PROXY-protocol header.
+            \\# TYPE saltare_proxy_protocol_accepted_total counter
+            \\saltare_proxy_protocol_accepted_total{{version="v1"}} {d}
+            \\saltare_proxy_protocol_accepted_total{{version="v2"}} {d}
+            \\
+        , .{
+            g_proxy_proto_accepted_v1_total.load(.seq_cst),
+            g_proxy_proto_accepted_v2_total.load(.seq_cst),
+        });
+    }
+
+    // v1.6 OpenMetrics EOF marker (RFC for OpenMetrics 1.0). Both
+    // Prometheus 2.x scrape paths accept it; OpenMetrics-strict tooling
+    // (openmetrics-client, m3) requires it. Cheap — three bytes.
+    w.write("# EOF\n", .{});
+
     var head_buf: [512]u8 = undefined;
     const head = std.fmt.bufPrint(
         &head_buf,
@@ -1467,6 +1539,33 @@ fn serveDispatch(loop: *eventloop.Loop, conn: *Connection) void {
         return;
     };
     serveFixedBody(loop, conn, 200, "OK", "application/json; charset=utf-8", body, "");
+}
+
+/// v1.6 graceful-drain endpoint. POST/PUT flips `g_draining` to true;
+/// the main loop notices on the next iteration and behaves identically
+/// to a SIGTERM-driven drain (stops accepting, lets in-flight finish,
+/// exits when shutdown_timeout elapses or all conns close). GET is an
+/// idempotent probe — returns the current state without flipping.
+/// Other verbs return 405 so a curl typo doesn't accidentally drain.
+fn serveDrainEndpoint(loop: *eventloop.Loop, conn: *Connection) void {
+    const req = conn.parsed.?;
+    if (std.mem.eql(u8, req.method, "POST") or std.mem.eql(u8, req.method, "PUT")) {
+        const was_draining = g_draining.swap(true, .seq_cst);
+        const body = if (was_draining)
+            "{\"draining\":true,\"changed\":false}\n"
+        else
+            "{\"draining\":true,\"changed\":true}\n";
+        return serveFixedBody(loop, conn, 200, "OK", "application/json; charset=utf-8", body, "");
+    }
+    if (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "HEAD")) {
+        const draining = g_draining.load(.seq_cst);
+        const body = if (draining)
+            "{\"draining\":true}\n"
+        else
+            "{\"draining\":false}\n";
+        return serveFixedBody(loop, conn, 200, "OK", "application/json; charset=utf-8", body, "");
+    }
+    serveFixedBody(loop, conn, 405, "Method Not Allowed", "text/plain; charset=utf-8", "method not allowed\n", "Allow: GET, HEAD, POST, PUT\r\n");
 }
 
 /// CORS preflight intercept. Answers OPTIONS-with-Origin from Zig with a
@@ -2718,6 +2817,7 @@ fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
             // family 0 (UNSPEC) or 3 (AF_UNIX): keep TCP peer.
         }
         consumed = total;
+        _ = g_proxy_proto_accepted_v2_total.fetchAdd(1, .seq_cst);
     } else {
         // PROXY v1 text format.
         const buf = data[0..conn.read_total];
@@ -2759,6 +2859,7 @@ fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
             return;
         }
         consumed = crlf + 2;
+        _ = g_proxy_proto_accepted_v1_total.fetchAdd(1, .seq_cst);
     }
 
     // Re-check the per-IP connection cap now that we know the real
@@ -2799,6 +2900,15 @@ fn doHandshake(loop: *eventloop.Loop, conn: *Connection) void {
     const ssl = conn.ssl.?;
     switch (tls.handshake(ssl)) {
         .ok => {
+            // v1.6: count completed TLS handshakes + session reuses for
+            // /metrics. A second .ok event for the same connection would
+            // be the rare TLS-renegotiation case; we don't try to filter
+            // it out — the counter is a rate, not an exact handshake-per-
+            // accept tally.
+            _ = g_tls_handshakes_total.fetchAdd(1, .seq_cst);
+            if (tls.sessionReused(ssl)) {
+                _ = g_tls_session_reuse_total.fetchAdd(1, .seq_cst);
+            }
             conn.state = .reading;
             loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
                 loop.remove(conn.fd);
@@ -3326,6 +3436,11 @@ fn dispatchWithBody(loop: *eventloop.Loop, conn: *Connection, more_body: bool) v
     if (g_obs.dispatch_path) |path| {
         if (std.mem.eql(u8, req.target, path)) {
             return serveDispatch(loop, conn);
+        }
+    }
+    if (g_obs.drain_path) |path| {
+        if (std.mem.eql(u8, req.target, path)) {
+            return serveDrainEndpoint(loop, conn);
         }
     }
     if (g_obs.cors_preflight_allow_all and

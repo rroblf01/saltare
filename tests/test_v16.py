@@ -324,3 +324,75 @@ def test_ws_pmd_inbound_compressed():
     # Server echoes back compressed; decompress to verify.
     decoded = zlib.decompressobj(-15).decompress(payload + b"\x00\x00\xff\xff")
     assert decoded.decode("utf-8") == msg
+
+
+# ---------------------------------------------------------------------------
+# v1.6: HSTS, drain endpoint, OpenMetrics EOF, proxy-protocol counters.
+# ---------------------------------------------------------------------------
+
+
+async def _hello(scope, receive, send):
+    if scope["type"] == "lifespan":
+        await _lifespan_drain(receive, send)
+        return
+    await receive()
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"text/plain")]})
+    await send({"type": "http.response.body", "body": b"hi"})
+
+
+def test_hsts_header_emitted_when_enabled():
+    """--hsts-max-age N puts Strict-Transport-Security on every response;
+    includeSubDomains + preload tokens are appended when their flags are
+    on. Off by default — no header at max-age=0."""
+    port = _free_port()
+    _serve(_hello, port,
+           hsts_max_age=63072000,
+           hsts_include_subdomains=True,
+           hsts_preload=True)
+    r = httpx.get(f"http://127.0.0.1:{port}/", timeout=5.0 * _TIMING_FACTOR)
+    assert r.status_code == 200
+    sts = r.headers.get("strict-transport-security", "")
+    assert "max-age=63072000" in sts
+    assert "includeSubDomains" in sts
+    assert "preload" in sts
+
+
+def test_hsts_off_by_default():
+    port = _free_port()
+    _serve(_hello, port)
+    r = httpx.get(f"http://127.0.0.1:{port}/", timeout=5.0 * _TIMING_FACTOR)
+    assert "strict-transport-security" not in {k.lower() for k in r.headers.keys()}
+
+
+def test_metrics_openmetrics_eof_marker():
+    """/metrics body ends with `# EOF\\n` (OpenMetrics 1.0)."""
+    port = _free_port()
+    _serve(_hello, port, metrics_path="/metrics")
+    httpx.get(f"http://127.0.0.1:{port}/", timeout=5.0 * _TIMING_FACTOR)
+    r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=5.0 * _TIMING_FACTOR)
+    assert r.status_code == 200
+    assert r.text.rstrip("\n").endswith("# EOF")
+
+
+def test_drain_endpoint_get_idempotent():
+    """GET on the drain path returns current state without flipping."""
+    port = _free_port()
+    _serve(_hello, port, drain_path="/admin/drain")
+    r = httpx.get(f"http://127.0.0.1:{port}/admin/drain",
+                  timeout=5.0 * _TIMING_FACTOR)
+    assert r.status_code == 200
+    assert r.json() == {"draining": False}
+    # Confirm the worker still serves regular traffic.
+    r2 = httpx.get(f"http://127.0.0.1:{port}/", timeout=5.0 * _TIMING_FACTOR)
+    assert r2.status_code == 200
+
+
+def test_drain_endpoint_method_not_allowed():
+    """DELETE etc. return 405 — guards against curl typos."""
+    port = _free_port()
+    _serve(_hello, port, drain_path="/admin/drain")
+    r = httpx.delete(f"http://127.0.0.1:{port}/admin/drain",
+                     timeout=5.0 * _TIMING_FACTOR)
+    assert r.status_code == 405
+    assert "GET" in r.headers.get("allow", "")

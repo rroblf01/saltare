@@ -119,6 +119,31 @@ def set_traceparent_propagation(enabled: bool) -> None:
     _traceparent_propagation = bool(enabled)
 
 
+# v1.6 HSTS (RFC 6797). Opt-in. When `_hsts_header_line` is non-empty the
+# dispatcher appends it to every response. Operator owns the decision —
+# we don't gate on scope["scheme"] because real deployments terminate TLS
+# at a proxy and saltare sees scheme="http" via X-Forwarded-Proto: https.
+# Pre-rendered byte string saves a bytes-build per response.
+_hsts_header_line: bytes = b""
+
+
+def set_hsts(max_age: int, include_subdomains: bool, preload: bool) -> None:
+    """Pre-render `Strict-Transport-Security` header. `max_age <= 0`
+    disables (line cleared)."""
+    global _hsts_header_line
+    if max_age <= 0:
+        _hsts_header_line = b""
+        return
+    parts = [f"max-age={int(max_age)}"]
+    if include_subdomains:
+        parts.append("includeSubDomains")
+    if preload:
+        parts.append("preload")
+    _hsts_header_line = (
+        b"strict-transport-security: " + "; ".join(parts).encode("ascii") + b"\r\n"
+    )
+
+
 def _ensure_state() -> threading.local:
     if not hasattr(_state, "loop"):
         _state.loop = asyncio.new_event_loop()
@@ -1730,6 +1755,8 @@ class _HttpState:
             parts.append(_request_id_header + b": " + self._request_id + b"\r\n")
         if self._traceparent_echo:
             parts.append(b"traceparent: " + self._traceparent_echo + b"\r\n")
+        if _hsts_header_line:
+            parts.append(_hsts_header_line)
         if _server_timing_enabled and self._start_ns:
             import time
             elapsed_ms = (time.monotonic_ns() - self._start_ns) / 1_000_000.0

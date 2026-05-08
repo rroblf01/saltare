@@ -77,6 +77,10 @@ def run(
     runtime_config_path: str | None = None,
     dispatch_token: str | None = None,
     ktls: bool = False,
+    hsts_max_age: int = 0,
+    hsts_include_subdomains: bool = False,
+    hsts_preload: bool = False,
+    drain_path: str | None = None,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -262,6 +266,12 @@ def run(
         int(max_request_body),
     )
     _dispatcher.set_traceparent_propagation(bool(traceparent_propagation))
+    # v1.6 HSTS. `max_age=0` keeps the header line empty (zero-cost path).
+    _dispatcher.set_hsts(
+        int(hsts_max_age),
+        bool(hsts_include_subdomains),
+        bool(hsts_preload),
+    )
 
     # `workers=0` is shorthand for "use what the kernel says we have,
     # capped at 4". Multi-worker past 4 hits diminishing returns under
@@ -322,4 +332,5 @@ def run(
         runtime_config_path,
         dispatch_token,
         int(bool(ktls)),
+        drain_path,
     )

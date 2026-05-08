@@ -60,6 +60,7 @@ const Funcs = struct {
     SSL_write: *const fn (*Ssl, [*]const u8, c_int) callconv(.c) c_int,
     SSL_pending: *const fn (*Ssl) callconv(.c) c_int,
     SSL_get_error: *const fn (*Ssl, c_int) callconv(.c) c_int,
+    SSL_session_reused: *const fn (*Ssl) callconv(.c) c_int,
 };
 
 const SSL_VERIFY_NONE: c_int = 0x00;
@@ -275,6 +276,16 @@ pub fn pending(ssl: *Ssl) usize {
     const r = f.SSL_pending(ssl);
     if (r < 0) return 0;
     return @intCast(r);
+}
+
+/// True iff this SSL handshake reused a cached server-side session
+/// instead of doing a full handshake (RFC 5077 tickets / RFC 8446 PSK).
+/// Read once after handshake completes for the
+/// `saltare_tls_session_reuse_total` counter — observability into how
+/// effective the configured `tls_session_cache_size` is.
+pub fn sessionReused(ssl: *Ssl) bool {
+    const f = funcs orelse return false;
+    return f.SSL_session_reused(ssl) != 0;
 }
 
 fn mapError(ssl: *Ssl, ret: c_int) IoStatus {

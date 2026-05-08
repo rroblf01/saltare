@@ -199,10 +199,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var runtime_config_path_z: [*c]const u8 = null;
     var dispatch_token_z: [*c]const u8 = null;
     var ktls_flag: c_int = 0;
+    var drain_path_z: [*c]const u8 = null;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzzi",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzziz",
         &app,
         &host_z,
         &port,
@@ -252,6 +253,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &runtime_config_path_z,
         &dispatch_token_z,
         &ktls_flag,
+        &drain_path_z,
     ) == 0) {
         return null;
     }
@@ -312,6 +314,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .dispatch_path = if (dispatch_path_z != null) std.mem.span(dispatch_path_z) else null,
         .runtime_config_path = if (runtime_config_path_z != null) std.mem.span(runtime_config_path_z) else null,
         .dispatch_token = if (dispatch_token_z != null) std.mem.span(dispatch_token_z) else null,
+        .drain_path = if (drain_path_z != null) std.mem.span(drain_path_z) else null,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 

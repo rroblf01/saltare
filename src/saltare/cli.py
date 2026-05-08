@@ -500,6 +500,22 @@ def main(argv: list[str] | None = None) -> None:
         help="enable OpenSSL kTLS (sendfile-over-HTTPS, kernel TLS records; needs OpenSSL >=3.0 + Linux >=4.13)",
     )
     parser.add_argument(
+        "--hsts-max-age", type=int, default=0, metavar="SECS",
+        help="when >0, emit Strict-Transport-Security: max-age=SECS on every response (RFC 6797; 0 disables)",
+    )
+    parser.add_argument(
+        "--hsts-include-subdomains", action="store_true",
+        help="add `includeSubDomains` to the HSTS header (only meaningful with --hsts-max-age)",
+    )
+    parser.add_argument(
+        "--hsts-preload", action="store_true",
+        help="add `preload` to the HSTS header (HSTS preload list eligibility — implies includeSubDomains + max-age >= 31536000)",
+    )
+    parser.add_argument(
+        "--drain-path", type=str, default=None, metavar="PATH",
+        help="POST/PUT to PATH (e.g. '/admin/drain') flips the worker into graceful drain — Zig-side intercept (no Python dispatch). Pair with --health-path for k8s rolling deploys.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -594,4 +610,8 @@ def main(argv: list[str] | None = None) -> None:
         # secrets are the safer default for production.
         dispatch_token=args.dispatch_token or os.environ.get("SALTARE_DISPATCH_TOKEN") or None,
         ktls=args.ktls,
+        hsts_max_age=args.hsts_max_age,
+        hsts_include_subdomains=args.hsts_include_subdomains,
+        hsts_preload=args.hsts_preload,
+        drain_path=args.drain_path,
     )
