@@ -586,6 +586,14 @@ pub const WsOpen = struct {
     /// `subprotocol.len > 0`). Server.zig echoes this in the
     /// `Sec-WebSocket-Protocol` 101-response header.
     subprotocol: []u8,
+    /// v1.6 negotiated WebSocket extension token to echo as the
+    /// `Sec-WebSocket-Extensions` 101-response header. Currently
+    /// only `permessage-deflate; ...` per RFC 7692. Empty = none.
+    /// Owned by `allocator`.
+    extensions: []u8,
+    /// True iff per-message-deflate was negotiated. Server.zig flips
+    /// `conn.ws_pmd_active` so subsequent rsv1 hints flow correctly.
+    pmd_active: bool,
 };
 
 pub const WsTick = struct {
@@ -643,17 +651,18 @@ pub fn wsOpen(req: http.Request, allocator: std.mem.Allocator) ?WsOpen {
 /// Push one WebSocket text/binary frame into the running coroutine and pump
 /// the Python loop. Returns the encoded frames the app produced, plus a
 /// `done` flag if the coroutine has finished. `opcode` is 0x1 (text) or 0x2.
-pub fn wsEvent(handle: c_long, opcode: u8, payload: []const u8, allocator: std.mem.Allocator) ?WsTick {
+pub fn wsEvent(handle: c_long, opcode: u8, payload: []const u8, rsv1: bool, allocator: std.mem.Allocator) ?WsTick {
     const gstate = py.PyGILState_Ensure();
     defer py.PyGILState_Release(gstate);
 
     const result = py.PyObject_CallFunction(
         g_ws_event.?,
-        "liy#",
+        "liy#i",
         handle,
         @as(c_int, @intCast(opcode)),
         @as([*c]const u8, @ptrCast(payload.ptr)),
         @as(py.Py_ssize_t, @intCast(payload.len)),
+        @as(c_int, if (rsv1) 1 else 0),
     ) orelse {
         py.PyErr_Print();
         return null;
@@ -684,21 +693,24 @@ pub fn wsDisconnect(handle: c_long, code: u16, allocator: std.mem.Allocator) []u
 }
 
 fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
-    if (py.PyTuple_Size(result) != 5) return null;
+    if (py.PyTuple_Size(result) != 7) return null;
 
     const handle_obj = py.PyTuple_GetItem(result, 0);
     const accepted_obj = py.PyTuple_GetItem(result, 1);
     const frames_obj = py.PyTuple_GetItem(result, 2);
     const done_obj = py.PyTuple_GetItem(result, 3);
     const sub_obj = py.PyTuple_GetItem(result, 4);
+    const ext_obj = py.PyTuple_GetItem(result, 5);
+    const pmd_obj = py.PyTuple_GetItem(result, 6);
     if (handle_obj == null or accepted_obj == null or frames_obj == null or
-        done_obj == null or sub_obj == null) {
+        done_obj == null or sub_obj == null or ext_obj == null or pmd_obj == null) {
         return null;
     }
 
     const handle = py.PyLong_AsLong(handle_obj);
     const accepted = py.PyObject_IsTrue(accepted_obj) == 1;
     const done = py.PyObject_IsTrue(done_obj) == 1;
+    const pmd_active = py.PyObject_IsTrue(pmd_obj) == 1;
     const frames = copyBytes(frames_obj.?, allocator) orelse return null;
 
     // Subprotocol arrives as a Python `str` (empty when the app didn't
@@ -717,12 +729,28 @@ fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
         subprotocol = buf;
     }
 
+    var ext_len: py.Py_ssize_t = 0;
+    const ext_ptr = py.PyUnicode_AsUTF8AndSize(ext_obj.?, &ext_len);
+    var extensions: []u8 = &.{};
+    if (ext_ptr != null and ext_len > 0) {
+        const len: usize = @intCast(ext_len);
+        const buf = allocator.alloc(u8, len) catch {
+            allocator.free(frames);
+            if (subprotocol.len > 0) allocator.free(subprotocol);
+            return null;
+        };
+        @memcpy(buf, ext_ptr[0..len]);
+        extensions = buf;
+    }
+
     return .{
         .handle = handle,
         .accepted = accepted,
         .frames = frames,
         .done = done,
         .subprotocol = subprotocol,
+        .extensions = extensions,
+        .pmd_active = pmd_active,
     };
 }
 

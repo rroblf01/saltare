@@ -73,7 +73,7 @@ fn malloc_trim(pad: usize) c_int {
     return 0; // musl path: no-op, succeed silently
 }
 
-const SERVER_HEADER = "saltare/1.5.0";
+const SERVER_HEADER = "saltare/1.6.0";
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`
@@ -1843,8 +1843,17 @@ const Connection = struct {
     // delivers the reassembled message and frees the buffer. Capped to
     // 1 MiB so a slow producer can't OOM us.
     ws_frag_opcode: u8,
+    /// rsv1 of the first frame in a fragmented message — RFC 7692
+    /// per-message-deflate sets it on the start frame only; the
+    /// reassembled message inherits the flag.
+    ws_frag_rsv1: bool,
     ws_frag_buf: ?[]u8,
     ws_frag_len: usize,
+    /// v1.6 WS per-message-deflate negotiated for this connection.
+    /// Set in `startWebSocket` when the client offered the extension
+    /// and the dispatcher accepted. Used to pass the rsv1 hint to
+    /// the bridge on every inbound message.
+    ws_pmd_active: bool,
 
     // v1.4: request-body streaming state. When the declared
     // `Content-Length` exceeds the read buffer's available space,
@@ -1901,8 +1910,10 @@ const Connection = struct {
             .last_activity_ns = 0,
             .accepted_ns = monoNs(),
             .ws_frag_opcode = 0,
+            .ws_frag_rsv1 = false,
             .ws_frag_buf = null,
             .ws_frag_len = 0,
+            .ws_pmd_active = false,
             .body_streaming = false,
             .body_streaming_consumed = 0,
         };
@@ -3463,10 +3474,11 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
     };
-    // Subprotocol buffer is owned by us regardless of which branch we
-    // exit through. Free it on every error path AND after we've copied
-    // it into the response.
+    // Subprotocol + extensions buffers owned by us; free in every
+    // exit branch.
     defer if (opened.subprotocol.len > 0) conn.allocator.free(opened.subprotocol);
+    defer if (opened.extensions.len > 0) conn.allocator.free(opened.extensions);
+    conn.ws_pmd_active = opened.pmd_active;
 
     if (!opened.accepted) {
         // App rejected by closing without accepting.
@@ -3488,40 +3500,52 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     var accept_buf: [28]u8 = undefined;
     const accept = ws.computeAccept(trimmed_key, &accept_buf);
 
-    var resp_buf: [512]u8 = undefined;
-    const resp = if (opened.subprotocol.len > 0)
-        std.fmt.bufPrint(
-            &resp_buf,
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Accept: {s}\r\n" ++
-                "Sec-WebSocket-Protocol: {s}\r\n" ++
-                "{s}" ++
-                "\r\n",
-            .{ accept, opened.subprotocol, g_server_line },
-        ) catch {
-            if (opened.frames.len > 0) conn.allocator.free(opened.frames);
-            loop.remove(conn.fd);
-            conn.destroy();
-            return;
-        }
-    else
-        std.fmt.bufPrint(
-            &resp_buf,
-            "HTTP/1.1 101 Switching Protocols\r\n" ++
-                "Upgrade: websocket\r\n" ++
-                "Connection: Upgrade\r\n" ++
-                "Sec-WebSocket-Accept: {s}\r\n" ++
-                "{s}" ++
-                "\r\n",
-            .{ accept, g_server_line },
+    var resp_buf: [768]u8 = undefined;
+    var resp_pos: usize = 0;
+    const base = std.fmt.bufPrint(
+        resp_buf[resp_pos..],
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: {s}\r\n" ++
+            "{s}",
+        .{ accept, g_server_line },
+    ) catch {
+        if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    resp_pos += base.len;
+    if (opened.subprotocol.len > 0) {
+        const line = std.fmt.bufPrint(
+            resp_buf[resp_pos..],
+            "Sec-WebSocket-Protocol: {s}\r\n",
+            .{opened.subprotocol},
         ) catch {
             if (opened.frames.len > 0) conn.allocator.free(opened.frames);
             loop.remove(conn.fd);
             conn.destroy();
             return;
         };
+        resp_pos += line.len;
+    }
+    if (opened.extensions.len > 0) {
+        const line = std.fmt.bufPrint(
+            resp_buf[resp_pos..],
+            "Sec-WebSocket-Extensions: {s}\r\n",
+            .{opened.extensions},
+        ) catch {
+            if (opened.frames.len > 0) conn.allocator.free(opened.frames);
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
+        resp_pos += line.len;
+    }
+    @memcpy(resp_buf[resp_pos..resp_pos + 2], "\r\n");
+    resp_pos += 2;
+    const resp = resp_buf[0..resp_pos];
 
     // Concatenate 101 + any frames the app emitted between accept and the
     // first await receive() (e.g. an immediate `websocket.send`).
@@ -3728,11 +3752,12 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                             // Hand off to wsDeliverToApp; it copies
                             // bytes to the Python side, so freeing
                             // after is safe.
-                            wsDeliverToApp(loop, conn, assembled_op, assembled);
+                            wsDeliverToApp(loop, conn, assembled_op, assembled, conn.ws_frag_rsv1);
                             conn.allocator.free(conn.ws_frag_buf.?);
                             conn.ws_frag_buf = null;
                             conn.ws_frag_len = 0;
                             conn.ws_frag_opcode = 0;
+                            conn.ws_frag_rsv1 = false;
                             const leftover2 = conn.read_total - total;
                             if (leftover2 > 0) {
                                 std.mem.copyForwards(u8, data[0..leftover2], data[total..total + leftover2]);
@@ -3810,6 +3835,7 @@ fn handleWsFragment(conn: *Connection, hdr: ws.Header, payload: []u8) bool {
         conn.ws_frag_buf = buf;
         conn.ws_frag_len = 0;
         conn.ws_frag_opcode = hdr.opcode_raw;
+        conn.ws_frag_rsv1 = hdr.rsv1;
     } else {
         return false;
     }
@@ -3828,8 +3854,8 @@ fn handleWsFragment(conn: *Connection, hdr: ws.Header, payload: []u8) bool {
 
 fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, payload: []u8) void {
     switch (hdr.opcode) {
-        .text => wsDeliverToApp(loop, conn, 0x1, payload),
-        .binary => wsDeliverToApp(loop, conn, 0x2, payload),
+        .text => wsDeliverToApp(loop, conn, 0x1, payload, hdr.rsv1),
+        .binary => wsDeliverToApp(loop, conn, 0x2, payload, hdr.rsv1),
         .close => {
             // Echo close + tear down.
             sendCloseFrame(conn, 1000) catch {};
@@ -3847,8 +3873,8 @@ fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, paylo
     }
 }
 
-fn wsDeliverToApp(loop: *eventloop.Loop, conn: *Connection, opcode: u8, payload: []const u8) void {
-    const tick = bridge.wsEvent(conn.ws_handle, opcode, payload, conn.allocator) orelse {
+fn wsDeliverToApp(loop: *eventloop.Loop, conn: *Connection, opcode: u8, payload: []const u8, rsv1: bool) void {
+    const tick = bridge.wsEvent(conn.ws_handle, opcode, payload, rsv1, conn.allocator) orelse {
         wsTeardown(loop, conn);
         return;
     };

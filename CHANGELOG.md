@@ -1,5 +1,98 @@
 # Changelog
 
+## 1.6.0
+
+**Theme**: complete the compression matrix + WebSocket extensions.
+v1.4 shipped one-shot brotli/zstd; v1.5 shipped streaming gzip;
+v1.6 closes the diagonal — brotli + zstd now compress chunked
+responses end-to-end, and WebSocket connections that offer
+`permessage-deflate` get RFC 7692 compressed frames.
+
+### Default-on (no flag)
+
+- **Six v1.5-cycle bug fixes** rolled forward unchanged.
+
+### Opt-in flags (no new flags; existing knobs apply)
+
+- **Streaming brotli** — when `--response-brotli` is on and a response
+  emits `more_body=True`, saltare carries a `BrotliEncoderState*`
+  across `_send` calls (created via the new lazy-dlopen surface in
+  [src/zig/brotli.zig](src/zig/brotli.zig); accessed from Python via
+  `_core.brotli_stream_create` / `…compress` / `…destroy`). Per
+  intermediate chunk: `BROTLI_OPERATION_FLUSH`. Final chunk:
+  `BROTLI_OPERATION_FINISH`. Counters land on
+  `saltare_response_compression_total{encoding="br"}` etc.
+- **Streaming zstd** — same pattern, libzstd's `ZSTD_CCtx*` carried
+  across `_send`. Per chunk: `ZSTD_e_flush`. Final: `ZSTD_e_end`.
+  Note: streaming zstd may emit multiple concatenated frames; the
+  one-shot `_core.zstd_decode` doesn't handle that, but standard
+  zstd clients (curl --compressed, fetch, browsers) do.
+- **WebSocket per-message-deflate** (RFC 7692) — when the client's
+  upgrade carries `Sec-WebSocket-Extensions: permessage-deflate`,
+  saltare:
+  - echoes `permessage-deflate; client_no_context_takeover;
+    server_no_context_takeover` in the 101 response (no shared
+    sliding window across messages — simpler + lower per-conn RAM);
+  - sets RSV1 on outbound text/binary frames; payload is raw-deflate
+    + `Z_SYNC_FLUSH` minus the trailing 4-byte sync marker (per
+    RFC 7692 §7.2.1);
+  - inflates inbound frames whose RSV1 is set (`payload + b"\x00\x00\xff\xff"`
+    fed to `zlib.decompressobj(-15).decompress(..., max_size=1 MiB)` —
+    zip-bomb capped). Malformed compressed frames close the
+    connection.
+  WS-frame builder in `_dispatcher.py::_build_server_frame` gains an
+  `rsv1: bool` parameter; framing for non-pmd connections is
+  byte-identical to v1.5.
+
+### Cross-cutting Zig API additions
+
+- [src/zig/brotli.zig](src/zig/brotli.zig): `streamCreate`,
+  `streamCompress`, `streamDestroy` + new func-table entries
+  (`BrotliEncoderCreateInstance` / `…SetParameter` / `…CompressStream`
+  / `…HasMoreOutput` / `…TakeOutput` / `…DestroyInstance`).
+- [src/zig/zstd.zig](src/zig/zstd.zig): `streamCreate`, `streamCompress`,
+  `streamDestroy` + `ZSTD_createCCtx` / `ZSTD_freeCCtx` /
+  `ZSTD_CCtx_setParameter` / `ZSTD_compressStream2` plus
+  `ZstdInBuffer` / `ZstdOutBuffer` extern structs.
+- [src/zig/ws.zig](src/zig/ws.zig): `Header.rsv1` field surfaced from
+  the wire (bit 6 of byte 0).
+- [src/zig/server.zig](src/zig/server.zig): `Connection.ws_pmd_active`
+  + `ws_frag_rsv1` (fragment-reassembly tracks the start frame's
+  rsv1).
+- [src/zig/bridge.zig](src/zig/bridge.zig): `WsOpen` extended with
+  `extensions: []u8` + `pmd_active: bool`. `wsEvent` signature gains
+  `rsv1: bool` (Python side: `ws_event(handle, opcode, payload, rsv1)`).
+
+### Tests
+
+102 total — 6 new at [tests/test_v16.py](tests/test_v16.py):
+streaming brotli body decoded, streaming zstd header check, WS pmd
+handshake echoes the extension, WS no-pmd doesn't, WS pmd outbound
+RSV1 + decompresses to the original, WS pmd inbound inflates a
+client-compressed frame.
+
+Brotli + zstd tests skip gracefully when libbrotlienc / libzstd
+aren't present in the test image (test-image dnf only lazy-deps
+manylinux core + the libs are not vendored to the wheel — the
+production Alpine image is where they're bundled).
+
+### Bench
+
+No bench delta vs v1.5 — every new feature is opt-in, and when off
+the dispatcher path is byte-identical (`if not self.pmd_active` /
+`if not self._brotli_handle` early-outs).
+
+### Deferred to v1.7+
+
+- HTTP/2 + ALPN (~3-4 weeks; nghttp2 + HPACK + multiplex state
+  machine).
+- io_uring event loop (~2-3 weeks; eventloop.zig rewrite).
+- macOS port (~3-5 days; kqueue + Linux-isms).
+- OTLP exporter (~2-3 days; protobuf hand-roll).
+- HTTP/3 / QUIC (~months; v2.0 territory).
+
+
+
 ## 1.5.0
 
 **Theme**: operational depth + distribution reach. Saltare now ships

@@ -9,11 +9,21 @@ const dl = @cImport({
     @cInclude("dlfcn.h");
 });
 
-// Symbols we use from libbrotlienc + libbrotlidec.
+// Symbols we use from libbrotlienc + libbrotlidec. Streaming surface
+// (v1.6) added `BrotliEncoderCreateInstance` / `…SetParameter` /
+// `…CompressStream` / `…HasMoreOutput` / `…TakeOutput` /
+// `…DestroyInstance` so the Python dispatcher can carry a Brotli
+// state across `_send` calls in chunked-streaming responses.
 const Funcs = struct {
     BrotliEncoderMaxCompressedSize: *const fn (usize) callconv(.c) usize,
     BrotliEncoderCompress: *const fn (c_int, c_int, c_int, usize, [*]const u8, *usize, [*]u8) callconv(.c) c_int,
     BrotliDecoderDecompress: *const fn (usize, [*]const u8, *usize, [*]u8) callconv(.c) c_int,
+    BrotliEncoderCreateInstance: *const fn (?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.c) ?*anyopaque,
+    BrotliEncoderSetParameter: *const fn (?*anyopaque, c_int, u32) callconv(.c) c_int,
+    BrotliEncoderCompressStream: *const fn (?*anyopaque, c_int, *usize, *[*]const u8, *usize, *[*]u8, ?*usize) callconv(.c) c_int,
+    BrotliEncoderHasMoreOutput: *const fn (?*anyopaque) callconv(.c) c_int,
+    BrotliEncoderTakeOutput: *const fn (?*anyopaque, *usize) callconv(.c) [*]const u8,
+    BrotliEncoderDestroyInstance: *const fn (?*anyopaque) callconv(.c) void,
 };
 
 var funcs: ?Funcs = null;
@@ -129,4 +139,70 @@ pub fn brotliDecode(src: []const u8, allocator: std.mem.Allocator, max_size: usi
         return null;
     }
     return allocator.realloc(buf, out_size) catch buf[0..out_size];
+}
+
+// v1.6 streaming brotli. Same encoder lifecycle as zlib's
+// `compressobj`: caller creates an instance, feeds chunks, calls
+// `streamFinish` at the end to flush the final block.
+pub const BROTLI_PARAM_QUALITY: c_int = 1;
+pub const BROTLI_PARAM_LGWIN: c_int = 2;
+pub const BROTLI_OPERATION_PROCESS: c_int = 0;
+pub const BROTLI_OPERATION_FLUSH: c_int = 1;
+pub const BROTLI_OPERATION_FINISH: c_int = 2;
+
+/// Create a streaming brotli encoder. Returns an opaque handle (the
+/// libbrotli `BrotliEncoderState*`) or null on libbrotli miss.
+/// Caller must pair with `streamDestroy`.
+pub fn streamCreate(quality: c_int) ?*anyopaque {
+    if (!loadFuncs()) return null;
+    const f = funcs.?;
+    const inst = f.BrotliEncoderCreateInstance(null, null, null) orelse return null;
+    const q: u32 = @intCast(if (quality < 0) DEFAULT_QUALITY else quality);
+    _ = f.BrotliEncoderSetParameter(inst, BROTLI_PARAM_QUALITY, q);
+    return inst;
+}
+
+/// Feed `chunk` into the encoder, drain any produced output, return
+/// caller-owned bytes (possibly empty). Pass `finish=true` on the
+/// last call to flush the final brotli block. `null` on encode error.
+pub fn streamCompress(
+    state: *anyopaque,
+    chunk: []const u8,
+    allocator: std.mem.Allocator,
+    finish: bool,
+) ?[]u8 {
+    const f = funcs.?; // streamCreate already loaded
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    out.ensureTotalCapacity(allocator, chunk.len) catch return null;
+
+    var avail_in: usize = chunk.len;
+    var next_in: [*]const u8 = if (chunk.len > 0) chunk.ptr else @ptrFromInt(0x1);
+    const op: c_int = if (finish) BROTLI_OPERATION_FINISH else BROTLI_OPERATION_FLUSH;
+
+    while (true) {
+        // Drive the encoder with zero output buffer; we drain via
+        // TakeOutput which is the documented streaming pattern.
+        var avail_out: usize = 0;
+        var next_out: [*]u8 = @ptrFromInt(0x1);
+        const rc = f.BrotliEncoderCompressStream(state, op, &avail_in, &next_in, &avail_out, &next_out, null);
+        if (rc == 0) return null;
+        while (f.BrotliEncoderHasMoreOutput(state) != 0) {
+            var taken: usize = 0;
+            const ptr = f.BrotliEncoderTakeOutput(state, &taken);
+            if (taken > 0) {
+                out.appendSlice(allocator, ptr[0..taken]) catch return null;
+            }
+        }
+        if (avail_in == 0 and (op == BROTLI_OPERATION_FLUSH or op == BROTLI_OPERATION_PROCESS)) break;
+        if (op == BROTLI_OPERATION_FINISH) {
+            // FINISH loops until encoder reports nothing pending.
+            if (f.BrotliEncoderHasMoreOutput(state) == 0 and avail_in == 0) break;
+        }
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+pub fn streamDestroy(state: *anyopaque) void {
+    if (funcs) |f| f.BrotliEncoderDestroyInstance(state);
 }

@@ -22,6 +22,13 @@ pub const Opcode = enum(u4) {
 
 pub const Header = struct {
     fin: bool,
+    /// v1.6 RFC 7692 per-message-deflate. When negotiated, the
+    /// server sets RSV1 on every compressed (text/binary) frame and
+    /// the client sets it on its compressed frames. Always-zero on
+    /// connections without the extension. Surfaced through the
+    /// bridge so the dispatcher can decide whether to inflate the
+    /// payload.
+    rsv1: bool,
     opcode: Opcode,
     /// Raw 4-bit opcode value as read from the wire. v1.3 added so the
     /// fragmentation reassembler can distinguish "continuation"
@@ -50,6 +57,7 @@ pub fn parseHeader(buf: []const u8) ParseResult {
     const b1 = buf[1];
 
     const fin = (b0 & 0x80) != 0;
+    const rsv1 = (b0 & 0x40) != 0;
     const opcode_raw: u4 = @intCast(b0 & 0x0F);
     const masked = (b1 & 0x80) != 0;
     const len7: u7 = @intCast(b1 & 0x7F);
@@ -80,6 +88,7 @@ pub fn parseHeader(buf: []const u8) ParseResult {
 
     return .{ .ok = .{
         .fin = fin,
+        .rsv1 = rsv1,
         .opcode = @enumFromInt(opcode_raw),
         .opcode_raw = opcode_raw,
         .masked = masked,

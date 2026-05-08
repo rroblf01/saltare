@@ -141,7 +141,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("1.5.0");
+    return py.PyUnicode_FromString("1.6.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -616,6 +616,88 @@ fn saltareZstdDecode(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.Py
     return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
 }
 
+// v1.6 streaming brotli/zstd. Python dispatcher creates one
+// encoder per response, feeds chunks, calls finish on the last one.
+// Handle is the raw `BrotliEncoderState*` / `ZSTD_CCtx*` cast to int.
+
+// Pointer ↔ Python int via unsigned long long. PyLong_FromVoidPtr is a
+// macro under translate-c which sometimes doesn't surface as a callable;
+// the explicit ULL path works on every CPython we target.
+inline fn ptrToPyLong(p: ?*anyopaque) ?*py.PyObject {
+    const u: c_ulonglong = @intCast(@intFromPtr(p));
+    return py.PyLong_FromUnsignedLongLong(u);
+}
+inline fn pyLongToPtr(obj: ?*py.PyObject) ?*anyopaque {
+    if (obj == null) return null;
+    const u = py.PyLong_AsUnsignedLongLong(obj);
+    if (u == 0) return null;
+    return @ptrFromInt(@as(usize, @intCast(u)));
+}
+
+fn saltareBrotliStreamCreate(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var quality: c_int = brotli_mod.DEFAULT_QUALITY;
+    if (py.PyArg_ParseTuple(args, "|i", &quality) == 0) return null;
+    const handle = brotli_mod.streamCreate(quality);
+    if (handle == null) return pyReturnNone();
+    return ptrToPyLong(handle);
+}
+
+fn saltareBrotliStreamCompress(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var handle_obj: ?*py.PyObject = null;
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var finish: c_int = 0;
+    if (py.PyArg_ParseTuple(args, "Oy#p", &handle_obj, &src_ptr, &src_len, &finish) == 0) return null;
+    const handle = pyLongToPtr(handle_obj) orelse return pyReturnNone();
+    const src = src_ptr[0..@intCast(src_len)];
+    const save = py.PyEval_SaveThread();
+    const out = brotli_mod.streamCompress(handle, src, std.heap.c_allocator, finish != 0);
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
+fn saltareBrotliStreamDestroy(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var handle_obj: ?*py.PyObject = null;
+    if (py.PyArg_ParseTuple(args, "O", &handle_obj) == 0) return null;
+    const handle = pyLongToPtr(handle_obj);
+    if (handle) |h| brotli_mod.streamDestroy(h);
+    return pyReturnNone();
+}
+
+fn saltareZstdStreamCreate(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var level: c_int = zstd_mod.DEFAULT_LEVEL;
+    if (py.PyArg_ParseTuple(args, "|i", &level) == 0) return null;
+    const handle = zstd_mod.streamCreate(level);
+    if (handle == null) return pyReturnNone();
+    return ptrToPyLong(handle);
+}
+
+fn saltareZstdStreamCompress(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var handle_obj: ?*py.PyObject = null;
+    var src_ptr: [*c]const u8 = null;
+    var src_len: py.Py_ssize_t = 0;
+    var finish: c_int = 0;
+    if (py.PyArg_ParseTuple(args, "Oy#p", &handle_obj, &src_ptr, &src_len, &finish) == 0) return null;
+    const handle = pyLongToPtr(handle_obj) orelse return pyReturnNone();
+    const src = src_ptr[0..@intCast(src_len)];
+    const save = py.PyEval_SaveThread();
+    const out = zstd_mod.streamCompress(handle, src, std.heap.c_allocator, finish != 0);
+    py.PyEval_RestoreThread(save);
+    if (out == null) return pyReturnNone();
+    defer std.heap.c_allocator.free(out.?);
+    return py.PyBytes_FromStringAndSize(@ptrCast(out.?.ptr), @intCast(out.?.len));
+}
+
+fn saltareZstdStreamDestroy(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    var handle_obj: ?*py.PyObject = null;
+    if (py.PyArg_ParseTuple(args, "O", &handle_obj) == 0) return null;
+    const handle = pyLongToPtr(handle_obj);
+    if (handle) |h| zstd_mod.streamDestroy(h);
+    return pyReturnNone();
+}
+
 /// gunzip(payload: bytes, max_size: int) -> bytes | None.
 /// Decompresses a gzip-wrapped (RFC 1952) payload. `max_size` caps the
 /// output (zip-bomb defense — return None on overflow). Returns None when
@@ -703,6 +785,42 @@ var methods = [_]py.PyMethodDef{
         .ml_meth = @ptrCast(&saltareZstdDecode),
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "zstd_decode(payload: bytes, max_size: int) -> bytes | None.",
+    },
+    .{
+        .ml_name = "brotli_stream_create",
+        .ml_meth = @ptrCast(&saltareBrotliStreamCreate),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "brotli_stream_create(quality: int = 4) -> int | None. Streaming encoder handle.",
+    },
+    .{
+        .ml_name = "brotli_stream_compress",
+        .ml_meth = @ptrCast(&saltareBrotliStreamCompress),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "brotli_stream_compress(handle: int, chunk: bytes, finish: bool) -> bytes | None.",
+    },
+    .{
+        .ml_name = "brotli_stream_destroy",
+        .ml_meth = @ptrCast(&saltareBrotliStreamDestroy),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "brotli_stream_destroy(handle: int) -> None. Frees the encoder.",
+    },
+    .{
+        .ml_name = "zstd_stream_create",
+        .ml_meth = @ptrCast(&saltareZstdStreamCreate),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "zstd_stream_create(level: int = 3) -> int | None. Streaming CCtx handle.",
+    },
+    .{
+        .ml_name = "zstd_stream_compress",
+        .ml_meth = @ptrCast(&saltareZstdStreamCompress),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "zstd_stream_compress(handle: int, chunk: bytes, finish: bool) -> bytes | None.",
+    },
+    .{
+        .ml_name = "zstd_stream_destroy",
+        .ml_meth = @ptrCast(&saltareZstdStreamDestroy),
+        .ml_flags = py.METH_VARARGS,
+        .ml_doc = "zstd_stream_destroy(handle: int) -> None. Frees the CCtx.",
     },
     .{
         .ml_name = "compression_metric_inc",

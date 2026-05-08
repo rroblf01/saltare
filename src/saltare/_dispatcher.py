@@ -684,10 +684,74 @@ def _status_line(status: int) -> bytes:
 # never completes until close).
 
 
-def _build_server_frame(opcode: int, payload: bytes) -> bytes:
-    """RFC 6455 server-side frame (no masking). FIN=1, single fragment."""
+# v1.6 RFC 7692 permessage-deflate. We negotiate
+# `client_no_context_takeover; server_no_context_takeover` — both sides
+# reset state every message. Simpler than carrying sliding-window state
+# across messages, and the compression hit is < 5% on typical text.
+_PMD_TRAIL = b"\x00\x00\xff\xff"
+_PMD_LEVEL = 6  # zlib default; matches gzip default.
+
+
+def _pmd_negotiate(headers: list[tuple[bytes, bytes]]) -> tuple[bool, str]:
+    """Inspect `Sec-WebSocket-Extensions`. Returns (active, response_token).
+    Active iff client offered `permessage-deflate`. Response is the
+    token to echo on the 101 (with our preferred params)."""
+    for name, value in headers:
+        if name != b"sec-websocket-extensions":
+            continue
+        for offer in value.split(b","):
+            tok = offer.strip()
+            if not tok:
+                continue
+            head, *_rest = (p.strip() for p in tok.split(b";"))
+            if head == b"permessage-deflate":
+                # We always reply with both no-context-takeover params
+                # — ignores any `server_max_window_bits` / `client_max_window_bits`
+                # the client requested. RFC 7692 lets the server pick a
+                # compatible subset of the offered params.
+                return (True, "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+    return (False, "")
+
+
+def _pmd_deflate(co: Any, payload: bytes) -> bytes:
+    """RFC 7692 §7.2.1: deflate, append `Z_SYNC_FLUSH`, strip trailing
+    4 sync-bytes (`00 00 ff ff`). With no_context_takeover the encoder
+    is reset to a fresh state every message — we recreate a compressobj
+    each call to avoid sticky state."""
+    import zlib as _zlib
+    if co is None:
+        co = _zlib.compressobj(_PMD_LEVEL, _zlib.DEFLATED, -15)
+    out = co.compress(payload) + co.flush(_zlib.Z_SYNC_FLUSH)
+    if out.endswith(_PMD_TRAIL):
+        out = out[:-4]
+    return out
+
+
+def _pmd_inflate(co: Any, payload: bytes, max_size: int = 1 * 1024 * 1024) -> bytes | None:
+    """Append the 4-byte sync trailer back + raw inflate. Cap at
+    `max_size` to defend against zip-bomb messages. Returns None on
+    overflow / invalid stream."""
+    import zlib as _zlib
+    if co is None:
+        co = _zlib.decompressobj(-15)
+    try:
+        out = co.decompress(payload + _PMD_TRAIL, max_size)
+    except _zlib.error:
+        return None
+    if co.unconsumed_tail:
+        return None  # exceeded max_size
+    return out
+
+
+def _build_server_frame(opcode: int, payload: bytes, rsv1: bool = False) -> bytes:
+    """RFC 6455 server-side frame (no masking). FIN=1, single fragment.
+    `rsv1=True` sets bit 6 of byte 0 — used by RFC 7692 per-message-deflate
+    on compressed text/binary frames."""
     out = bytearray()
-    out.append(0x80 | (opcode & 0x0F))
+    b0 = 0x80 | (opcode & 0x0F)
+    if rsv1:
+        b0 |= 0x40
+    out.append(b0)
     n = len(payload)
     if n < 126:
         out.append(n)
@@ -705,6 +769,11 @@ class _WsState:
     __slots__ = (
         "recv_queue", "outgoing", "outgoing_bytes", "accepted",
         "subprotocol", "closed", "task",
+        # v1.6 RFC 7692 per-message-deflate.
+        "extensions",          # str echoed in Sec-WebSocket-Extensions
+        "pmd_active",          # bool — extension negotiated this conn
+        "_pmd_inflater",       # zlib.decompressobj or None
+        "_pmd_deflater",       # zlib.compressobj or None
     )
 
     def __init__(self, app: Any, scope: dict[str, Any]) -> None:
@@ -719,6 +788,10 @@ class _WsState:
         # The Zig bridge reads this back after the upgrade pump and
         # echoes it as `Sec-WebSocket-Protocol` in the 101 response.
         self.subprotocol: str = ""
+        self.extensions: str = ""
+        self.pmd_active: bool = False
+        self._pmd_inflater: Any = None
+        self._pmd_deflater: Any = None
         self.closed: bool = False
 
         async def receive() -> dict[str, Any]:
@@ -750,9 +823,15 @@ class _WsState:
                 if self.closed:
                     return
                 if message.get("text") is not None:
-                    _queue(_build_server_frame(0x1, message["text"].encode("utf-8")))
+                    payload = message["text"].encode("utf-8")
+                    if self.pmd_active:
+                        payload = _pmd_deflate(self._pmd_deflater, payload)
+                    _queue(_build_server_frame(0x1, payload, rsv1=self.pmd_active))
                 elif message.get("bytes") is not None:
-                    _queue(_build_server_frame(0x2, message["bytes"]))
+                    payload = message["bytes"]
+                    if self.pmd_active:
+                        payload = _pmd_deflate(self._pmd_deflater, payload)
+                    _queue(_build_server_frame(0x2, payload, rsv1=self.pmd_active))
             elif mtype == "websocket.close":
                 code = int(message.get("code", 1000))
                 reason = message.get("reason", "") or ""
@@ -825,9 +904,9 @@ def ws_open(
     server_host: str,
     server_port: int,
     scheme: str,
-) -> tuple[int, bool, bytes, bool, str]:
+) -> tuple[int, bool, bytes, bool, str, str, bool]:
     """Start a WebSocket coroutine, push the websocket.connect event, and
-    pump the loop. Returns (handle, accepted, frames, done, subprotocol):
+    pump the loop. Returns 7-tuple:
        handle:      opaque int the bridge keeps for subsequent ws_event calls.
        accepted:    True if the app called websocket.accept.
        frames:      already-encoded server frames to write (close, early sends).
@@ -835,13 +914,18 @@ def ws_open(
        subprotocol: subprotocol the app selected via `accept(subprotocol=...)`,
                     or empty string. Bridge echoes it as
                     `Sec-WebSocket-Protocol` in the 101 response.
+       extensions:  v1.6 — token to echo as `Sec-WebSocket-Extensions`
+                    when permessage-deflate negotiated (else empty).
+       pmd_active:  v1.6 — True iff permessage-deflate was negotiated.
+                    Bridge sets `conn.ws_pmd_active` so subsequent
+                    rsv1 hints pass through.
     """
     global _next_ws_handle
 
     try:
         path = decoded_path.decode("utf-8")
     except UnicodeDecodeError:
-        return (0, False, b"", True, "")
+        return (0, False, b"", True, "", "", False)
 
     # Same as the HTTP path: names already lowercase from the bridge.
     headers = raw_headers
@@ -883,6 +967,13 @@ def ws_open(
     tstate.next_ws_handle += 1
 
     ws_state = _WsState(app, scope)
+    # v1.6 RFC 7692 negotiate before the app runs, so the app sees a
+    # consistent extensions value if it inspects scope. The connection
+    # state machine + frame builder consult `pmd_active` from here on.
+    pmd_active, pmd_response = _pmd_negotiate(headers)
+    if pmd_active:
+        ws_state.pmd_active = True
+        ws_state.extensions = pmd_response
     tstate.ws_states[handle] = ws_state
     ws_state.push({"type": "websocket.connect"})
 
@@ -897,16 +988,27 @@ def ws_open(
         ws_state.drain(),
         ws_state.task.done(),
         ws_state.subprotocol,
+        ws_state.extensions,
+        ws_state.pmd_active,
     )
 
 
-def ws_event(handle: int, opcode: int, payload: bytes) -> tuple[bytes, bool]:
+def ws_event(handle: int, opcode: int, payload: bytes, rsv1: int = 0) -> tuple[bytes, bool]:
     """Deliver a WebSocket frame to the running coroutine. `opcode` is 1
-    (text) or 2 (binary). Returns (frames_to_send, done)."""
+    (text) or 2 (binary). `rsv1=1` + permessage-deflate-negotiated →
+    inflate the payload before pushing. Returns (frames_to_send, done)."""
     tstate = _ensure_state()
     ws_state = tstate.ws_states.get(handle)
     if ws_state is None or ws_state.task.done():
         return (b"", True)
+
+    if rsv1 and ws_state.pmd_active:
+        decoded = _pmd_inflate(ws_state._pmd_inflater, payload)
+        if decoded is None:
+            # Malformed compressed frame or zip-bomb cap exceeded.
+            # Treat as protocol error — close the conn.
+            return (b"", True)
+        payload = decoded
 
     if opcode == 0x1:
         try:
@@ -1118,6 +1220,14 @@ class _HttpState:
         # the stream closes (`more_body=False`).
         "_gzip_bytes_in",
         "_gzip_bytes_out",
+        # v1.6 streaming brotli + zstd. Handles are opaque ints
+        # holding `BrotliEncoderState*` / `ZSTD_CCtx*` cast to int.
+        # 0 = no streaming compressor for this codec on this response.
+        # `_codec_bytes_*` track cumulative ratios for /metrics.
+        "_brotli_handle",
+        "_zstd_handle",
+        "_codec_bytes_in",
+        "_codec_bytes_out",
     )
 
     def __init__(
@@ -1149,6 +1259,10 @@ class _HttpState:
         self._gzip_co: Any = None
         self._gzip_bytes_in: int = 0
         self._gzip_bytes_out: int = 0
+        self._brotli_handle: int = 0
+        self._zstd_handle: int = 0
+        self._codec_bytes_in: int = 0
+        self._codec_bytes_out: int = 0
         # Filled in when http.response.start arrives.
         self.status: int = 500
         self.out_headers: list[tuple[bytes, bytes]] = []
@@ -1280,13 +1394,13 @@ class _HttpState:
                         # Streaming gzip: per-chunk Z_SYNC_FLUSH +
                         # Z_FINISH at end.
                         self._maybe_init_streaming_gzip()
-                    elif more and self._negotiated_encoding in (b"br", b"zstd"):
-                        # Streaming brotli/zstd not yet wired —
-                        # encoders need per-state objects across `_send`
-                        # calls (analogous to `_gzip_co`). Pass through
-                        # identity for this response. v1.5.x.
-                        from saltare import _core as _c
-                        _c.compression_metric_skip("encoder_unavailable")
+                    elif more and self._negotiated_encoding == b"br":
+                        # v1.6 streaming brotli via libbrotli encoder
+                        # state held across `_send` calls.
+                        self._maybe_init_streaming_brotli()
+                    elif more and self._negotiated_encoding == b"zstd":
+                        # v1.6 streaming zstd via libzstd CCtx.
+                        self._maybe_init_streaming_zstd()
                 # HEAD: same headers as GET but no body. Force single-
                 # shot mode (no chunked) and use the first chunk's
                 # length as Content-Length unless the app explicitly
@@ -1318,6 +1432,26 @@ class _HttpState:
                     # End of stream — record the cumulative ratio.
                     from saltare import _core as _c
                     _c.compression_metric_inc("gzip", self._gzip_bytes_in, self._gzip_bytes_out)
+            elif self._brotli_handle and not self._is_head:
+                from saltare import _core as _c
+                self._codec_bytes_in += len(chunk)
+                encoded = _c.brotli_stream_compress(self._brotli_handle, chunk, not more) or b""
+                self._codec_bytes_out += len(encoded)
+                chunk = encoded
+                if not more:
+                    _c.brotli_stream_destroy(self._brotli_handle)
+                    _c.compression_metric_inc("br", self._codec_bytes_in, self._codec_bytes_out)
+                    self._brotli_handle = 0
+            elif self._zstd_handle and not self._is_head:
+                from saltare import _core as _c
+                self._codec_bytes_in += len(chunk)
+                encoded = _c.zstd_stream_compress(self._zstd_handle, chunk, not more) or b""
+                self._codec_bytes_out += len(encoded)
+                chunk = encoded
+                if not more:
+                    _c.zstd_stream_destroy(self._zstd_handle)
+                    _c.compression_metric_inc("zstd", self._codec_bytes_in, self._codec_bytes_out)
+                    self._zstd_handle = 0
             if chunk and not self._is_head:
                 if self.chunked:
                     framed = _encode_chunk(chunk)
@@ -1396,6 +1530,70 @@ class _HttpState:
         self.out_headers = new_headers
         self.explicit_cl = False
         self._gzip_co = co
+
+    def _maybe_init_streaming_brotli(self) -> None:
+        """v1.6 streaming brotli. Mirrors `_maybe_init_streaming_gzip`
+        but uses `_core.brotli_stream_*` (libbrotli encoder state via
+        Zig handle). Bails silently on non-compressible content-type
+        or libbrotli-not-loadable."""
+        if not self._compressible_for_streaming():
+            return
+        from saltare import _core as _c
+        handle = _c.brotli_stream_create(_response_brotli_quality)
+        if handle is None:
+            from saltare import _core as _c2
+            _c2.compression_metric_skip("encoder_unavailable")
+            return
+        self._brotli_handle = handle
+        self._rewrite_headers_for_streaming(b"br")
+
+    def _maybe_init_streaming_zstd(self) -> None:
+        """v1.6 streaming zstd via libzstd CCtx."""
+        if not self._compressible_for_streaming():
+            return
+        from saltare import _core as _c
+        handle = _c.zstd_stream_create(_response_zstd_level)
+        if handle is None:
+            from saltare import _core as _c2
+            _c2.compression_metric_skip("encoder_unavailable")
+            return
+        self._zstd_handle = handle
+        self._rewrite_headers_for_streaming(b"zstd")
+
+    def _compressible_for_streaming(self) -> bool:
+        """True iff the response Content-Type is in the compressible
+        set AND the app didn't already declare a `Content-Encoding`."""
+        ctype = b""
+        for name, value in self.out_headers:
+            if name.lower() == b"content-type":
+                ctype = value
+                break
+        if not _is_gzippable_content_type(ctype):
+            return False
+        for name, _value in self.out_headers:
+            if name.lower() == b"content-encoding":
+                return False
+        return True
+
+    def _rewrite_headers_for_streaming(self, encoding: bytes) -> None:
+        """Drop CL / pre-existing CE, append `Content-Encoding: <enc>`
+        + `Vary: Accept-Encoding`. Common to all streaming codecs."""
+        new_headers: list[tuple[bytes, bytes]] = []
+        have_vary = False
+        for name, value in self.out_headers:
+            ln = name.lower()
+            if ln == b"content-length" or ln == b"content-encoding":
+                continue
+            if ln == b"vary":
+                if b"accept-encoding" not in value.lower():
+                    value = value + b", Accept-Encoding"
+                have_vary = True
+            new_headers.append((name, value))
+        new_headers.append((b"content-encoding", encoding))
+        if not have_vary:
+            new_headers.append((b"vary", b"Accept-Encoding"))
+        self.out_headers = new_headers
+        self.explicit_cl = False
 
     def _maybe_compress_response(self, chunk: bytes) -> bytes:
         """Single-shot encode `chunk` according to `self._negotiated_encoding`
@@ -1490,9 +1688,21 @@ class _HttpState:
         self._sendfile_path = ""
         self._negotiated_encoding = b""
         self._traceparent_echo = b""
+        # If a previous use left an encoder handle live (defensive —
+        # `_send` should always finalise it), free it before reset.
+        if self._brotli_handle:
+            from saltare import _core as _c
+            _c.brotli_stream_destroy(self._brotli_handle)
+        if self._zstd_handle:
+            from saltare import _core as _c
+            _c.zstd_stream_destroy(self._zstd_handle)
         self._gzip_co = None
         self._gzip_bytes_in = 0
         self._gzip_bytes_out = 0
+        self._brotli_handle = 0
+        self._zstd_handle = 0
+        self._codec_bytes_in = 0
+        self._codec_bytes_out = 0
         self.status = 500
         self.out_headers = []
         self.headers_sent = False
