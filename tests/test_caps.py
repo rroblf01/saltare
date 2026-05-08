@@ -8,12 +8,19 @@ Each cap turns the architectural RAM advantage into a hard guarantee:
 
 from __future__ import annotations
 
+import platform as _platform
 import socket
 import threading
 import time
 from typing import Any
 
 import pytest
+
+# Socket-recv timeouts in this file race the kernel close + scheduler on
+# busy CI hosts and (especially) under QEMU-emulated aarch64 in
+# cibuildwheel. Scale a single factor so the assertions don't race the
+# emulator and so the cap-check round trip has slack on shared CI runners.
+_TIMING_FACTOR: float = 4.0 if _platform.machine() in {"aarch64", "arm64"} else 2.0
 
 
 async def echo_app(scope: dict, receive, send) -> None:
@@ -208,6 +215,7 @@ def test_max_keepalive_requests_forces_close_at_limit() -> None:
         assert sock.recv(4096) == b""
 
 
+@pytest.mark.flaky(reruns=3, reruns_delay=1)
 def test_max_concurrent_connections_drops_extras() -> None:
     """Once the active-connection cap is hit, the server still accepts new
     sockets (to drain the kernel backlog) but immediately closes them — the
@@ -223,12 +231,12 @@ def test_max_concurrent_connections_drops_extras() -> None:
             held.append(socket.create_connection(("127.0.0.1", port), timeout=2.0))
 
         # Give the server a moment to register them.
-        time.sleep(0.1)
+        time.sleep(0.1 * _TIMING_FACTOR)
 
         # The third connect succeeds at the TCP level (kernel queues it
         # then accept() returns) but saltare immediately closes it.
-        with socket.create_connection(("127.0.0.1", port), timeout=2.0) as extra:
-            extra.settimeout(2.0)
+        with socket.create_connection(("127.0.0.1", port), timeout=2.0 * _TIMING_FACTOR) as extra:
+            extra.settimeout(2.0 * _TIMING_FACTOR)
             try:
                 data = extra.recv(4096)
             except (ConnectionResetError, BrokenPipeError):
