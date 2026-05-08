@@ -666,6 +666,18 @@ pub fn compressionMetricInc(encoding: []const u8, bytes_in: u64, bytes_out: u64)
     }
 }
 
+/// v1.6: Python-callable graceful-shutdown trigger. Pytest fixtures use
+/// it to tear down test-spawned daemon threads cleanly between tests —
+/// before this hook, each `_serve()` helper left its `_core.serve()`
+/// thread running until process exit, accumulating dozens of concurrent
+/// servers that race on shared globals (g_obs, atomics, listen fd). The
+/// race only surfaces under stricter allocators (musllinux on cibuildwheel),
+/// but it was always present. Same effect as SIGTERM: drains in-flight,
+/// exits the I/O loop, lets `serve()` return so the host thread terminates.
+pub fn requestShutdown() void {
+    g_draining.store(true, .seq_cst);
+}
+
 pub fn compressionMetricSkip(reason: []const u8) void {
     if (std.mem.eql(u8, reason, "small_body")) {
         _ = g_comp_skip_small.fetchAdd(1, .seq_cst);
@@ -2330,6 +2342,11 @@ pub fn run(
     };
     g_active_conns.store(0, .seq_cst);
     defer g_active_conns.store(0, .seq_cst);
+    // Clear any drain flag a prior test/process left set (e.g. a pytest
+    // fixture that called `_core.request_shutdown()` while no worker
+    // was running — without this reset the next `serve()` would enter
+    // the main loop, immediately observe drain, and exit before binding).
+    g_draining.store(false, .seq_cst);
     resetMetrics();
     rateLimitReset();
 

@@ -740,6 +740,15 @@ fn saltareCompressionMetricSkip(_: ?*py.PyObject, args: ?*py.PyObject) callconv(
     return pyReturnNone();
 }
 
+/// request_shutdown() -> None. Equivalent to a SIGTERM: flips the
+/// global drain flag so the I/O loop stops accepting, finishes
+/// in-flight requests, and lets `serve()` return. Used by the pytest
+/// conftest fixture to tear down test-spawned servers between tests.
+fn saltareRequestShutdown(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
+    server.requestShutdown();
+    return pyReturnNone();
+}
+
 var methods = [_]py.PyMethodDef{
     .{
         .ml_name = "version",
@@ -836,6 +845,12 @@ var methods = [_]py.PyMethodDef{
         .ml_meth = @ptrCast(&saltareCompressionMetricSkip),
         .ml_flags = py.METH_VARARGS,
         .ml_doc = "compression_metric_skip(reason: str) -> None.",
+    },
+    .{
+        .ml_name = "request_shutdown",
+        .ml_meth = @ptrCast(&saltareRequestShutdown),
+        .ml_flags = py.METH_NOARGS,
+        .ml_doc = "request_shutdown() -> None. Trigger graceful shutdown (test cleanup helper).",
     },
     .{ .ml_name = null, .ml_meth = null, .ml_flags = 0, .ml_doc = null },
 };
