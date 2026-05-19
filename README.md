@@ -175,36 +175,49 @@ docker run --rm -e BENCH_LARGE_BYTES=1048576 saltare-bench \
 
 Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 0.136, pydantic 2.13, uvicorn 0.x plain — no `[standard]` extras, granian 2.x ASGI), v1.4.0 with default settings (single worker except where noted). Same host, same image. Each server's launcher imports the FastAPI app at module level so RSS readings reflect the same import footprint — without that normalisation, granian's master appears artificially small (~37 MiB) because it spawns a worker subprocess that holds the actual app, and the bench harness reads the master's `/proc/<pid>/status`.
 
-### Sequential — 1 client, 1000 requests (v1.6.0)
+### Sequential — 1 client, 1000 requests (v1.7.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.27 MiB |      45.40 MiB | **45.40 MiB** |    1000 | 1050 |
-| uvicorn | 48.00 MiB |      48.04 MiB | 48.04 MiB |    1000 | 1232 |
-| granian | 57.13 MiB |      57.13 MiB | 57.13 MiB |    1000 | 1200 |
+| saltare | 45.37 MiB |      45.50 MiB | **45.50 MiB** |    1000 | 1086 |
+| uvicorn | 48.04 MiB |      48.07 MiB | 48.07 MiB |    1000 | 1254 |
+| granian | 54.85 MiB |      54.85 MiB | 54.85 MiB |    1000 | 1123 |
 
-### Concurrent — 100 clients × 20 requests (2000 total) (v1.6.0)
+### Concurrent — 100 clients × 20 requests (2000 total) (v1.7.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.99 MiB |      44.30 MiB | **44.32 MiB** |    2000 | 1979 |
-| uvicorn | 48.14 MiB |      49.53 MiB | 49.53 MiB |    2000 | 2001 |
-| granian | 55.20 MiB |      55.20 MiB | 55.20 MiB |    2000 | 1954 |
+| saltare | 43.97 MiB |      44.34 MiB | **44.36 MiB** |    2000 | 1915 |
+| uvicorn | 47.98 MiB |      49.16 MiB | 49.16 MiB |    2000 | 1893 |
+| granian | 55.37 MiB |      55.37 MiB | 55.37 MiB |    2000 | 1702 |
 
-### Idle keep-alive — 500 connections held open (v1.6.0)
+### Idle keep-alive — 500 connections held open (v1.7.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 43.91 MiB |      44.25 MiB | **44.25 MiB** |     500 | 1473      |
-| uvicorn | 47.95 MiB |      53.32 MiB | 53.32 MiB |     500 | 1306      |
-| granian | 55.95 MiB |      55.95 MiB | 55.95 MiB |     500 | 1344      |
+| saltare | 44.01 MiB |      44.28 MiB | **44.28 MiB** |     500 | 1266      |
+| uvicorn | 48.04 MiB |      53.41 MiB | 53.41 MiB |     500 | 1489      |
+| granian | 53.84 MiB |      53.84 MiB | 53.84 MiB |     500 | 1360      |
 
-### Multi-worker idle — Pss across the whole cluster (saltare only) (v1.6.0)
+### Multi-worker idle — Pss across the whole cluster (saltare only) (v1.7.0)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  39.26 MiB |      0.00 MiB | 39.26 MiB |                 —  |
-|       4 |        4 |  14.38 MiB |     39.26 MiB | 53.64 MiB |  157.03 MiB (−66%) |
+|       1 |        — |  39.18 MiB |      0.00 MiB | 39.18 MiB |                 —  |
+|       4 |        4 |  14.38 MiB |     39.28 MiB | 53.65 MiB |  156.72 MiB (−66%) |
+
+> **mimalloc note (v1.7)**: The bench image now preloads
+> `libmimalloc.so.2` (matches the production Dockerfile) so all three
+> servers run under the same allocator and the comparison is apples
+> to apples. mimalloc cuts granian's peak by ~2 MiB on the
+> sequential / idle-keepalive workloads vs the v1.6 glibc-default
+> bench. **Saltare's numbers are unchanged within noise** — its
+> `mallopt(M_TRIM_THRESHOLD=64K, M_ARENA_MAX=1)` tuning plus
+> `MALLOC_ARENA_MAX=1` injected into the CLI re-exec env already
+> drove glibc to behave as aggressively as mimalloc. mimalloc still
+> wins where the operator is on musl (Alpine) or doesn't want to
+> rely on glibc-specific knobs — that's why `Dockerfile.production`
+> ships it by default.
 
 `Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.85 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
 

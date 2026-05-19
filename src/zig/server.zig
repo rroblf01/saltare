@@ -142,6 +142,14 @@ pub const Observability = struct {
     /// per-request cost is one linear scan, bounded by the entry count
     /// (typically <10).
     access_log_exclude: []const []const u8 = &.{},
+    /// v1.7 — when true, emit a single stderr line every time a WS
+    /// upgrade is rejected (the app emitted `websocket.close` before
+    /// `websocket.accept`, or its `connect` coroutine raised). Line
+    /// shape: `saltare: ws-reject path=<url> code=<int> reason=<...>`.
+    /// Operational diagnostic for Channels' Origin/Host/Auth middleware
+    /// rejecting connects — without it operators couldn't see *why*.
+    /// Off by default (zero overhead when off).
+    ws_reject_log: bool = false,
     /// If true, the dispatcher honours `X-Forwarded-For` /
     /// `X-Forwarded-Proto` from the request to populate `scope["client"]`
     /// and `scope["scheme"]`. Only enable behind a trusted reverse proxy
@@ -3651,12 +3659,51 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // exit branch.
     defer if (opened.subprotocol.len > 0) conn.allocator.free(opened.subprotocol);
     defer if (opened.extensions.len > 0) conn.allocator.free(opened.extensions);
+    // v1.7: close_reason is empty in the accept path; defer-free here so
+    // the reject-branch's explicit free + this defer never double-up
+    // (the reject branch sets reason.len = 0 before returning by freeing
+    // and not nulling, but we early-return before this defer runs).
+    defer if (opened.close_reason.len > 0) conn.allocator.free(opened.close_reason);
     conn.ws_pmd_active = opened.pmd_active;
 
     if (!opened.accepted) {
         // App rejected by closing without accepting.
+        // v1.7: map the WebSocket close code (RFC 6455 §7.4 — apps
+        // typically use 4xxx Private codes) to a meaningful HTTP status
+        // so clients see something better than a flat 403. Channels'
+        // AuthMiddleware uses 4003 (Origin reject), 4001 (auth), etc.
+        const status_code: u16 = switch (opened.close_code) {
+            4001 => 401,
+            4002 => 402,
+            4003 => 403,
+            4004 => 404,
+            4008 => 408,
+            4029 => 429,
+            else => 403,
+        };
+        const reason_text: []const u8 = switch (status_code) {
+            401 => "Unauthorized",
+            402 => "Payment Required",
+            404 => "Not Found",
+            408 => "Request Timeout",
+            429 => "Too Many Requests",
+            else => "Forbidden",
+        };
+        if (g_obs.ws_reject_log) {
+            // Single write(2) keeps the line atomic. 4 KiB headroom for
+            // path + reason — well past any realistic combination.
+            var line_buf: [4096]u8 = undefined;
+            const line = std.fmt.bufPrint(
+                &line_buf,
+                "saltare: ws-reject path={s} code={d} reason={s}\n",
+                .{ req.target, opened.close_code, opened.close_reason },
+            ) catch line_buf[0..0];
+            if (line.len > 0) _ = c.write(2, line.ptr, line.len);
+        }
         if (opened.frames.len > 0) conn.allocator.free(opened.frames);
-        sendStatus(loop, conn, 403, "Forbidden");
+        // close_reason + subprotocol + extensions freed by the defer
+        // chain above. Don't free here or we'd double-free at return.
+        sendStatus(loop, conn, status_code, reason_text);
         return;
     }
 

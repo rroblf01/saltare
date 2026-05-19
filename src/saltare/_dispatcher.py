@@ -908,6 +908,13 @@ class _WsState:
         "pmd_active",          # bool — extension negotiated this conn
         "_pmd_inflater",       # zlib.decompressobj or None
         "_pmd_deflater",       # zlib.compressobj or None
+        # v1.7 close-code forwarding. When the app emits `websocket.close`
+        # *before* accepting (Channels' AuthMiddleware rejecting on Origin
+        # / Host / session), saltare maps the code to an HTTP status so
+        # the client sees something more specific than a flat 403. 0 =
+        # never closed by the app pre-accept (just no `websocket.accept`).
+        "close_code",
+        "close_reason",
     )
 
     def __init__(self, app: Any, scope: dict[str, Any]) -> None:
@@ -927,6 +934,8 @@ class _WsState:
         self._pmd_inflater: Any = None
         self._pmd_deflater: Any = None
         self.closed: bool = False
+        self.close_code: int = 0
+        self.close_reason: str = ""
 
         async def receive() -> dict[str, Any]:
             return await self.recv_queue.get()
@@ -969,6 +978,10 @@ class _WsState:
             elif mtype == "websocket.close":
                 code = int(message.get("code", 1000))
                 reason = message.get("reason", "") or ""
+                # v1.7: capture for the HTTP-reject path so the bridge can
+                # surface the consumer's close code as an HTTP status.
+                self.close_code = code
+                self.close_reason = reason
                 payload = code.to_bytes(2, "big") + reason.encode("utf-8")
                 _queue(_build_server_frame(0x8, payload))
                 self.closed = True
@@ -1151,6 +1164,11 @@ def ws_open(
         ws_state.subprotocol,
         ws_state.extensions,
         ws_state.pmd_active,
+        # v1.7 close-code forwarding. Only meaningful when accepted=False;
+        # bridge.zig reads these on the reject path to map e.g. 4003 → 403,
+        # 4001 → 401 in the HTTP status of the rejection response.
+        ws_state.close_code,
+        ws_state.close_reason,
     )
 
 

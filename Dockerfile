@@ -78,12 +78,26 @@ RUN pytest -q tests
 # into the test-env image and runs `benchmarks.bench` to print a Markdown
 # comparison table. Granian is included so saltare-vs-uvicorn isn't taken
 # in isolation; both are low-level alternatives to asyncio-based servers.
+#
+# v1.7: mimalloc preloaded so the bench numbers reflect saltare's
+# documented production posture (the same `LD_PRELOAD=libmimalloc.so.2`
+# the Dockerfile.production image bakes in). The preload also applies
+# to the uvicorn / granian subprocesses the harness spawns, so the
+# three-way comparison stays apples-to-apples — every server runs under
+# the same allocator. Manylinux_2_28 ships AlmaLinux 8; mimalloc lives
+# in EPEL.
 FROM test-env AS bench
+RUN dnf install -y epel-release \
+ && dnf install -y mimalloc \
+ && dnf clean all
 COPY --from=builder /dist /dist
 RUN pip install --no-deps /dist/saltare-*.whl \
  && pip install uvicorn granian
 WORKDIR /work
 COPY benchmarks /work/benchmarks
+# Path on RHEL/AlmaLinux: /usr/lib64/libmimalloc.so.2.x — point at the
+# major-version symlink so the layer survives mimalloc minor bumps.
+ENV LD_PRELOAD=/usr/lib64/libmimalloc.so.2
 # Default invocation: --include-granian so the table has all three servers.
 # Override with `docker run ... saltare-bench python -m benchmarks.bench [flags]`.
 CMD ["python", "-m", "benchmarks.bench", "--include-granian"]

@@ -37,18 +37,38 @@ on missing scope keys. v1.7 closes that gap.
   RFC 7239 `Forwarded:` precedence over X-Real-IP / X-Forwarded-For
   is now identical across both paths.
 
-### Deferred to 1.7.x
+### Diagnostic polish (rolled into 1.7.0)
 
-- **Forward app's close code in HTTP response** — Channels uses
-  4xxx close codes (4003 Origin reject, 4001 unauthorized, …) before
-  `accept()`; saltare today returns a flat 403. Mapping `4003 → 403`,
-  `4001 → 401`, etc. is a 1.7.x diagnostic polish.
-- **`--ws-reject-log`** — stderr line on every 403 carrying the
-  close code + reason so operators don't have to attach a debugger
-  to find why Channels closed early.
-- **`test_channels.py`** integration test — mount a
-  `ProtocolTypeRouter` + `AuthMiddlewareStack` + an in-memory
-  channel layer in pytest; verify connect/disconnect end-to-end.
+- **Consumer close-code → HTTP status forwarding.** When the app
+  emits `websocket.close(code=4xxx)` before accepting (Channels'
+  AuthMiddleware rejecting on Origin / Host / session), saltare now
+  maps the WebSocket close code to a meaningful HTTP status instead
+  of a flat 403: `4001 → 401`, `4002 → 402`, `4003 → 403`,
+  `4004 → 404`, `4008 → 408`, `4029 → 429`, anything else → 403.
+  RFC 6455 §7.4 reserves 4000–4999 for app use; Channels uses
+  exactly this range, so a Channels-rejected upgrade now surfaces
+  the consumer's real intent at the HTTP layer.
+- **`--ws-reject-log`** — opt-in stderr line every time a WS upgrade
+  is rejected: `saltare: ws-reject path=/ws/foo code=4003 reason=Origin`.
+  Diagnoses Channels' middleware closing connects without attaching
+  a debugger. Off by default; zero overhead when off.
+- **`tests/test_channels.py`** — integration tests verifying
+  `ProtocolTypeRouter({"websocket": URLRouter(...)})` accepts an
+  upgrade end-to-end and that consumers using `await self.close(code=4003)`
+  produce HTTP 403, `code=4004` produces 404. Skipped automatically
+  when `channels` isn't installed in the test environment.
+
+### Distribution
+
+- **Regular Dockerfile (bench stage) preloads mimalloc**, matching
+  `Dockerfile.production`. The bench numbers below run under the
+  same allocator across saltare / uvicorn / granian — the comparison
+  is now apples to apples instead of "saltare's `mallopt`-tuned
+  glibc vs uvicorn/granian's untuned glibc". mimalloc cuts ~2 MiB
+  off granian's peak on the sequential / idle-keepalive workloads;
+  saltare's numbers are unchanged within noise (its `mallopt` +
+  `MALLOC_ARENA_MAX=1` already drove glibc to behave as aggressively
+  as mimalloc — the mimalloc win lives elsewhere, e.g. musl deployments).
 
 ## 1.6.1
 

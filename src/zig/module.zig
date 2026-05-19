@@ -201,10 +201,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var ktls_flag: c_int = 0;
     var drain_path_z: [*c]const u8 = null;
     var access_log_exclude_z: [*c]const u8 = null;
+    var ws_reject_log_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzzizz",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzzizzi",
         &app,
         &host_z,
         &port,
@@ -256,6 +257,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &ktls_flag,
         &drain_path_z,
         &access_log_exclude_z,
+        &ws_reject_log_flag,
     ) == 0) {
         return null;
     }
@@ -350,6 +352,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .dispatch_token = if (dispatch_token_z != null) std.mem.span(dispatch_token_z) else null,
         .drain_path = if (drain_path_z != null) std.mem.span(drain_path_z) else null,
         .access_log_exclude = if (access_log_exclude_buf) |buf| buf else &.{},
+        .ws_reject_log = ws_reject_log_flag != 0,
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 

@@ -520,6 +520,10 @@ def main(argv: list[str] | None = None) -> None:
         help="path (request-target, exact match) to skip from --access-log output (repeatable). Typical use: silence noisy probes like /metrics, /healthz, /favicon.ico without losing app-traffic visibility.",
     )
     parser.add_argument(
+        "--ws-reject-log", action="store_true",
+        help="emit a single stderr line every time a WebSocket upgrade is rejected (`saltare: ws-reject path=... code=... reason=...`). Diagnoses Channels' Origin / Host / Auth middleware closing connects before `accept()`. Off by default.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -619,4 +623,5 @@ def main(argv: list[str] | None = None) -> None:
         hsts_preload=args.hsts_preload,
         drain_path=args.drain_path,
         access_log_exclude=args.access_log_exclude,
+        ws_reject_log=args.ws_reject_log,
     )

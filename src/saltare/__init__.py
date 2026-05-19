@@ -82,6 +82,7 @@ def run(
     hsts_preload: bool = False,
     drain_path: str | None = None,
     access_log_exclude: list[str] | tuple[str, ...] | None = None,
+    ws_reject_log: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -339,4 +340,5 @@ def run(
         # Stripped + filtered empties so trailing commas / accidental
         # blanks don't shadow real entries.
         (",".join(p for p in access_log_exclude if p) if access_log_exclude else None),
+        int(bool(ws_reject_log)),
     )

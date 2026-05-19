@@ -594,6 +594,15 @@ pub const WsOpen = struct {
     /// True iff per-message-deflate was negotiated. Server.zig flips
     /// `conn.ws_pmd_active` so subsequent rsv1 hints flow correctly.
     pmd_active: bool,
+    /// v1.7 — close code the consumer emitted via `websocket.close`
+    /// before accepting. 0 = the app never called `close()` (just
+    /// hung up / never returned `accept`). Server.zig maps non-zero
+    /// codes to an HTTP status on the reject path (4003 → 403,
+    /// 4001 → 401, 4004 → 404, 4029 → 429, anything else → 403).
+    close_code: u16,
+    /// v1.7 — `reason` string from the `websocket.close` event. Owned
+    /// by `allocator`; empty when absent. Used by `--ws-reject-log`.
+    close_reason: []u8,
 };
 
 pub const WsTick = struct {
@@ -693,7 +702,7 @@ pub fn wsDisconnect(handle: c_long, code: u16, allocator: std.mem.Allocator) []u
 }
 
 fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
-    if (py.PyTuple_Size(result) != 7) return null;
+    if (py.PyTuple_Size(result) != 9) return null;
 
     const handle_obj = py.PyTuple_GetItem(result, 0);
     const accepted_obj = py.PyTuple_GetItem(result, 1);
@@ -702,8 +711,11 @@ fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
     const sub_obj = py.PyTuple_GetItem(result, 4);
     const ext_obj = py.PyTuple_GetItem(result, 5);
     const pmd_obj = py.PyTuple_GetItem(result, 6);
+    const close_code_obj = py.PyTuple_GetItem(result, 7);
+    const close_reason_obj = py.PyTuple_GetItem(result, 8);
     if (handle_obj == null or accepted_obj == null or frames_obj == null or
-        done_obj == null or sub_obj == null or ext_obj == null or pmd_obj == null) {
+        done_obj == null or sub_obj == null or ext_obj == null or pmd_obj == null or
+        close_code_obj == null or close_reason_obj == null) {
         return null;
     }
 
@@ -743,6 +755,29 @@ fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
         extensions = buf;
     }
 
+    // v1.7 close code (int) + reason (str). Reason is owned-by-allocator
+    // (empty when absent). Code is clamped to u16; WebSocket close codes
+    // live in 1000–4999 per RFC 6455 §7.4.
+    const code_raw = py.PyLong_AsLong(close_code_obj);
+    const close_code: u16 = if (code_raw > 0 and code_raw <= 65535)
+        @intCast(code_raw)
+    else
+        0;
+    var reason_len: py.Py_ssize_t = 0;
+    const reason_ptr = py.PyUnicode_AsUTF8AndSize(close_reason_obj.?, &reason_len);
+    var close_reason: []u8 = &.{};
+    if (reason_ptr != null and reason_len > 0) {
+        const len: usize = @intCast(reason_len);
+        const buf = allocator.alloc(u8, len) catch {
+            allocator.free(frames);
+            if (subprotocol.len > 0) allocator.free(subprotocol);
+            if (extensions.len > 0) allocator.free(extensions);
+            return null;
+        };
+        @memcpy(buf, reason_ptr[0..len]);
+        close_reason = buf;
+    }
+
     return .{
         .handle = handle,
         .accepted = accepted,
@@ -751,6 +786,8 @@ fn extractWsOpen(result: *py.PyObject, allocator: std.mem.Allocator) ?WsOpen {
         .subprotocol = subprotocol,
         .extensions = extensions,
         .pmd_active = pmd_active,
+        .close_code = close_code,
+        .close_reason = close_reason,
     };
 }
 
