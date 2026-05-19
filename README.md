@@ -316,8 +316,70 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the per-version highlights and the [`exam
 - [`examples/sendfile.py`](examples/sendfile.py) — `saltare.sendfile` ASGI extension for zero-copy static-asset responses.
 - [`examples/observability.py`](examples/observability.py) — W3C `traceparent` propagation + Prometheus latency histogram on `/metrics`.
 - [`examples/django.md`](examples/django.md) — `pip install saltare[django]` integration: `manage.py runserver` boots Django under saltare instead of wsgiref.
+- [`examples/channels/`](examples/channels/) — Django Channels (`ProtocolTypeRouter` + `AuthMiddlewareStack` + a runnable WebSocket consumer); drop-in replacement for daphne.
 
 Both per-request HTTP dispatch and ASGI lifespan startup/shutdown are wired up: `FastAPI(lifespan=...)` and the older `@app.on_event("startup")` work as expected.
+
+### Django Channels (WebSockets)
+
+Saltare speaks the standard ASGI WebSocket protocol and runs Channels' `ProtocolTypeRouter` directly — same `asgi.py` you point daphne at:
+
+```python
+# myproject/asgi.py
+import os
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+
+import django
+django.setup()                              # MUST run before importing Channels routing
+
+from channels.routing import ProtocolTypeRouter, URLRouter
+from channels.auth import AuthMiddlewareStack
+from channels.security.websocket import AllowedHostsOriginValidator
+from django.core.asgi import get_asgi_application
+
+from myapp.routing import websocket_urlpatterns
+
+django_asgi_app = get_asgi_application()
+
+application = ProtocolTypeRouter({
+    "http": django_asgi_app,
+    "websocket": AllowedHostsOriginValidator(
+        AuthMiddlewareStack(URLRouter(websocket_urlpatterns))
+    ),
+})
+```
+
+Run:
+
+```bash
+saltare myproject.asgi:application --host 0.0.0.0 --port 8000 \
+    --access-log --ws-reject-log \
+    --proxy-headers                       # add behind nginx / traefik / k8s ingress
+```
+
+#### Required settings
+
+- **`ALLOWED_HOSTS`** must include the host the browser is on (`localhost`, `mysite.com`, container DNS name, …). Channels' `AllowedHostsOriginValidator` reads this to decide whether to accept the upgrade — mismatched Origin → close code 4003 → saltare returns HTTP 403.
+- **`django.contrib.sessions`** in `INSTALLED_APPS` + `SessionMiddleware` in `MIDDLEWARE` if you use `AuthMiddlewareStack` (it looks up the session backend).
+- **`SECRET_KEY`** present (any env-driven default is fine).
+- **A configured channel layer** (in-memory for dev, Redis or PostgreSQL for prod). Without it, `group_send` raises.
+
+#### Diagnostics
+
+`--ws-reject-log` writes one stderr line per rejected upgrade with the WebSocket close code (`4003`, `4001`, etc.) and reason, so you can tell at a glance whether `OriginValidator`, `AuthMiddleware`, or the consumer itself shut the connection. Saltare also maps the close code onto an HTTP status (`4003 → 403`, `4001 → 401`, `4004 → 404`, `4008 → 408`, `4029 → 429`, anything else → 403) so browser-side `WebSocket.onclose` carries a meaningful status.
+
+The `--access-log` stream emits `[WS-CONNECT]` and `[WS-CLOSE]` lines in the same format as the HTTP traffic, with the close code in place of the status:
+
+```
+19/05/2026:11:46:30 [WS-CONNECT] [/ws/notifications/] [101] [0]
+19/05/2026:11:48:15 [WS-CLOSE]   [/ws/notifications/] [1000] [1234]
+```
+
+#### Tuning
+
+- **`--ws-handshake-timeout SECS`** — how long the upgrade pump waits for the consumer to accept/close (default `2.0`). Raise on cold-start middleware that does a slow DB warm-up.
+- **`--ws-pump-interval-ms MS`** — interval between asyncio-loop pumps for live WS connections (default `50`). Lower for server-push workloads that need sub-50 ms `group_send` delivery; raise on bandwidth-pinched deployments. Floor 10 ms.
 
 ### Streaming responses
 

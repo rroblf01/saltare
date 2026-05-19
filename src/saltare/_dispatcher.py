@@ -266,10 +266,22 @@ def lifespan_startup(app: Any) -> bool:
     if kind == "exception":
         # Per ASGI convention, an exception before any send() typically means
         # the app doesn't support lifespan. We log it and continue serving.
-        sys.stderr.write(
-            f"saltare: lifespan task raised during startup "
-            f"({type(value).__name__}: {value}). Treating as 'no lifespan support'.\n"
+        # v1.7.1: Channels' `ProtocolTypeRouter` raises
+        # `ValueError("No application configured for scope type 'lifespan'")`
+        # on every saltare boot when the user didn't wire a lifespan
+        # handler (the default). That's the documented Channels pattern,
+        # not a misconfiguration; silently treat as "no lifespan support"
+        # instead of polluting the logs on every restart.
+        msg = str(value) if value is not None else ""
+        is_channels_no_lifespan = (
+            isinstance(value, ValueError)
+            and "No application configured for scope type 'lifespan'" in msg
         )
+        if not is_channels_no_lifespan:
+            sys.stderr.write(
+                f"saltare: lifespan task raised during startup "
+                f"({type(value).__name__}: {value}). Treating as 'no lifespan support'.\n"
+            )
         return True
 
     if kind == "returned":
@@ -1310,6 +1322,30 @@ def ws_drain(handle: int) -> tuple[bytes, bool]:
     return (ws_state.drain(), ws_state.closed or ws_state.task.done())
 
 
+def ws_drain_all() -> list:
+    """v1.7.1 batched variant of `ws_drain`. Returns a list of
+    `(handle, frames, done)` tuples for every WS connection that has
+    bytes to flush OR is in a terminal state. Replaces the per-conn
+    `bridge.wsDrain` walk with a single GIL acquire + Python call —
+    important at scale: 200 live WS × 20 Hz pump = 4 000 GIL hops/s
+    in the per-conn variant; one hop with this batched form. Empty-
+    output conns that are still alive are omitted entirely so the
+    Zig walker only iterates over conns that matter."""
+    tstate = _ensure_state()
+    out: list[tuple[int, bytes, bool]] = []
+    # Iterate over a snapshot of the keys — the dispatch path may
+    # mutate `ws_states` if a teardown fires inside the pump loop.
+    for handle in list(tstate.ws_states.keys()):
+        ws_state = tstate.ws_states.get(handle)
+        if ws_state is None:
+            continue
+        chunks = ws_state.drain()
+        done = ws_state.closed or ws_state.task.done()
+        if chunks or done:
+            out.append((handle, chunks, done))
+    return out
+
+
 def ws_disconnect(handle: int, code: int) -> bytes:
     """Tell the coroutine the connection has been (or is being) torn down,
     drain any final frames, and clean up the state. After this call the
@@ -1409,6 +1445,17 @@ _WS_OUTGOING_MAX_BYTES = 1024 * 1024
 # this are real bugs or DB latency, not legitimate connects, and a
 # timeout-mapped 408 is the right answer there.
 _WS_UPGRADE_DEADLINE_S = 2.0
+
+
+def set_ws_upgrade_deadline(secs: float) -> None:
+    """v1.7.1 — tunable WS handshake budget. The pump-during-upgrade
+    spins for at most this many seconds while waiting for the
+    consumer to accept / close / error. Increase for slow cold-start
+    middleware (long DB warm-up, cold container); decrease for
+    latency-sensitive deployments where 2 s is too lenient. Default
+    2 s. `<= 0` reverts to the compile-time default."""
+    global _WS_UPGRADE_DEADLINE_S
+    _WS_UPGRADE_DEADLINE_S = float(secs) if secs and secs > 0 else 2.0
 
 # v1.7.1 WebSocket post-accept pump. After the consumer calls `accept()`
 # its `connect()` coroutine usually keeps running (group_add, initial DB

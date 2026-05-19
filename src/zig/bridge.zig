@@ -37,6 +37,7 @@ threadlocal var g_lifespan_shutdown: ?*py.PyObject = null;
 threadlocal var g_ws_open: ?*py.PyObject = null;
 threadlocal var g_ws_event: ?*py.PyObject = null;
 threadlocal var g_ws_drain: ?*py.PyObject = null;
+threadlocal var g_ws_drain_all: ?*py.PyObject = null;
 threadlocal var g_ws_disconnect: ?*py.PyObject = null;
 threadlocal var g_tracemalloc_dump: ?*py.PyObject = null;
 threadlocal var g_tracemalloc_init: ?*py.PyObject = null;
@@ -101,6 +102,7 @@ pub fn init(
     g_ws_open = py.PyObject_GetAttrString(mod, "ws_open") orelse return false;
     g_ws_event = py.PyObject_GetAttrString(mod, "ws_event") orelse return false;
     g_ws_drain = py.PyObject_GetAttrString(mod, "ws_drain") orelse return false;
+    g_ws_drain_all = py.PyObject_GetAttrString(mod, "ws_drain_all") orelse return false;
     g_ws_disconnect = py.PyObject_GetAttrString(mod, "ws_disconnect") orelse return false;
     // Optional: only present when tracemalloc_path is configured. Failing
     // here would be fatal; we tolerate absence by clearing the error.
@@ -182,6 +184,10 @@ pub fn shutdown() void {
     if (g_ws_drain) |d| {
         py.Py_DecRef(d);
         g_ws_drain = null;
+    }
+    if (g_ws_drain_all) |d| {
+        py.Py_DecRef(d);
+        g_ws_drain_all = null;
     }
     if (g_ws_disconnect) |d| {
         py.Py_DecRef(d);
@@ -685,6 +691,62 @@ pub fn wsEvent(handle: c_long, opcode: u8, payload: []const u8, rsv1: bool, allo
     defer py.Py_DecRef(result);
 
     return extractWsTick(result, allocator);
+}
+
+pub const WsDrainEntry = struct {
+    handle: c_long,
+    /// Owned by allocator; caller frees.
+    frames: []u8,
+    done: bool,
+};
+
+/// v1.7.1 — batched server-initiated drain. Single GIL hop +
+/// single Python call returns the entries for every WS conn that
+/// has bytes to flush OR has hit a terminal state. Caller frees
+/// each `frames` slice (and the outer slice itself). Returns null
+/// on call failure; returns an empty slice when nothing to flush
+/// (caller can ignore safely — no allocation in that case).
+pub fn wsDrainAll(allocator: std.mem.Allocator) ?[]WsDrainEntry {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallObject(g_ws_drain_all.?, null) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    const n = py.PyList_Size(result);
+    if (n <= 0) return &.{};
+    const entries = allocator.alloc(WsDrainEntry, @intCast(n)) catch return null;
+    var i: py.Py_ssize_t = 0;
+    while (i < n) : (i += 1) {
+        const tup = py.PyList_GetItem(result, i);
+        if (tup == null) {
+            // Free anything we already populated and bail.
+            var k: usize = 0;
+            while (k < @as(usize, @intCast(i))) : (k += 1) {
+                if (entries[k].frames.len > 0) allocator.free(entries[k].frames);
+            }
+            allocator.free(entries);
+            return null;
+        }
+        const handle_obj = py.PyTuple_GetItem(tup, 0);
+        const frames_obj = py.PyTuple_GetItem(tup, 1);
+        const done_obj = py.PyTuple_GetItem(tup, 2);
+        const handle = py.PyLong_AsLong(handle_obj);
+        const done = py.PyObject_IsTrue(done_obj) == 1;
+        const frames = copyBytes(frames_obj.?, allocator) orelse {
+            var k: usize = 0;
+            while (k < @as(usize, @intCast(i))) : (k += 1) {
+                if (entries[k].frames.len > 0) allocator.free(entries[k].frames);
+            }
+            allocator.free(entries);
+            return null;
+        };
+        entries[@intCast(i)] = .{ .handle = handle, .frames = frames, .done = done };
+    }
+    return entries;
 }
 
 /// v1.7.1 — server-initiated drain. Pulls any bytes the consumer

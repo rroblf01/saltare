@@ -83,6 +83,8 @@ def run(
     drain_path: str | None = None,
     access_log_exclude: list[str] | tuple[str, ...] | None = None,
     ws_reject_log: bool = False,
+    ws_pump_interval_ms: int = 50,
+    ws_handshake_timeout: float = 2.0,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -268,6 +270,8 @@ def run(
         int(max_request_body),
     )
     _dispatcher.set_traceparent_propagation(bool(traceparent_propagation))
+    # v1.7.1: tunable WS handshake budget (Phase 1 + 2 pump deadline).
+    _dispatcher.set_ws_upgrade_deadline(float(ws_handshake_timeout))
     # v1.6 HSTS. `max_age=0` keeps the header line empty (zero-cost path).
     _dispatcher.set_hsts(
         int(hsts_max_age),
@@ -341,4 +345,5 @@ def run(
         # blanks don't shadow real entries.
         (",".join(p for p in access_log_exclude if p) if access_log_exclude else None),
         int(bool(ws_reject_log)),
+        int(ws_pump_interval_ms),
     )

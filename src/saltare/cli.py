@@ -524,6 +524,14 @@ def main(argv: list[str] | None = None) -> None:
         help="emit a single stderr line every time a WebSocket upgrade is rejected (`saltare: ws-reject path=... code=... reason=...`). Diagnoses Channels' Origin / Host / Auth middleware closing connects before `accept()`. Off by default.",
     )
     parser.add_argument(
+        "--ws-pump-interval-ms", type=int, default=50, metavar="MS",
+        help="interval between forced asyncio-loop pumps for live WebSocket connections (default 50). Lower for sub-50ms `channel_layer.group_send` server-push latency; raise on bandwidth-pinched deployments. Floor 10ms.",
+    )
+    parser.add_argument(
+        "--ws-handshake-timeout", type=float, default=2.0, metavar="SECS",
+        help="seconds the WS-upgrade pump waits for the consumer to accept/close (default 2.0). Bump for slow cold-start middleware (long DB warm-up); drop for latency-sensitive deployments.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -540,6 +548,15 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.app:
         parser.error("missing app target (e.g. 'main:app')")
+
+    # v1.7.1 startup banner — one stderr line at boot identifying the
+    # server and its version. Sized to coexist with `--access-log`
+    # output (no `info:` prefix, no log level), and routed to stderr
+    # so it doesn't interleave with stdout-bound app output. Operators
+    # who want quieter boots can suppress via `2>/dev/null`.
+    sys.stderr.write(
+        f"saltare {__version__} — low-RAM ASGI HTTP server (Zig backbone)\n"
+    )
 
     # Guardrail: a one-digit rate limit is almost always a typo. Print a
     # single warning at boot — the user can ignore if intentional.
@@ -624,4 +641,6 @@ def main(argv: list[str] | None = None) -> None:
         drain_path=args.drain_path,
         access_log_exclude=args.access_log_exclude,
         ws_reject_log=args.ws_reject_log,
+        ws_pump_interval_ms=args.ws_pump_interval_ms,
+        ws_handshake_timeout=args.ws_handshake_timeout,
     )

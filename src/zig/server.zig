@@ -150,6 +150,15 @@ pub const Observability = struct {
     /// rejecting connects — without it operators couldn't see *why*.
     /// Off by default (zero overhead when off).
     ws_reject_log: bool = false,
+    /// v1.7.1 — interval between forced asyncio pumps for live WS
+    /// connections, in milliseconds. Default 50 ms (`channel_layer.group_send`
+    /// latency feels instantaneous to most operators). Lower it for
+    /// trading-floor / chat-room workloads that need <50 ms server
+    /// push latency; raise it (e.g. 200 ms) on bandwidth-pinched
+    /// deployments where the pump cost matters more than tail
+    /// latency. Bounded by `WS_PUMP_MIN_INTERVAL_MS` (10 ms) on the
+    /// low end to keep the spin under control.
+    ws_pump_interval_ms: u32 = 50,
     /// If true, the dispatcher honours `X-Forwarded-For` /
     /// `X-Forwarded-Proto` from the request to populate `scope["client"]`
     /// and `scope["scheme"]`. Only enable behind a trusted reverse proxy
@@ -749,7 +758,9 @@ var g_stalled_head: ?*Connection = null;
 // `loop.run_forever()` thread; saltare's per-event pump model needs
 // this explicit heartbeat.
 pub var g_ws_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
-const WS_PUMP_INTERVAL_NS: i64 = 50 * std.time.ns_per_ms;
+/// Floor for `ws_pump_interval_ms` to keep pathological configs
+/// from spinning the worker thread at >100 Hz.
+const WS_PUMP_MIN_INTERVAL_MS: u32 = 10;
 var g_last_ws_pump_ns: i64 = 0;
 // Singly-linked list of live WebSocket connections. `drainWsOutbound`
 // walks this list each pump tick to flush server-pushed frames
@@ -875,6 +886,46 @@ const Tm = extern struct {
     tm_zone: ?[*:0]const u8,
 };
 extern fn localtime_r(t: *const c_long, result: *Tm) ?*Tm;
+
+/// v1.7.1 — WebSocket access-log line. Same date+time prefix and
+/// `[TOKEN] [URL] [STATUS] [BYTES]` shape as the HTTP variant, only
+/// the method-slot becomes `WS-CONNECT` / `WS-CLOSE`. Daphne logs
+/// `WSCONNECTING / WSCONNECT / WSDISCONNECT`; we collapse to two
+/// events (post-101 = WS-CONNECT, post-teardown = WS-CLOSE) which
+/// is what operators actually need to spot lifecycle issues.
+/// `kind` is the bracketed label, `code` is the WS close code on
+/// teardown (0 for connect events), `bytes_sent` is the cumulative
+/// write_buf bytes drained over the connection's lifetime.
+fn emitWsAccessLog(conn: *Connection, kind: []const u8, code: u16, bytes_sent: u64) void {
+    if (!g_obs.access_log) return;
+    const req = conn.parsed orelse return;
+    // Same exclude filter as the HTTP path so silencing /metrics on
+    // HTTP also silences any /ws/metrics noise an operator might
+    // configure on the same host.
+    for (g_obs.access_log_exclude) |skip_path| {
+        if (std.mem.eql(u8, req.target, skip_path)) return;
+    }
+
+    var log: LogBuf = .{};
+    var unix_now: c_long = @intCast(c.time(null));
+    var tm: Tm = undefined;
+    if (localtime_r(&unix_now, &tm) != null) {
+        log.printFmt("{d:0>2}/{d:0>2}/{d}:{d:0>2}:{d:0>2}:{d:0>2} ", .{
+            @as(u32, @intCast(tm.tm_mday)),
+            @as(u32, @intCast(tm.tm_mon + 1)),
+            @as(u32, @intCast(tm.tm_year + 1900)),
+            @as(u32, @intCast(tm.tm_hour)),
+            @as(u32, @intCast(tm.tm_min)),
+            @as(u32, @intCast(tm.tm_sec)),
+        });
+    }
+    log.appendByte('[');
+    log.appendSlice(kind);
+    log.appendSlice("] [");
+    log.appendSlice(req.target);
+    log.printFmt("] [{d}] [{d}]\n", .{ code, bytes_sent });
+    if (!log.overflow) _ = c.write(g_access_log_fd, &log.buf, log.pos);
+}
 
 fn emitAccessLog(conn: *Connection) void {
     const req = conn.parsed orelse return;
@@ -2542,10 +2593,11 @@ pub fn run(
         // v1.7.1: cap epoll wait at the WS pump interval whenever a WS
         // connection is alive — otherwise a 100 ms idle would delay
         // `channel_layer.group_send` deliveries by up to that much.
+        const ws_pump_ms: u32 = @max(g_obs.ws_pump_interval_ms, WS_PUMP_MIN_INTERVAL_MS);
         const wait_timeout: c_int = if (g_stalled_head != null)
             0
         else if (g_ws_conns.load(.seq_cst) > 0)
-            50
+            @intCast(ws_pump_ms)
         else
             100;
         const events = loop.wait(wait_timeout);
@@ -2616,7 +2668,8 @@ pub fn run(
         // WS conn is live (zero overhead on plain HTTP deployments).
         if (g_ws_conns.load(.seq_cst) > 0) {
             const now_ns = monoNs();
-            if (now_ns - g_last_ws_pump_ns >= WS_PUMP_INTERVAL_NS) {
+            const interval_ns: i64 = @as(i64, ws_pump_ms) * std.time.ns_per_ms;
+            if (now_ns - g_last_ws_pump_ns >= interval_ns) {
                 bridge.httpGlobalPump();
                 g_last_ws_pump_ns = now_ns;
                 // Drain any frames the pumped consumers queued. The
@@ -3866,6 +3919,11 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // Link into `g_ws_head` so `drainWsOutbound` can flush this conn.
     conn.ws_list_next = g_ws_head;
     g_ws_head = conn;
+    // v1.7.1: WS-CONNECT access-log line, parity with daphne's
+    // `WSCONNECT` event. Emitted after the 101 head is queued so
+    // operators can pair connect/close lines in the same log file
+    // they already grep for HTTP traffic.
+    emitWsAccessLog(conn, "WS-CONNECT", 101, 0);
     conn.ws_handle = opened.handle;
     // If the app already finished (called close right after accept), close
     // after we drain the frames; otherwise stay alive.
@@ -4179,24 +4237,43 @@ fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, paylo
 /// outgoing buffers into wire bytes. Without this, group_send
 /// messages sat in `_WsState.outgoing` forever (the existing
 /// drain path only fired on inbound traffic).
+///
+/// Single batched Python call (`bridge.wsDrainAll`) returns the
+/// entries we need so we don't acquire the GIL once per live WS
+/// conn each tick — critical for high-fanout deployments where
+/// 200 conns × 20 Hz pump would otherwise be 4 000 GIL hops/s.
 fn drainWsOutbound(loop: *eventloop.Loop) void {
-    var node = g_ws_head;
-    while (node) |conn| {
-        // Snapshot `next` BEFORE wsTeardown so we can keep walking
-        // even if this conn dies as part of the flush (close frame
-        // → connection close on next write).
-        const next = conn.ws_list_next;
-        const tick = bridge.wsDrain(conn.ws_handle, conn.allocator) orelse {
-            node = next;
-            continue;
-        };
-        if (tick.frames.len > 0) {
-            queueFrames(conn, tick.frames);
-            flushOutbound(loop, conn);
-        } else if (tick.done) {
-            conn.keep_alive = false;
+    if (g_ws_head == null) return;
+    const allocator = std.heap.c_allocator;
+    const entries = bridge.wsDrainAll(allocator) orelse return;
+    if (entries.len == 0) return;
+    defer allocator.free(entries);
+    // Look up each entry's conn by walking g_ws_head once and
+    // building a small handle→conn vector — O(N+M) on the active-
+    // WS set + the dirty subset; both stay small in practice.
+    for (entries) |entry| {
+        var node = g_ws_head;
+        var target: ?*Connection = null;
+        while (node) |conn| {
+            if (conn.ws_handle == entry.handle) {
+                target = conn;
+                break;
+            }
+            node = conn.ws_list_next;
         }
-        node = next;
+        if (target) |conn| {
+            if (entry.frames.len > 0) {
+                queueFrames(conn, entry.frames);
+                flushOutbound(loop, conn);
+            } else if (entry.done) {
+                conn.keep_alive = false;
+                if (entry.frames.len > 0) allocator.free(entry.frames);
+            }
+        } else {
+            // Stale entry (the conn died between drain + walk).
+            // Don't leak the buffer.
+            if (entry.frames.len > 0) allocator.free(entry.frames);
+        }
     }
 }
 
@@ -4328,6 +4405,12 @@ fn wsAfterWrite(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn wsTeardown(loop: *eventloop.Loop, conn: *Connection) void {
+    // v1.7.1: emit a WS-CLOSE access-log line before tearing the conn
+    // down. Using close code 1006 mirrors what `wsDisconnect` tells
+    // Python — "abnormal closure" — when the peer didn't send a
+    // proper close frame; the close code from a clean shutdown was
+    // already logged via the dispatch path that called us.
+    emitWsAccessLog(conn, "WS-CLOSE", 1006, conn.bytes_sent);
     if (conn.ws_handle != 0) {
         const final = bridge.wsDisconnect(conn.ws_handle, 1006, conn.allocator);
         if (final.len > 0) conn.allocator.free(final);
