@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.7.0
+
+**Theme**: Django Channels / ASGI 3.0 compliance.
+
+v1.6 served WebSocket upgrades fine in isolation but rejected with
+HTTP 403 when the user app was a Channels `ProtocolTypeRouter` with
+`AuthMiddlewareStack` in front of it — the consumer never reached
+`accept()` because Channels' middleware short-circuited the connect
+on missing scope keys. v1.7 closes that gap.
+
+### Default-on (no flag)
+
+- **ASGI 3.0 `state` dict** — `lifespan_startup` now creates a fresh
+  empty dict (`state.asgi_state`) and surfaces it as `scope["state"]`
+  on the lifespan scope; apps that mutate it (DB connection pools,
+  feature-flag caches, etc.) see the *same dict object* on every
+  subsequent HTTP and WebSocket scope. Matches uvicorn / hypercorn
+  semantics. Channels' `AuthMiddlewareStack` consults this on every
+  WS connect.
+- **`scope["extensions"]`** — empty `dict` (`_SCOPE_EXTENSIONS`) added
+  to HTTP and WS scopes. ASGI 3.0 reserved marker; some middleware
+  raises `KeyError` if missing.
+- **`scope["client"]` populated on WebSocket upgrades** — the WS
+  path now runs the same `_apply_proxy_headers` helper as HTTP, so
+  behind nginx / traefik / k8s ingress `scope["client"]` reflects the
+  real peer instead of `None`. `scope["scheme"]` honours
+  `X-Forwarded-Proto` (`ws` → `wss` when the proxy terminated TLS).
+  Channels' `AllowedHostsOriginValidator` was rejecting because of
+  the `None` client; that path now works.
+- **`method` dropped from WebSocket scope** — it was non-spec
+  (ASGI WS scope doesn't include the HTTP request method); strict
+  middleware assert-failed on the extra key.
+- **`_apply_proxy_headers` helper** factored out of
+  `http_dispatch_start` so HTTP and WS share one implementation —
+  RFC 7239 `Forwarded:` precedence over X-Real-IP / X-Forwarded-For
+  is now identical across both paths.
+
+### Deferred to 1.7.x
+
+- **Forward app's close code in HTTP response** — Channels uses
+  4xxx close codes (4003 Origin reject, 4001 unauthorized, …) before
+  `accept()`; saltare today returns a flat 403. Mapping `4003 → 403`,
+  `4001 → 401`, etc. is a 1.7.x diagnostic polish.
+- **`--ws-reject-log`** — stderr line on every 403 carrying the
+  close code + reason so operators don't have to attach a debugger
+  to find why Channels closed early.
+- **`test_channels.py`** integration test — mount a
+  `ProtocolTypeRouter` + `AuthMiddlewareStack` + an in-memory
+  channel layer in pytest; verify connect/disconnect end-to-end.
+
 ## 1.6.1
 
 **Theme**: access-log polish + small ops affordances.

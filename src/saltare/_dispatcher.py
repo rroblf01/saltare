@@ -154,6 +154,12 @@ def _ensure_state() -> threading.local:
         _state.lifespan_task = None
         _state.lifespan_receive_queue = None
         _state.lifespan_send_queue = None
+        # v1.7 ASGI 3.0 shared state. Same dict object passed through
+        # lifespan startup (apps may populate it) and then surfaced as
+        # `scope["state"]` in every subsequent HTTP and WebSocket scope
+        # — matches uvicorn's behaviour and is what Channels'
+        # `AuthMiddlewareStack` / custom middleware expect to find.
+        _state.asgi_state = {}
     return _state
 
 
@@ -227,9 +233,14 @@ def lifespan_startup(app: Any) -> bool:
     async def lifespan_send(message: dict[str, Any]) -> None:
         await sq.put(message)
 
+    # ASGI 3.0: fresh shared-state dict for this serve() invocation.
+    # The app's lifespan-startup callable can populate it; every HTTP /
+    # WebSocket scope built thereafter sees the same dict by reference.
+    state.asgi_state = {}
     scope: dict[str, Any] = {
         "type": "lifespan",
         "asgi": _ASGI_LIFESPAN_SUB,
+        "state": state.asgi_state,
     }
 
     state.lifespan_task = loop.create_task(app(scope, lifespan_receive, lifespan_send))
@@ -468,6 +479,104 @@ def dump_tracemalloc(top_n: int = 30) -> bytes:
 _ASGI_LIFESPAN_SUB = {"version": "3.0", "spec_version": "2.0"}
 _ASGI_HTTP_SUB = {"version": "3.0", "spec_version": "2.3"}
 _ASGI_WS_SUB = {"version": "3.0", "spec_version": "2.3"}
+
+def _apply_proxy_headers(
+    headers: list[tuple[bytes, bytes]],
+    scheme: str,
+    server_host: str,
+    server_port: int,
+) -> tuple[str, tuple[str, int] | None, tuple[str, int]]:
+    """v1.7: factor out the X-Forwarded-* / RFC 7239 parsing used by
+    `http_dispatch_start`. Returns `(scheme, client, server)`. Called
+    by both the HTTP and the WebSocket entry points so the WS path
+    behind a reverse proxy now reflects the real client (was: always
+    `None`, which broke Channels' `AllowedHostsOriginValidator`).
+
+    Source-precedence (most specific first):
+      1. RFC 7239 `Forwarded:` (`for=...;proto=...;host=...`)
+      2. nginx `X-Real-IP` (single IP)
+      3. `X-Forwarded-For` (comma-separated; leftmost = original client)
+    plus optional `X-Forwarded-Proto` / `-Host`. We trust whatever the
+    immediate peer (assumed: a hardened reverse proxy) sent.
+    """
+    effective_scheme = scheme
+    effective_client: tuple[str, int] | None = None
+    effective_server: tuple[str, int] = (server_host, server_port)
+    x_real_ip: bytes | None = None
+    x_forwarded_for: bytes | None = None
+    x_forwarded_host: bytes | None = None
+    forwarded_for: bytes | None = None
+    forwarded_proto: bytes | None = None
+    forwarded_host: bytes | None = None
+    for name, value in headers:
+        if name == b"x-real-ip":
+            x_real_ip = value
+        elif name == b"x-forwarded-for":
+            x_forwarded_for = value
+        elif name == b"x-forwarded-proto":
+            proto = value.strip().lower()
+            if proto in (b"http", b"https"):
+                effective_scheme = proto.decode("ascii")
+        elif name == b"x-forwarded-host":
+            x_forwarded_host = value
+        elif name == b"forwarded":
+            first = value.split(b",", 1)[0]
+            for part in first.split(b";"):
+                p = part.strip()
+                if p.startswith(b"for="):
+                    forwarded_for = p[4:].strip(b"\"")
+                elif p.startswith(b"proto="):
+                    forwarded_proto = p[6:].strip(b"\"")
+                elif p.startswith(b"host="):
+                    forwarded_host = p[5:].strip(b"\"")
+    if forwarded_proto:
+        fp = forwarded_proto.lower()
+        if fp in (b"http", b"https"):
+            effective_scheme = fp.decode("ascii")
+    host_raw = forwarded_host if forwarded_host is not None else x_forwarded_host
+    if host_raw:
+        try:
+            host_str = host_raw.decode("ascii").strip().strip('"')
+            if ":" in host_str and not host_str.startswith("["):
+                h, _, p = host_str.rpartition(":")
+                try:
+                    effective_server = (h, int(p))
+                except ValueError:
+                    effective_server = (host_str, server_port)
+            else:
+                effective_server = (host_str, server_port)
+        except UnicodeDecodeError:
+            pass
+    client_raw: bytes | None = None
+    if forwarded_for is not None:
+        cf = forwarded_for.strip(b"\"")
+        if cf.startswith(b"["):
+            end = cf.find(b"]")
+            if end != -1:
+                cf = cf[1:end]
+        elif b":" in cf and cf.count(b":") == 1:
+            cf = cf.split(b":", 1)[0]
+        client_raw = cf
+    elif x_real_ip is not None:
+        client_raw = x_real_ip.strip()
+    elif x_forwarded_for is not None:
+        client_raw = x_forwarded_for.split(b",", 1)[0].strip()
+    if client_raw:
+        try:
+            ip = client_raw.decode("ascii")
+            effective_client = (ip, 0)
+        except UnicodeDecodeError:
+            pass
+    return effective_scheme, effective_client, effective_server
+
+
+# v1.7 ASGI 3.0 `extensions` marker. Empty dict shared by every scope
+# (HTTP + WS). Apps that consult `scope["extensions"]` (the FastAPI
+# lifespan-state helper, Django Channels' middleware that probes for
+# server-side extension support) now see a real dict instead of
+# `KeyError`. We don't advertise any extensions yet — `saltare.sendfile`
+# remains an ASGI-message-type extension, not a scope-level one.
+_SCOPE_EXTENSIONS: dict[str, Any] = {}
 
 # v1.2: pre-built wire-format byte constants. Each response used to rebuild
 # `b"server: " + _SERVER_HEADER + b"\r\n"` (one `+` allocation), the
@@ -971,23 +1080,50 @@ def ws_open(
                         continue
             break
 
+    # `method` from the request line is unused here — ASGI WebSocket
+    # scope does not carry it, and shipping it confused strict middleware
+    # (notably Django Channels' AuthMiddlewareStack v4).
+    del method  # documented signature-arg discard
+
+    # v1.7 ASGI 3.0: derive scheme/client/server identically to the HTTP
+    # path so proxy_headers actually works on WS upgrades behind nginx /
+    # traefik / k8s ingress. Previously `scope["client"]` was hardcoded
+    # to None, which broke Channels' `AllowedHostsOriginValidator` and
+    # any per-IP rate limiting that lives in the consumer.
+    base_scheme = "wss" if scheme == "https" else "ws"
+    effective_scheme = base_scheme
+    effective_client: tuple[str, int] | None = None
+    effective_server: tuple[str, int] = (server_host, server_port)
+    if _proxy_headers_enabled:
+        # `_apply_proxy_headers` speaks http/https; translate back to
+        # ws/wss after the proxy-aware scheme is known.
+        proxy_scheme, effective_client, effective_server = _apply_proxy_headers(
+            headers,
+            "https" if base_scheme == "wss" else "http",
+            server_host,
+            server_port,
+        )
+        effective_scheme = "wss" if proxy_scheme == "https" else "ws"
+
+    tstate = _ensure_state()
     scope: dict[str, Any] = {
         "type": "websocket",
         "asgi": _ASGI_WS_SUB,
         "http_version": "1.1",
-        "scheme": "wss" if scheme == "https" else "ws",
+        "scheme": effective_scheme,
         "path": path,
         "raw_path": raw_path,
         "query_string": query_string,
         "headers": headers,
-        "server": (server_host, server_port),
-        "client": None,
+        "server": effective_server,
+        "client": effective_client,
         "root_path": "",
         "subprotocols": subprotocols,
-        "method": method,
+        # v1.7 ASGI 3.0 — shared lifespan state + extensions marker
+        # (same dict references as the HTTP path).
+        "state": tstate.asgi_state,
+        "extensions": _SCOPE_EXTENSIONS,
     }
-
-    tstate = _ensure_state()
     handle = tstate.next_ws_handle
     tstate.next_ws_handle += 1
 
@@ -1888,86 +2024,9 @@ def http_dispatch_start(
     effective_server: tuple[str, int] = (server_host, server_port)
 
     if _proxy_headers_enabled:
-        # Source-precedence (most-specific first):
-        #   1. RFC 7239 `Forwarded:` (`for=...;proto=...;host=...`)
-        #   2. nginx `X-Real-IP` (single IP)
-        #   3. `X-Forwarded-For` (comma-separated chain, leftmost = client)
-        # plus optional `X-Forwarded-Proto` and `X-Forwarded-Host` for
-        # scheme + scope["server"]. We trust whatever the immediate
-        # peer (assumed: a hardened reverse proxy) sent.
-        x_real_ip: bytes | None = None
-        x_forwarded_for: bytes | None = None
-        x_forwarded_host: bytes | None = None
-        forwarded_for: bytes | None = None
-        forwarded_proto: bytes | None = None
-        forwarded_host: bytes | None = None
-        for name, value in headers:
-            if name == b"x-real-ip":
-                x_real_ip = value
-            elif name == b"x-forwarded-for":
-                x_forwarded_for = value
-            elif name == b"x-forwarded-proto":
-                proto = value.strip().lower()
-                if proto in (b"http", b"https"):
-                    effective_scheme = proto.decode("ascii")
-            elif name == b"x-forwarded-host":
-                x_forwarded_host = value
-            elif name == b"forwarded":
-                # RFC 7239 — comma-separated list of `key=value;...`.
-                # Take the leftmost element (closest to original client).
-                first = value.split(b",", 1)[0]
-                for part in first.split(b";"):
-                    p = part.strip()
-                    if p.startswith(b"for="):
-                        forwarded_for = p[4:].strip(b"\"")
-                    elif p.startswith(b"proto="):
-                        forwarded_proto = p[6:].strip(b"\"")
-                    elif p.startswith(b"host="):
-                        forwarded_host = p[5:].strip(b"\"")
-        # Apply 7239 `proto=` if present.
-        if forwarded_proto:
-            fp = forwarded_proto.lower()
-            if fp in (b"http", b"https"):
-                effective_scheme = fp.decode("ascii")
-        # Apply 7239 `host=` then fall back to X-Forwarded-Host.
-        host_raw = forwarded_host if forwarded_host is not None else x_forwarded_host
-        if host_raw:
-            try:
-                host_str = host_raw.decode("ascii").strip().strip('"')
-                # `Host: example.com[:port]` form.
-                if ":" in host_str and not host_str.startswith("["):
-                    h, _, p = host_str.rpartition(":")
-                    try:
-                        effective_server = (h, int(p))
-                    except ValueError:
-                        effective_server = (host_str, server_port)
-                else:
-                    effective_server = (host_str, server_port)
-            except UnicodeDecodeError:
-                pass
-        # Client IP precedence.
-        client_raw: bytes | None = None
-        if forwarded_for is not None:
-            # `for=192.0.2.1` or `for="[2001:db8::1]:42"` — strip
-            # bracket / port best-effort.
-            cf = forwarded_for.strip(b"\"")
-            if cf.startswith(b"["):
-                end = cf.find(b"]")
-                if end != -1:
-                    cf = cf[1:end]
-            elif b":" in cf and cf.count(b":") == 1:
-                cf = cf.split(b":", 1)[0]
-            client_raw = cf
-        elif x_real_ip is not None:
-            client_raw = x_real_ip.strip()
-        elif x_forwarded_for is not None:
-            client_raw = x_forwarded_for.split(b",", 1)[0].strip()
-        if client_raw:
-            try:
-                ip = client_raw.decode("ascii")
-                effective_client = (ip, 0)
-            except UnicodeDecodeError:
-                pass
+        effective_scheme, effective_client, effective_server = _apply_proxy_headers(
+            headers, scheme, server_host, server_port,
+        )
 
     # v1.3: synthesise the request ID up front so the app sees it in
     # scope (as `scope["x-request-id"]`) AND `_emit_headers` can echo
@@ -1992,6 +2051,13 @@ def http_dispatch_start(
         "server": effective_server,
         "client": effective_client,
         "root_path": "",
+        # ASGI 3.0 — shared lifespan state + extensions marker dict.
+        # Both are required reads by uvicorn-compatible middleware
+        # (Django Channels' `AuthMiddlewareStack`, FastAPI lifespan
+        # helpers, custom auth that stashes a session pool in state
+        # during startup).
+        "state": state_obj.asgi_state,
+        "extensions": _SCOPE_EXTENSIONS,
     }
     if req_id_bytes:
         # ASGI extension key — apps grab it via scope["x-request-id"].
