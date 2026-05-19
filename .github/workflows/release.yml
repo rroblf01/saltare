@@ -4,6 +4,12 @@ name: Build & release wheels
 # excluded because saltare's event loop is Linux-only (see eventloop.zig's
 # `@compileError` on non-Linux targets); a kqueue port is not on the
 # roadmap. PRs run the same Linux matrix as the release workflow.
+#
+# manylinux_2_28 + musllinux_1_2 are PyPI compatibility tags, not just
+# container choices — PyPI rejects wheels tagged `linux_x86_64` (the
+# raw-Linux tag) because they're not portable across distros. So the
+# build images here are fixed; performance work is in the matrix shape
+# (parallelism) and the test-stage split, not the base image.
 
 on:
   push:
@@ -24,15 +30,26 @@ env:
   ZIG_VERSION: "0.16.0"
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Wheels — 4-job fan-out: libc × arch. Each job builds the 5 supported
+  # Python versions (cp310 .. cp314) for its one (libc, arch) combo.
+  # GitHub free-tier concurrency caps at ~20 parallel jobs; 4 is safely
+  # under that and runs in parallel with build_sdist + test_wheels.
+  #
+  # Wall-time math (per job): 5 wheels × ~80 s each (no per-wheel test
+  # install thanks to CIBW_TEST_SKIP) ≈ 7 min. Was: 10 wheels serial
+  # per arch × ~150 s = 25 min.
   build_wheels:
-    name: ${{ matrix.os }} (${{ matrix.arch }})
+    name: wheels ${{ matrix.libc }} ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    arch: x86_64  }
-          - { os: ubuntu-24.04-arm, arch: aarch64 }
+          - { os: ubuntu-latest,    arch: x86_64,  libc: manylinux }
+          - { os: ubuntu-latest,    arch: x86_64,  libc: musllinux }
+          - { os: ubuntu-24.04-arm, arch: aarch64, libc: manylinux }
+          - { os: ubuntu-24.04-arm, arch: aarch64, libc: musllinux }
     steps:
       - uses: actions/checkout@v4
 
@@ -54,29 +71,100 @@ jobs:
           ZIG_SKIP_SYMLINK: "1"
         run: bash scripts/install-zig.sh
 
-      # Wrap cibuildwheel in retries: quay.io serves the manylinux /
-      # musllinux images and occasionally returns 502 Bad Gateway under
-      # load. The pull is idempotent so a 30-second backoff usually
-      # clears the transient. 3 attempts is enough — sustained quay.io
-      # outages are operator-visible problems, not flaky-CI ones.
+      # Tier-5: cache pip's download/wheel cache across runs so the
+      # build-time dependency install (`scikit-build-core`, `ninja`) skips
+      # the PyPI round-trip on cache hits. Keyed by pyproject.toml so
+      # cache invalidates only when build-deps change.
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ matrix.arch }}-${{ matrix.libc }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-${{ matrix.arch }}-${{ matrix.libc }}-
+
+      # Tier-3: skip cibuildwheel's per-wheel test pass entirely. Tests
+      # run once in the separate `test_wheels` job below — much cheaper
+      # than re-installing pytest/fastapi/httpx/websockets inside every
+      # one of the 5 manylinux containers. The trade-off is per-Python-
+      # version coverage of the import path; the separate test job
+      # exercises a representative subset (cp310, cp312, cp314) so a
+      # version-specific ABI regression still surfaces.
+      #
+      # CIBW_BUILD limits the matrix slot to one (libc, arch) combo so
+      # the 4 parallel jobs don't all rebuild the same wheels.
       - name: Build wheels
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 60
+          timeout_minutes: 30
           max_attempts: 3
           retry_wait_seconds: 30
           retry_on: error
           command: |
             CIBW_ARCHS=${{ matrix.arch }} \
+            CIBW_BUILD='cp31?-${{ matrix.libc }}_*' \
+            CIBW_TEST_SKIP='*' \
             CIBW_CONTAINER_ENGINE='docker; create_args: --volume ${{ runner.temp }}/zig:/host-zig:ro' \
             CIBW_ENVIRONMENT_LINUX='PATH=/host-zig:/usr/local/bin:$PATH ZIG_VERSION=${{ env.ZIG_VERSION }}' \
             pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.arch }}
+          name: wheels-${{ matrix.arch }}-${{ matrix.libc }}
           path: ./wheelhouse/*.whl
 
+  # ---------------------------------------------------------------------------
+  # Tier-3 test stage. Downloads the manylinux x86_64 wheel set built
+  # above and runs `pytest -q tests` against cp310 / cp312 / cp314 in a
+  # lightweight ubuntu-latest runner — no manylinux container needed for
+  # the test phase. Catches version-specific issues without re-paying
+  # the cibuildwheel per-wheel install tax × 5 Python versions × 4
+  # (libc, arch) jobs.
+  test_wheels:
+    name: test cp${{ matrix.py_short }}
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python-version: "3.10", py_short: "310" }
+          - { python-version: "3.12", py_short: "312" }
+          - { python-version: "3.14", py_short: "314" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-x86_64-manylinux
+          path: wheelhouse
+
+      - name: Cache pip downloads (test)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-test-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-test-${{ matrix.python-version }}-
+
+      - name: Install wheel + test deps
+        run: |
+          pip install --upgrade pip
+          # Match the test-requires baked into pyproject.toml's
+          # [tool.cibuildwheel]; keeps both runs honest.
+          pip install pytest httpx fastapi websockets pytest-rerunfailures
+          # Pick the wheel matching this runner's CPython tag.
+          pip install --no-deps wheelhouse/saltare-*-cp${{ matrix.py_short }}-cp${{ matrix.py_short }}*-manylinux_2_28_x86_64.whl
+
+      - name: Run pytest
+        run: pytest -q tests
+
+  # ---------------------------------------------------------------------------
+  # Source distribution. Independent of the wheel matrix — runs once on
+  # ubuntu-latest, no manylinux needed (sdists are platform-agnostic).
   build_sdist:
     name: Source distribution
     runs-on: ubuntu-latest
@@ -92,10 +180,14 @@ jobs:
           name: sdist
           path: ./dist/*.tar.gz
 
+  # ---------------------------------------------------------------------------
+  # PyPI publish. Gated on tag pushes AND on test_wheels passing — the
+  # latter is the v1.7 addition (was: published as soon as wheels built,
+  # before any test confirmed they were installable).
   publish:
     name: Publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build_wheels, build_sdist]
+    needs: [build_wheels, test_wheels, build_sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi

@@ -36,6 +36,7 @@ threadlocal var g_lifespan_startup: ?*py.PyObject = null;
 threadlocal var g_lifespan_shutdown: ?*py.PyObject = null;
 threadlocal var g_ws_open: ?*py.PyObject = null;
 threadlocal var g_ws_event: ?*py.PyObject = null;
+threadlocal var g_ws_drain: ?*py.PyObject = null;
 threadlocal var g_ws_disconnect: ?*py.PyObject = null;
 threadlocal var g_tracemalloc_dump: ?*py.PyObject = null;
 threadlocal var g_tracemalloc_init: ?*py.PyObject = null;
@@ -99,6 +100,7 @@ pub fn init(
     g_lifespan_shutdown = py.PyObject_GetAttrString(mod, "lifespan_shutdown") orelse return false;
     g_ws_open = py.PyObject_GetAttrString(mod, "ws_open") orelse return false;
     g_ws_event = py.PyObject_GetAttrString(mod, "ws_event") orelse return false;
+    g_ws_drain = py.PyObject_GetAttrString(mod, "ws_drain") orelse return false;
     g_ws_disconnect = py.PyObject_GetAttrString(mod, "ws_disconnect") orelse return false;
     // Optional: only present when tracemalloc_path is configured. Failing
     // here would be fatal; we tolerate absence by clearing the error.
@@ -176,6 +178,10 @@ pub fn shutdown() void {
     if (g_ws_event) |e| {
         py.Py_DecRef(e);
         g_ws_event = null;
+    }
+    if (g_ws_drain) |d| {
+        py.Py_DecRef(d);
+        g_ws_drain = null;
     }
     if (g_ws_disconnect) |d| {
         py.Py_DecRef(d);
@@ -678,6 +684,24 @@ pub fn wsEvent(handle: c_long, opcode: u8, payload: []const u8, rsv1: bool, allo
     };
     defer py.Py_DecRef(result);
 
+    return extractWsTick(result, allocator);
+}
+
+/// v1.7.1 — server-initiated drain. Pulls any bytes the consumer
+/// queued since the last tick (typically from `channel_layer.group_send`
+/// → consumer handler → `await self.send(...)`) without pushing any
+/// inbound event. The asyncio loop should already have been pumped
+/// (`httpGlobalPump`) before this call so the consumer task ran to
+/// its next park. Returns (frames, done) like `wsEvent`.
+pub fn wsDrain(handle: c_long, allocator: std.mem.Allocator) ?WsTick {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(g_ws_drain.?, "l", handle) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
     return extractWsTick(result, allocator);
 }
 

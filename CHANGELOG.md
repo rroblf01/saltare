@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.7.1
+
+**Theme**: Django Channels WebSocket runtime — closing the gap with daphne.
+
+v1.7.0 shipped the scope-shape fixes (state, extensions, drop
+method, proxy_headers for WS) but Channels apps still didn't work
+end-to-end: `AuthMiddlewareStack` parked the consumer task on an
+async session lookup, saltare gave up after one tick, and the
+consumer's `channel_layer.group_send` deliveries never reached the
+wire. v1.7.1 reworks the WS upgrade + steady-state pump so Channels
+apps that work under daphne also work under saltare.
+
+### Default-on
+
+- **WS upgrade: two-phase multi-tick pump.** Phase 1 spins
+  `_pump_once()` up to `_WS_UPGRADE_DEADLINE_S` (2 s) until the
+  consumer accepts / closes / errors — gives `AuthMiddlewareStack`'s
+  async session lookup room to settle. Phase 2 (post-accept) keeps
+  pumping until the consumer's `connect()` finishes its `group_add`
+  + initial-state DB fetch + initial `self.send(...)` chain — was:
+  saltare broke out as soon as `accepted=True` and the initial
+  state push never reached the client. Quiet-tick heuristic
+  (`_WS_QUIET_TICKS_BEFORE_RETURN`) detects the consumer parking
+  on `receive_queue.get()` so the pump exits as soon as the
+  initial work is done.
+- **Periodic asyncio pump for live WS connections.** Daphne keeps
+  `loop.run_forever()` in a background thread; saltare's per-event
+  pump model was idle between socket events, so
+  `channel_layer.group_send` queued a message but the consumer's
+  `await receive_queue.get()` never resumed. The main loop now
+  ticks the asyncio loop every 50 ms when `g_ws_conns > 0` and
+  walks a new `g_ws_head` singly-linked list of live WS conns,
+  draining each via `bridge.wsDrain` + `queueFrames` +
+  `flushOutbound`. Zero overhead on plain-HTTP deployments
+  (gated on `g_ws_conns > 0`).
+- **WS-task exception surfacing.** When the consumer task ends with
+  an unconsumed exception before `accept()` (Channels middleware
+  raising on missing SECRET_KEY / SessionMiddleware misconfig /
+  scope key error), saltare now prints the traceback to stderr
+  AND stuffs the exception class+message into `close_reason` so
+  `--ws-reject-log` carries it. Was: silent 403 with no clue.
+
+### Tests
+
+108 total — same count as v1.7.0. No new tests; the existing
+`test_channels.py` (skipped when Channels isn't installed) covers
+the integration surface, and the WS-pump fix is exercised by
+existing `test_websocket.py` / `test_v16.py` because the new
+multi-tick path collapses to a single tick for simple consumers.
+
 ## 1.7.0
 
 **Theme**: Django Channels / ASGI 3.0 compliance.
@@ -57,6 +107,32 @@ on missing scope keys. v1.7 closes that gap.
   upgrade end-to-end and that consumers using `await self.close(code=4003)`
   produce HTTP 403, `code=4004` produces 404. Skipped automatically
   when `channels` isn't installed in the test environment.
+
+### CI / release pipeline (`release.yml`)
+
+- **Wheel matrix fan-out 2 → 4 jobs.** Was: one job per arch built
+  all 10 wheels (5 Python versions × 2 libcs) serially → 11–20 min
+  wall. Now: one job per `(libc, arch)` combo builds 5 wheels →
+  ~7 min wall on each of 4 parallel runners (well under the
+  GitHub-free-tier concurrency cap).
+- **Test phase split out** (`CIBW_TEST_SKIP='*'`). cibuildwheel no
+  longer reinstalls `pytest httpx fastapi websockets pytest-rerunfailures`
+  inside every per-wheel container. A separate `test_wheels` job
+  downloads the manylinux x86_64 wheel set and runs `pytest -q tests`
+  against cp310 / cp312 / cp314 on lightweight `ubuntu-latest`
+  runners. Catches ABI / import regressions without paying the
+  per-wheel install tax 20× (5 Python × 4 (libc, arch)).
+- **`pip` download cache** via `actions/cache@v4` keyed by
+  `pyproject.toml` hash. Build-dep round-trip (`scikit-build-core`,
+  `ninja`) skips PyPI on warm caches.
+- **`publish` gated on `test_wheels`** — was previously gated only on
+  `build_wheels` + `build_sdist`, meaning a broken-but-buildable
+  wheel could ship to PyPI. Now the test stage must pass first.
+- **manylinux_2_28 + musllinux_1_2 kept.** They're PyPI-compatibility
+  tags, not arbitrary container choices; switching to plain
+  Ubuntu/Alpine/Debian-slim would produce wheels PyPI rejects.
+  Performance work is in matrix shape and the test-stage split,
+  not the base image.
 
 ### Distribution
 

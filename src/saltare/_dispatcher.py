@@ -1151,10 +1151,95 @@ def ws_open(
     tstate.ws_states[handle] = ws_state
     ws_state.push({"type": "websocket.connect"})
 
-    try:
-        _pump_once()
-    except BaseException:
-        _print_exception_lazy(*sys.exc_info())
+    # v1.7.1: two-phase pump during the upgrade.
+    #
+    # Phase 1 (pre-accept): spin until `accepted` or `closed` or
+    # `task.done()`. Channels' `AuthMiddlewareStack` parks on an
+    # async session lookup; a single `_pump_once()` returns before
+    # the lookup resolves.
+    #
+    # Phase 2 (post-accept): the consumer's `connect()` typically
+    # does MORE work after `await self.accept()` — adds the channel
+    # to a group, fetches initial state from the DB, sends an
+    # initial frame to the client. v1.7.1 broke out of the pump as
+    # soon as `accepted=True`, leaving those follow-up coroutines
+    # parked. The client saw "WebSocket connected" but never got
+    # the initial state push. Now we keep pumping until the consumer
+    # quiets down (no new outgoing bytes for `_WS_QUIET_TICKS_BEFORE_RETURN`
+    # consecutive ticks) — that means the task has parked again,
+    # presumably on `await receive_queue.get()` waiting for the next
+    # client frame.
+    import time as _time
+    deadline = _time.monotonic() + _WS_UPGRADE_DEADLINE_S
+    prev_outgoing = 0
+    quiet_ticks = 0
+    while True:
+        try:
+            _pump_once()
+        except BaseException:
+            _print_exception_lazy(*sys.exc_info())
+
+        if ws_state.task.done():
+            break
+
+        # Pre-accept: keep going until decision arrives.
+        if not ws_state.accepted and not ws_state.closed:
+            if _time.monotonic() > deadline:
+                # Cancel the parked task to avoid leaking the coroutine
+                # behind a 403.
+                ws_state.task.cancel()
+                try:
+                    _pump_once()
+                except BaseException:
+                    _print_exception_lazy(*sys.exc_info())
+                if not ws_state.close_reason:
+                    ws_state.close_reason = (
+                        f"handshake timeout ({_WS_UPGRADE_DEADLINE_S}s; "
+                        "consumer never called accept() or close())"
+                    )
+                break
+            _time.sleep(0.001)
+            continue
+
+        if ws_state.closed:
+            break
+
+        # Post-accept: let the consumer flush its initial-state work
+        # (group_add, initial send, etc.) before returning control to
+        # the bridge. We watch `outgoing_bytes` as a proxy for "did
+        # the consumer make progress this tick?". Three consecutive
+        # ticks with no growth = parked on receive — safe to return.
+        if ws_state.outgoing_bytes > prev_outgoing:
+            prev_outgoing = ws_state.outgoing_bytes
+            quiet_ticks = 0
+        else:
+            quiet_ticks += 1
+            if quiet_ticks >= _WS_QUIET_TICKS_BEFORE_RETURN:
+                break
+
+        if _time.monotonic() > deadline:
+            break
+
+        _time.sleep(0.001)
+
+    # v1.7.1 → v1.7.1: surface unconsumed task exceptions so a raise
+    # in the user's middleware chain (Channels' AuthMiddlewareStack
+    # exploding because Django settings weren't ready / ALLOWED_HOSTS
+    # mismatched / SessionMiddleware missing) doesn't disappear silently.
+    # Without this, the only visible signal was a flat 403 with
+    # `ws-reject ... code=0 reason=`. Now operators see the actual stack.
+    if ws_state.task.done() and not ws_state.accepted:
+        try:
+            exc = ws_state.task.exception()
+        except (asyncio.CancelledError, asyncio.InvalidStateError):
+            exc = None
+        if exc is not None:
+            _print_exception_lazy(type(exc), exc, exc.__traceback__)
+            # Also stuff a short reason into close_reason so the
+            # `--ws-reject-log` line carries the exception class —
+            # the full traceback already went to stderr above.
+            if not ws_state.close_reason:
+                ws_state.close_reason = f"{type(exc).__name__}: {exc}"[:200]
 
     return (
         handle,
@@ -1206,6 +1291,23 @@ def ws_event(handle: int, opcode: int, payload: bytes, rsv1: int = 0) -> tuple[b
         _print_exception_lazy(*sys.exc_info())
 
     return (ws_state.drain(), ws_state.task.done())
+
+
+def ws_drain(handle: int) -> tuple[bytes, bool]:
+    """v1.7.1 — server-initiated WebSocket frame harvest. Called by
+    the Zig main-loop periodic pump (`drainWsOutbound`) to flush any
+    outgoing bytes the consumer produced since the last tick — most
+    commonly via `channel_layer.group_send` -> consumer handler ->
+    `await self.send(...)`. Does NOT push any inbound event; the
+    asyncio loop was already pumped by `http_global_pump` before this
+    call. Returns (frames, done). `done=True` when the consumer task
+    has finished — server should not call us again for this handle.
+    """
+    tstate = _ensure_state()
+    ws_state = tstate.ws_states.get(handle)
+    if ws_state is None:
+        return (b"", True)
+    return (ws_state.drain(), ws_state.closed or ws_state.task.done())
 
 
 def ws_disconnect(handle: int, code: int) -> bytes:
@@ -1296,6 +1398,29 @@ _HTTP_SEND_YIELD_BYTES = 64 * 1024
 # fast producer used to grow `outgoing` without bound. Above the cap we
 # mark the connection closed; the bridge tears it down on the next pump.
 _WS_OUTGOING_MAX_BYTES = 1024 * 1024
+
+# v1.7.1 WebSocket upgrade pump budget. Channels' `AuthMiddlewareStack`
+# does an async session lookup on every connect — the consumer's task
+# parks on the first `await`, and saltare's single-tick `_pump_once()`
+# returned before the lookup resolved (visible to operators as
+# `ws-reject ... code=0 reason=`). We now spin the loop up to this many
+# seconds of wall clock so async middleware gets a chance to decide.
+# 2 s covers cold-start Django ORM lookups comfortably; bursts past
+# this are real bugs or DB latency, not legitimate connects, and a
+# timeout-mapped 408 is the right answer there.
+_WS_UPGRADE_DEADLINE_S = 2.0
+
+# v1.7.1 WebSocket post-accept pump. After the consumer calls `accept()`
+# its `connect()` coroutine usually keeps running (group_add, initial DB
+# fetch, send initial frame); each step is an `await` that parks the
+# task. We want to surface those follow-up sends to the wire BEFORE
+# handing control back to the bridge — otherwise the client sees
+# `WebSocket connected` but never receives the initial state. We watch
+# `_WsState.outgoing_bytes` as a progress signal: this many consecutive
+# ticks with no growth = task parked on `receive_queue.get()`, no more
+# work pending. 3 × 1 ms ≈ 3 ms tail latency added to every connect, in
+# exchange for correctness under Channels' standard pattern.
+_WS_QUIET_TICKS_BEFORE_RETURN = 3
 
 
 def _acquire_http_state(

@@ -741,6 +741,22 @@ var g_ktls_enabled: bool = false;
 /// multiple awaits). Reset to null by `run()`.
 var g_stalled_head: ?*Connection = null;
 
+// v1.7.1 — count of live WebSocket connections. When non-zero the
+// main loop calls `bridge.httpGlobalPump()` every WS_PUMP_INTERVAL_NS
+// regardless of inbound traffic so Channels' `channel_layer.group_send`
+// (which queues a message but doesn't otherwise touch the socket)
+// reaches the consumer's `await receive_queue.get()`. Daphne keeps a
+// `loop.run_forever()` thread; saltare's per-event pump model needs
+// this explicit heartbeat.
+pub var g_ws_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+const WS_PUMP_INTERVAL_NS: i64 = 50 * std.time.ns_per_ms;
+var g_last_ws_pump_ns: i64 = 0;
+// Singly-linked list of live WebSocket connections. `drainWsOutbound`
+// walks this list each pump tick to flush server-pushed frames
+// (`channel_layer.group_send` and friends) that the consumer queued
+// into `_WsState.outgoing` without any inbound socket activity.
+var g_ws_head: ?*Connection = null;
+
 /// CLOCK_MONOTONIC nanoseconds. Wraps the libc call inline so the cost
 /// of a metrics scrape is dominated by the formatting, not by Zig
 /// indirection. Off the hot path when `access_log` is off (we only call
@@ -2014,6 +2030,11 @@ const Connection = struct {
     /// and the dispatcher accepted. Used to pass the rsv1 hint to
     /// the bridge on every inbound message.
     ws_pmd_active: bool,
+    /// v1.7.1 — singly-linked list of live WS conns rooted at
+    /// `g_ws_head`. Inserted at head on successful WS upgrade, removed
+    /// in `destroy`. Walked each periodic-pump tick to flush
+    /// `_WsState.outgoing` to the wire after `group_send` etc.
+    ws_list_next: ?*Connection,
 
     // v1.4: request-body streaming state. When the declared
     // `Content-Length` exceeds the read buffer's available space,
@@ -2074,6 +2095,7 @@ const Connection = struct {
             .ws_frag_buf = null,
             .ws_frag_len = 0,
             .ws_pmd_active = false,
+            .ws_list_next = null,
             .body_streaming = false,
             .body_streaming_consumed = 0,
         };
@@ -2085,6 +2107,26 @@ const Connection = struct {
         // `wsTeardown` BEFORE calling destroy. We don't acquire the GIL
         // here — destroy is called from many paths (including non-WS)
         // and forcing a GIL acquisition was a footgun in tests.
+        if (self.protocol == .websocket) {
+            // v1.7.1: pair with the increment in startWebSocket so the
+            // periodic-pump tick stops once the last WS conn dies.
+            _ = g_ws_conns.fetchSub(1, .seq_cst);
+            // Unlink from g_ws_head. O(N) scan; N is the active WS
+            // count which stays small in practice (~hundreds at most).
+            if (g_ws_head == self) {
+                g_ws_head = self.ws_list_next;
+            } else {
+                var prev = g_ws_head;
+                while (prev) |p| {
+                    if (p.ws_list_next == self) {
+                        p.ws_list_next = self.ws_list_next;
+                        break;
+                    }
+                    prev = p.ws_list_next;
+                }
+            }
+            self.ws_list_next = null;
+        }
         self.wheel.cancel(&self.timer_node);
         unlinkStalled(self);
         if (self.dispatch_active and self.dispatch_handle != 0) {
@@ -2497,7 +2539,15 @@ pub fn run(
         // drive the asyncio loop forward without sleeping for the full
         // 100 ms poll budget — otherwise a stalled batch of FastAPI
         // requests would each take 100 ms per await to unblock.
-        const wait_timeout: c_int = if (g_stalled_head != null) 0 else 100;
+        // v1.7.1: cap epoll wait at the WS pump interval whenever a WS
+        // connection is alive — otherwise a 100 ms idle would delay
+        // `channel_layer.group_send` deliveries by up to that much.
+        const wait_timeout: c_int = if (g_stalled_head != null)
+            0
+        else if (g_ws_conns.load(.seq_cst) > 0)
+            50
+        else
+            100;
         const events = loop.wait(wait_timeout);
         var saw_event = false;
         for (events) |ev| {
@@ -2556,6 +2606,29 @@ pub fn run(
         // got chunks transition back to .writing; those still parked
         // re-link themselves on the next stall path.
         if (g_stalled_head != null) drainStalled(&loop);
+
+        // v1.7.1: periodic asyncio pump for live WebSocket connections.
+        // Without it, `channel_layer.group_send(...)` queues a message
+        // but the consumer's `await receive_queue.get()` never resumes
+        // (no inbound socket activity → no `_pump_once` call → loop
+        // stays idle). Daphne avoids this by keeping `run_forever()`
+        // in a dedicated thread; saltare ticks here. Skipped when no
+        // WS conn is live (zero overhead on plain HTTP deployments).
+        if (g_ws_conns.load(.seq_cst) > 0) {
+            const now_ns = monoNs();
+            if (now_ns - g_last_ws_pump_ns >= WS_PUMP_INTERVAL_NS) {
+                bridge.httpGlobalPump();
+                g_last_ws_pump_ns = now_ns;
+                // Drain any frames the pumped consumers queued. The
+                // stalled-list walk above already harvested HTTP-side
+                // outgoing bytes; WS conns drain via the regular write
+                // path triggered on the next EPOLLOUT, so we rely on
+                // `handleWsTick` doing the bytes-flush on inbound
+                // activity. For pure server-push scenarios, we kick
+                // the write side here too — see `drainWsOutbound`.
+                drainWsOutbound(&loop);
+            }
+        }
     }
 
     g_stalled_head = null;
@@ -3787,6 +3860,12 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_pos = 0;
     conn.state = .writing;
     conn.protocol = .websocket;
+    // v1.7.1: count this live WS conn so the main loop knows to keep
+    // pumping the asyncio loop for `channel_layer.group_send` etc.
+    _ = g_ws_conns.fetchAdd(1, .seq_cst);
+    // Link into `g_ws_head` so `drainWsOutbound` can flush this conn.
+    conn.ws_list_next = g_ws_head;
+    g_ws_head = conn;
     conn.ws_handle = opened.handle;
     // If the app already finished (called close right after accept), close
     // after we drain the frames; otherwise stay alive.
@@ -4090,6 +4169,34 @@ fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, paylo
         },
         .pong => {}, // Unsolicited pongs are ignored.
         else => wsTeardown(loop, conn),
+    }
+}
+
+/// v1.7.1 — walk the live-WS list and flush any bytes the consumer
+/// produced via `channel_layer.group_send` / direct `self.send(...)`
+/// since the last tick. The pump above (`httpGlobalPump`) advanced
+/// the asyncio loop; this step turns the resulting Python-side
+/// outgoing buffers into wire bytes. Without this, group_send
+/// messages sat in `_WsState.outgoing` forever (the existing
+/// drain path only fired on inbound traffic).
+fn drainWsOutbound(loop: *eventloop.Loop) void {
+    var node = g_ws_head;
+    while (node) |conn| {
+        // Snapshot `next` BEFORE wsTeardown so we can keep walking
+        // even if this conn dies as part of the flush (close frame
+        // → connection close on next write).
+        const next = conn.ws_list_next;
+        const tick = bridge.wsDrain(conn.ws_handle, conn.allocator) orelse {
+            node = next;
+            continue;
+        };
+        if (tick.frames.len > 0) {
+            queueFrames(conn, tick.frames);
+            flushOutbound(loop, conn);
+        } else if (tick.done) {
+            conn.keep_alive = false;
+        }
+        node = next;
     }
 }
 
