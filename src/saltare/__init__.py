@@ -81,6 +81,7 @@ def run(
     hsts_include_subdomains: bool = False,
     hsts_preload: bool = False,
     drain_path: str | None = None,
+    access_log_exclude: list[str] | tuple[str, ...] | None = None,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -333,4 +334,9 @@ def run(
         dispatch_token,
         int(bool(ktls)),
         drain_path,
+        # CSV-encoded so the Zig side parses with a single `z` argument
+        # in PyArg_ParseTuple instead of iterating a Python tuple.
+        # Stripped + filtered empties so trailing commas / accidental
+        # blanks don't shadow real entries.
+        (",".join(p for p in access_log_exclude if p) if access_log_exclude else None),
     )

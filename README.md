@@ -2,7 +2,106 @@
 
 Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for FastAPI deployments where memory budget matters more than raw throughput.
 
-> **Status: 1.6.0 — full compression matrix + WebSocket extensions + operational hardening.** Carries v1.5 baseline (musllinux wheels, `/debug/dispatch` + token, SIGHUP hot reload, `process_*` metrics, kTLS, runbook) and adds: **streaming brotli** + **streaming zstd** (per-codec encoder state across `_send` via Zig lazy-dlopen handle API — closes the gap where v1.5 only streamed gzip), **WebSocket per-message-deflate** (RFC 7692; `permessage-deflate; client_no_context_takeover; server_no_context_takeover` negotiated; RSV1 + raw-deflate framing on outbound text/binary; zip-bomb-capped inflate on inbound), and the **v1.6 operational set**: `--hsts-max-age` / `--hsts-include-subdomains` / `--hsts-preload` (RFC 6797 `Strict-Transport-Security` line, opt-in, zero per-response cost when off), `--drain-path PATH` (Zig-side intercept that flips the worker into the same graceful-drain mode SIGTERM triggers — POST/PUT to begin, GET for an idempotent state probe; pair with `--health-path` for k8s rolling deploys), TLS observability counters on `/metrics` (`saltare_tls_handshakes_total`, `saltare_tls_session_reuse_total` via lazy `dlsym("SSL_session_reused")`), PROXY-protocol acceptance counters on `/metrics` (`saltare_proxy_protocol_accepted_total{version="v1|v2"}`), and the OpenMetrics 1.0 `# EOF` marker at the end of every `/metrics` body. 108 tests pass. Streaming br/zstd + WS p-m-d are zero-RAM-cost when off — `if not self.pmd_active` / `if not self._brotli_handle` early-outs keep v1.5 hot path byte-identical; HSTS is a cold module-level bytes object until set, drain endpoint is one optional `[]const u8` field.
+## Install
+
+```bash
+pip install saltare
+```
+
+Linux x86_64 / aarch64, manylinux + musllinux wheels, CPython 3.10–3.14. Zero runtime deps for plain HTTP; TLS / compression libraries (`libssl`, `libz`, `libbrotlienc`, `libzstd`) are `dlopen`'d on first use, so they only need to be present on the host when the matching feature is enabled.
+
+## Quickstart
+
+### 1. Write an ASGI app
+
+```python
+# main.py
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@app.get("/")
+def root():
+    return {"hello": "world"}
+```
+
+### 2a. Run from the command line
+
+```bash
+saltare main:app --host 0.0.0.0 --port 8000
+```
+
+A handful of frequently-used flags:
+
+```bash
+saltare main:app \
+    --host 0.0.0.0 --port 8000 \
+    --workers 0 \                    # 0 = min(cpu_count(), 4)
+    --access-log \                   # one line per request
+    --access-log-exclude /healthz \  # silence noisy probes
+    --access-log-exclude /metrics \
+    --health-path /healthz \         # 200 from Zig, no Python dispatch
+    --metrics-path /metrics \        # Prometheus text on this path
+    --response-gzip                  # negotiated content-encoding
+```
+
+`saltare --help` prints every flag (there are many — most are opt-in and cost zero RAM when off).
+
+### 2b. Run programmatically from Python
+
+```python
+# server.py
+import saltare
+from main import app
+
+if __name__ == "__main__":
+    saltare.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        workers=0,                    # 0 = min(cpu_count(), 4)
+        access_log=True,
+        access_log_exclude=["/healthz", "/metrics"],
+        health_path="/healthz",
+        metrics_path="/metrics",
+        response_gzip=True,
+    )
+```
+
+```bash
+python server.py
+```
+
+### 3. HTTPS
+
+Pass a certificate and private key (PEM, both required together):
+
+```bash
+saltare main:app --port 8443 \
+    --ssl-certfile /etc/ssl/saltare/cert.pem \
+    --ssl-keyfile  /etc/ssl/saltare/key.pem
+```
+
+(or `ssl_certfile=` / `ssl_keyfile=` kwargs on `saltare.run`). Combine with `--ktls` for kernel TLS + `sendfile(2)` over HTTPS.
+
+### 4. Access-log line format (v1.6.1+)
+
+```
+08/05/2026:14:32:11 [GET] [/api/users] [200] [347]
+                                              ^^^
+                                              bytes sent
+```
+
+Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is parseable with one regex; latency distributions live on `/metrics` (`--latency-histogram`).
+
+---
+
+## Status
+
+> **Status: 1.6.1 — access-log polish + ops affordances.** Carries v1.6.0 baseline and adds: `--access-log-exclude PATH` (repeatable; exact-match request-target filter), new plain-text access-log line format `DD/MM/YYYY:HH:MM:SS [METHOD] [URL] [STATUS] [BYTES]` (replaces the v0.15 JSON shape — easier to grep / awk), test-isolation fix (`_core.request_shutdown()` + autouse pytest fixture) closing the cp313-musllinux cibuildwheel segfault race, `server.run()` resets `g_draining=false` on entry so stale drain flags don't sink the next worker. 108 tests pass.
+>
+> **Status: 1.6.0 (historical entry) — full compression matrix + WebSocket extensions + operational hardening.** Carries v1.5 baseline (musllinux wheels, `/debug/dispatch` + token, SIGHUP hot reload, `process_*` metrics, kTLS, runbook) and adds: **streaming brotli** + **streaming zstd** (per-codec encoder state across `_send` via Zig lazy-dlopen handle API — closes the gap where v1.5 only streamed gzip), **WebSocket per-message-deflate** (RFC 7692; `permessage-deflate; client_no_context_takeover; server_no_context_takeover` negotiated; RSV1 + raw-deflate framing on outbound text/binary; zip-bomb-capped inflate on inbound), and the **v1.6 operational set**: `--hsts-max-age` / `--hsts-include-subdomains` / `--hsts-preload` (RFC 6797 `Strict-Transport-Security` line, opt-in, zero per-response cost when off), `--drain-path PATH` (Zig-side intercept that flips the worker into the same graceful-drain mode SIGTERM triggers — POST/PUT to begin, GET for an idempotent state probe; pair with `--health-path` for k8s rolling deploys), TLS observability counters on `/metrics` (`saltare_tls_handshakes_total`, `saltare_tls_session_reuse_total` via lazy `dlsym("SSL_session_reused")`), PROXY-protocol acceptance counters on `/metrics` (`saltare_proxy_protocol_accepted_total{version="v1|v2"}`), and the OpenMetrics 1.0 `# EOF` marker at the end of every `/metrics` body. 108 tests pass. Streaming br/zstd + WS p-m-d are zero-RAM-cost when off — `if not self.pmd_active` / `if not self._brotli_handle` early-outs keep v1.5 hot path byte-identical; HSTS is a cold module-level bytes object until set, drain endpoint is one optional `[]const u8` field.
 
 > **Status: 1.5.0 (historical entry) — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL) with **Bearer-token gate** (`--dispatch-token`), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **`process_*` Prometheus metrics** (`process_open_fds`, `process_cpu_seconds_total`, `process_start_time_seconds` — Grafana / Prom-client conventions), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip), **production runbook + day-2 ops table** in README, **`make smoke-alpine`** (real Alpine container smoke test against the freshly-built musllinux wheel), **`make soak`** (sustained-load RSS-drift gate, defaults 1800 s @ 200 rps), **`--ktls`** (kernel TLS offload via OpenSSL ≥ 3.0 — closes the v1.4 sendfile-over-HTTPS gap; off by default). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
 
@@ -192,11 +291,7 @@ These exercise the v1.2.2 streaming backpressure (large-response) and the per-co
 - **Free-threaded Python (`cp314t`)** — measure RSS + rps with GIL gone. Could let dispatch run concurrently; could also inflate the floor. Decision after benchmarking.
 - **Static-link OpenSSL** build experiment — alternative wheel (`saltare-with-tls`) that links libssl/libcrypto statically for environments without manylinux's runtime libs. Plain wheel keeps the lazy `dlopen` path.
 
-## Install (once published)
-
-```bash
-pip install saltare
-```
+## Examples
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the per-version highlights and the [`examples/`](examples/) directory for runnable end-to-end snippets:
 
@@ -204,35 +299,6 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the per-version highlights and the [`exam
 - [`examples/sendfile.py`](examples/sendfile.py) — `saltare.sendfile` ASGI extension for zero-copy static-asset responses.
 - [`examples/observability.py`](examples/observability.py) — W3C `traceparent` propagation + Prometheus latency histogram on `/metrics`.
 - [`examples/django.md`](examples/django.md) — `pip install saltare[django]` integration: `manage.py runserver` boots Django under saltare instead of wsgiref.
-
-## Usage
-
-```python
-# main.py
-from fastapi import FastAPI
-
-app = FastAPI()
-
-
-@app.get("/")
-def root():
-    return {"hello": "world"}
-```
-
-```bash
-saltare main:app --host 0.0.0.0 --port 8000
-```
-
-For HTTPS, pass a certificate and private key (PEM, both required together):
-
-```python
-import saltare
-from main import app
-
-saltare.run(app, host="0.0.0.0", port=443,
-            ssl_certfile="/etc/letsencrypt/live/example.com/fullchain.pem",
-            ssl_keyfile="/etc/letsencrypt/live/example.com/privkey.pem")
-```
 
 Both per-request HTTP dispatch and ASGI lifespan startup/shutdown are wired up: `FastAPI(lifespan=...)` and the older `@app.on_event("startup")` work as expected.
 

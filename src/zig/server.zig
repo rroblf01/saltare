@@ -132,6 +132,16 @@ pub const Observability = struct {
     /// run. Best-effort: any open() failure logs once to stderr and
     /// falls back to stderr writes.
     access_log_path: ?[]const u8 = null,
+    /// v1.6 access-log path-filter list. Each entry is matched exactly
+    /// against `req.target` (request-line target, including query string
+    /// if present); a hit skips the log line for that request. Useful
+    /// for muting noisy probes (`/metrics`, `/healthz`, `/favicon.ico`,
+    /// `/admin/drain`, `/debug/dispatch`) without losing app-traffic
+    /// visibility. Empty slice = no filtering (every request logged).
+    /// The CSV is split at run() time and stored as a slice of slices;
+    /// per-request cost is one linear scan, bounded by the entry count
+    /// (typically <10).
+    access_log_exclude: []const []const u8 = &.{},
     /// If true, the dispatcher honours `X-Forwarded-For` /
     /// `X-Forwarded-Proto` from the request to populate `scope["client"]`
     /// and `scope["scheme"]`. Only enable behind a trusted reverse proxy
@@ -822,28 +832,59 @@ const LogBuf = struct {
     }
 };
 
+// Local time helpers. `localtime_r` is POSIX, available on glibc + musl.
+// We use it to render the access-log timestamp in the operator's local
+// timezone — matches what they see on the host machine without forcing
+// a UTC mental translation. `struct tm` layout is x86_64 / aarch64
+// stable across both libcs; we only read the date/time fields.
+const Tm = extern struct {
+    tm_sec: c_int,
+    tm_min: c_int,
+    tm_hour: c_int,
+    tm_mday: c_int,
+    tm_mon: c_int,
+    tm_year: c_int,
+    tm_wday: c_int,
+    tm_yday: c_int,
+    tm_isdst: c_int,
+    tm_gmtoff: c_long,
+    tm_zone: ?[*:0]const u8,
+};
+extern fn localtime_r(t: *const c_long, result: *Tm) ?*Tm;
+
 fn emitAccessLog(conn: *Connection) void {
     const req = conn.parsed orelse return;
 
+    // v1.6 path filter — skip the log line when the request-target matches
+    // an operator-supplied exclude entry exactly. Linear scan; the list is
+    // typically <10 entries (the Zig-intercepted endpoints).
+    for (g_obs.access_log_exclude) |skip_path| {
+        if (std.mem.eql(u8, req.target, skip_path)) return;
+    }
+
     var log: LogBuf = .{};
 
-    log.appendSlice("{\"method\":");
-    log.appendJsonString(req.method);
-    log.appendSlice(",\"path\":");
-    log.appendJsonString(req.target);
-    log.printFmt(",\"status\":{d},\"bytes\":{d}", .{ conn.response_status, conn.bytes_sent });
-
-    const latency_us: i64 = if (conn.request_start_ns != 0)
-        @divTrunc(monoNs() - conn.request_start_ns, 1000)
-    else
-        0;
-    log.printFmt(",\"latency_us\":{d}", .{latency_us});
-
-    const ua_raw = req.header("user-agent") orelse "";
-    const trimmed_ua = std.mem.trim(u8, ua_raw, " \t");
-    log.appendSlice(",\"user_agent\":");
-    log.appendJsonString(trimmed_ua);
-    log.appendSlice("}\n");
+    // v1.6.1: human-readable line format —
+    //     DD/MM/YYYY:HH:MM:SS [METHOD] [URL] [STATUS] [BYTES]
+    // Replaces the v0.15 JSON shape. Easier to grep / awk / paste into
+    // an issue; status / bytes are still parseable with `sed`.
+    var unix_now: c_long = @intCast(c.time(null));
+    var tm: Tm = undefined;
+    if (localtime_r(&unix_now, &tm) != null) {
+        log.printFmt("{d:0>2}/{d:0>2}/{d}:{d:0>2}:{d:0>2}:{d:0>2} ", .{
+            @as(u32, @intCast(tm.tm_mday)),
+            @as(u32, @intCast(tm.tm_mon + 1)),
+            @as(u32, @intCast(tm.tm_year + 1900)),
+            @as(u32, @intCast(tm.tm_hour)),
+            @as(u32, @intCast(tm.tm_min)),
+            @as(u32, @intCast(tm.tm_sec)),
+        });
+    }
+    log.appendByte('[');
+    log.appendSlice(req.method);
+    log.appendSlice("] [");
+    log.appendSlice(req.target);
+    log.printFmt("] [{d}] [{d}]\n", .{ conn.response_status, conn.bytes_sent });
 
     if (!log.overflow) {
         // Single write(2) keeps the line atomic from the kernel's view —

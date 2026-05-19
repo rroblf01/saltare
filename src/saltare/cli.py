@@ -516,6 +516,10 @@ def main(argv: list[str] | None = None) -> None:
         help="POST/PUT to PATH (e.g. '/admin/drain') flips the worker into graceful drain — Zig-side intercept (no Python dispatch). Pair with --health-path for k8s rolling deploys.",
     )
     parser.add_argument(
+        "--access-log-exclude", action="append", default=None, metavar="PATH",
+        help="path (request-target, exact match) to skip from --access-log output (repeatable). Typical use: silence noisy probes like /metrics, /healthz, /favicon.ico without losing app-traffic visibility.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"saltare {__version__}",
@@ -614,4 +618,5 @@ def main(argv: list[str] | None = None) -> None:
         hsts_include_subdomains=args.hsts_include_subdomains,
         hsts_preload=args.hsts_preload,
         drain_path=args.drain_path,
+        access_log_exclude=args.access_log_exclude,
     )

@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.6.1
+
+**Theme**: access-log polish + small ops affordances.
+
+### Default-on
+
+- **Access-log line format changed from JSON to plain text.** The new
+  shape is `DD/MM/YYYY:HH:MM:SS [METHOD] [URL] [STATUS] [BYTES]`
+  (timestamp in local time). Easier to grep / awk / paste into an
+  issue. Fields dropped from the line: `user_agent` and `latency_us`
+  (use `--latency-histogram` on `/metrics` for distributions; UA was
+  rarely actionable post-mortem).
+- **Test isolation fix**: `_core.request_shutdown()` + pytest
+  `conftest.py` autouse fixture clean up daemon-thread servers
+  between tests. Closes a long-latent race that segfaulted cibuildwheel
+  on cp313-musllinux after ~70 accumulated test daemons. `server.run()`
+  also resets `g_draining=false` on entry so a fixture call without an
+  active worker doesn't stick the next worker in immediate drain.
+- **`test_caps::test_max_concurrent_connections_drops_extras`**:
+  marked `flaky(reruns=3)` + scaled socket timeouts by `_TIMING_FACTOR`
+  (2× on x86_64, 4× on aarch64). Race-condition tolerance for
+  QEMU-emulated cibuildwheel runs.
+
+### Opt-in flags
+
+- **`--access-log-exclude PATH`** (repeatable) — exact-match request-
+  target filter applied before the log emission. Typical: silence
+  noisy probes (`/healthz`, `/metrics`, `/favicon.ico`,
+  `/admin/drain`, `/debug/dispatch`) without losing visibility into
+  app traffic. Linear scan per request; list size typically <10.
+
+### Tests
+
+108 total — 1 new at [tests/test_observability.py](tests/test_observability.py):
+`access_log_exclude` silences listed paths without affecting the
+status / body of the response itself.
+
 ## 1.6.0
 
 **Theme**: complete the compression matrix + WebSocket extensions +

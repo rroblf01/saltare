@@ -316,21 +316,103 @@ saltare.run(app, host="127.0.0.1", port={port}, access_log=True)
             stderr_data = b""
         proc.wait(timeout=5.0)
 
-        # At least one line in stderr must be a parseable JSON record for
-        # the request we made.
-        log_lines = [
-            line for line in stderr_data.decode(errors="replace").splitlines()
-            if line.startswith("{") and "saltare-test/1.0" in line
+        # v1.6.1 line format: `DD/MM/YYYY:HH:MM:SS [METHOD] [URL] [STATUS] [BYTES]`.
+        # Match by the recognisable tokens. Body / user-agent are no longer
+        # part of the line (drop noise; structured logs go elsewhere).
+        import re as _re
+        text = stderr_data.decode(errors="replace")
+        candidates = [
+            line for line in text.splitlines()
+            if "[GET]" in line and "[/probe?x=1]" in line
         ]
-        assert log_lines, f"no access-log line found in stderr: {stderr_data[-500:]!r}"
+        assert candidates, f"no access-log line found in stderr: {text[-500:]!r}"
+        line = candidates[0]
+        m = _re.match(
+            r"(\d{2})/(\d{2})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) "
+            r"\[GET\] \[/probe\?x=1\] \[(\d{3})\] \[(\d+)\]",
+            line,
+        )
+        assert m, f"line did not match expected format: {line!r}"
+        status_str, bytes_str = m.group(7), m.group(8)
+        assert status_str == "200"
+        assert int(bytes_str) > 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
-        record = json.loads(log_lines[0])
-        assert record["method"] == "GET"
-        assert record["path"] == "/probe?x=1"
-        assert record["status"] == 200
-        assert record["bytes"] > 0
-        assert record["latency_us"] >= 0
-        assert record["user_agent"] == "saltare-test/1.0"
+
+def test_access_log_exclude_silences_listed_paths() -> None:
+    """`access_log_exclude=[...]` skips listed paths from the log without
+    affecting the request itself (status / body unchanged)."""
+    port = _free_port()
+    src = f"""
+import saltare
+
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        while True:
+            msg = await receive()
+            if msg["type"] == "lifespan.startup":
+                await send({{"type": "lifespan.startup.complete"}})
+            elif msg["type"] == "lifespan.shutdown":
+                await send({{"type": "lifespan.shutdown.complete"}})
+                return
+        return
+    await receive()
+    await send({{"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"text/plain")]}})
+    await send({{"type": "http.response.body", "body": b"hi", "more_body": False}})
+
+saltare.run(
+    app, host="127.0.0.1", port={port},
+    access_log=True,
+    access_log_exclude=["/skip-me", "/healthz"],
+)
+"""
+    proc = subprocess.Popen(
+        [sys.executable, "-c", src],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                pytest.fail("subprocess exited prematurely")
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    break
+            except (ConnectionRefusedError, socket.timeout):
+                time.sleep(0.05)
+        else:
+            pytest.fail("subprocess never became ready")
+
+        # Excluded path: served fine, no log line.
+        r_skip = httpx.get(f"http://127.0.0.1:{port}/skip-me",
+                           headers={"User-Agent": "skip-ua/1.0"}, timeout=2.0)
+        assert r_skip.status_code == 200
+        # Non-excluded path: logged.
+        r_keep = httpx.get(f"http://127.0.0.1:{port}/keep-me",
+                           headers={"User-Agent": "keep-ua/1.0"}, timeout=2.0)
+        assert r_keep.status_code == 200
+
+        time.sleep(0.2)
+        proc.terminate()
+        try:
+            stderr_data = proc.stderr.read() if proc.stderr else b""
+        except Exception:
+            stderr_data = b""
+        proc.wait(timeout=5.0)
+
+        text = stderr_data.decode(errors="replace")
+        # v1.6.1 line format: `[METHOD] [URL] [STATUS] [BYTES]`.
+        # Excluded → no record carrying its target.
+        assert "[/skip-me]" not in text, \
+            f"expected /skip-me to be filtered, but log shows it: {text[-500:]!r}"
+        # Non-excluded → recorded.
+        assert "[/keep-me]" in text, \
+            f"expected /keep-me to be logged, got: {text[-500:]!r}"
     finally:
         if proc.poll() is None:
             proc.kill()

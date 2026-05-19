@@ -141,7 +141,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("1.6.0");
+    return py.PyUnicode_FromString("1.6.1");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -200,10 +200,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var dispatch_token_z: [*c]const u8 = null;
     var ktls_flag: c_int = 0;
     var drain_path_z: [*c]const u8 = null;
+    var access_log_exclude_z: [*c]const u8 = null;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzziz",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzzizz",
         &app,
         &host_z,
         &port,
@@ -254,6 +255,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &dispatch_token_z,
         &ktls_flag,
         &drain_path_z,
+        &access_log_exclude_z,
     ) == 0) {
         return null;
     }
@@ -294,6 +296,38 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .max_request_uri = @intCast(max_request_uri),
         .max_request_head_bytes = @intCast(max_request_head_bytes),
     };
+    // v1.6 access-log path filter: split the comma-separated CSV the
+    // Python wrapper passes us into a heap-allocated slice-of-slices.
+    // Pointers into the original Python string are safe because the
+    // PyArg_ParseTuple `args` tuple stays alive for the entire saltareServe
+    // call (which is the only caller of run). Defer freeing the outer slice
+    // until the call returns. Empty / null = no filter.
+    var access_log_exclude_buf: ?[][]const u8 = null;
+    defer if (access_log_exclude_buf) |buf| std.heap.c_allocator.free(buf);
+    if (access_log_exclude_z != null) {
+        const csv = std.mem.span(access_log_exclude_z);
+        // First pass: count entries (segments separated by ',').
+        var count: usize = 0;
+        if (csv.len > 0) {
+            count = 1;
+            for (csv) |b| if (b == ',') {
+                count += 1;
+            };
+        }
+        if (count > 0) {
+            const slice = std.heap.c_allocator.alloc([]const u8, count) catch {
+                py.PyErr_SetString(py.PyExc_MemoryError, "saltare: out of memory parsing --access-log-exclude");
+                return null;
+            };
+            var i: usize = 0;
+            var it = std.mem.splitScalar(u8, csv, ',');
+            while (it.next()) |part| : (i += 1) {
+                slice[i] = std.mem.trim(u8, part, " \t");
+            }
+            access_log_exclude_buf = slice;
+        }
+    }
+
     const obs = server.Observability{
         .metrics_path = if (metrics_path_z != null) std.mem.span(metrics_path_z) else null,
         .health_path = if (health_path_z != null) std.mem.span(health_path_z) else null,
@@ -315,6 +349,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         .runtime_config_path = if (runtime_config_path_z != null) std.mem.span(runtime_config_path_z) else null,
         .dispatch_token = if (dispatch_token_z != null) std.mem.span(dispatch_token_z) else null,
         .drain_path = if (drain_path_z != null) std.mem.span(drain_path_z) else null,
+        .access_log_exclude = if (access_log_exclude_buf) |buf| buf else &.{},
     };
     const uds_path = if (uds_path_z != null) std.mem.span(uds_path_z) else null;
 
