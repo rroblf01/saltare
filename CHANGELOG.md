@@ -1,5 +1,62 @@
 # Changelog
 
+## 1.8.0
+
+**Theme**: header memory compression + edge-case test coverage.
+
+### Default-on
+
+- **Header offset compression.** `http.Header` was two `[]const u8`
+  slices = 32 B per header; each pool buffer holds `[max_headers]Header`
+  = 32 × 32 B = **1 KiB per Buffer**. Replaced with four `u16` offsets
+  into the buffer's data slice — 8 B per header, 256 B per Buffer.
+  Saves **768 B per active in-flight request**; at the default
+  `max_concurrent_connections=1024` that's **~770 KiB reclaimed at
+  the peak of in-flight occupancy**. `Request` gains a
+  `data: []const u8` reference and accessor methods (`method()`,
+  `target()`, `header.nameSlice(data)`, `header.valueSlice(data)`)
+  so callsites stay readable.
+- u16 imposes a 64 KiB ceiling on the head section, well above
+  saltare's existing pool-buffer cap (4 KiB small / 16 KiB overflow)
+  — no real-world request loses fidelity.
+- **Bench impact**: the existing 100-concurrent benchmark workload
+  only fills ~100 of the 1024 connection slots, so the visible
+  delta sits inside the run-to-run noise floor (~ ±0.5 MiB). The
+  win is **proportional to active in-flight count** and shows up
+  on deployments with 1k+ simultaneous in-flight requests; benchmark
+  rerun with `--high-conc-idle 1000` makes it visible.
+
+### Tests
+
+139 total (+17 from v1.7.2's 122). New file
+[tests/test_v18_edge.py](tests/test_v18_edge.py) covers gaps that
+header compression makes most worth verifying:
+
+- **Header compression edges**: long header value (~3 KiB),
+  near-`max_headers=32` count, empty value preserved.
+- **Pipelined HTTP requests** on one TCP socket — parser must
+  compact past each consumed head and re-parse cleanly.
+- **WebSocket binary echo** at varying sizes (small / >126 7-bit /
+  16-bit extended) — exercises the two length-prefix variants
+  that fit the pool buffer.
+- **HSTS** rendering combinations: `max-age` only, `max-age=0`
+  suppresses entirely (RFC 6797 §6.1.1).
+- **Drain endpoint verb matrix** (GET / HEAD / PUT / DELETE / PATCH /
+  OPTIONS) — POST/PUT 200, GET/HEAD 200, everything else 405.
+- **Method case-sensitivity** (RFC 7230 §3.1.1): `get /favicon.ico`
+  must NOT match saltare's `GET`-gated favicon intercept.
+- **Header injection guard**: NUL byte in a header name produces 400
+  (RFC 7230 §3.2.6 tchar validation), defending downstream proxies
+  against `Header\0Smuggled: x` smuggling.
+
+### Deferred to v1.9+ / v2.0
+
+- **`Connection` struct HTTP/WS union** — would save ~50 KiB at
+  1024 conns. 116 call sites to rewrite for marginal RAM. Trade-off
+  failed the cost/benefit cut for 1.8.0.
+- **Sub-interpreters (PEP 684)** for ~10 MiB Pss-multi-worker — 4-6
+  weeks of dedicated work, drops cp310/cp311. v2.0 milestone.
+
 ## 1.7.2
 
 **Theme**: WebSocket lifecycle correctness + test coverage.

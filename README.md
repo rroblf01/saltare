@@ -99,7 +99,9 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 ## Status
 
-> **Status: 1.7.2 — WebSocket lifecycle correctness + test suite.** v1.7.1 wired the multi-tick + periodic-pump runtime that made Channels apps work end-to-end; v1.7.2 centralises WS teardown into `Connection.destroy()` so the leak window on socket-level errors (peer RST mid-write, abrupt TCP FIN) closes — every destroy callsite now emits `WS-CLOSE`, cancels the Python consumer task via `bridge.wsDisconnect`, decrements `g_ws_conns`, and unlinks from `g_ws_head`. Caches `Connection.ws_log_path` so the post-upgrade `WS-CLOSE` line still knows the path after `wsAfterWrite` cleared `conn.parsed`. Adds 13 lifecycle tests (`tests/test_ws_lifecycle.py`) covering close-code → HTTP status mapping, post-accept initial-state push, handshake-timeout cancellation, abrupt-disconnect resilience, access-log symmetry, `--ws-reject-log` content, and N sequential connect/close cycles. **122 tests pass.**
+> **Status: 1.8.0 — header memory compression + edge-case coverage.** Replaces `http.Header`'s two `[]const u8` slices (32 B per header) with four `u16` offsets into the request buffer (8 B per header). Pool buffer's `[max_headers=32]Header` array drops from 1 KiB → 256 B; at default `max_concurrent_connections=1024` that's **~770 KiB peak RAM reclaimed**. `Request` gains accessor methods (`method()`, `target()`, `header.nameSlice(data)`) so the API stays readable. Test suite grows by 17 → 139 total (`tests/test_v18_edge.py`): header compression edges (long values, near-max count, empty values), pipelined HTTP, WebSocket binary echo at varied sizes, HSTS combinations, drain endpoint verb matrix, method case-sensitivity, header injection guard.
+>
+> **Status: 1.7.2 (historical entry) — WebSocket lifecycle correctness + test suite.** v1.7.1 wired the multi-tick + periodic-pump runtime that made Channels apps work end-to-end; v1.7.2 centralises WS teardown into `Connection.destroy()` so the leak window on socket-level errors (peer RST mid-write, abrupt TCP FIN) closes — every destroy callsite now emits `WS-CLOSE`, cancels the Python consumer task via `bridge.wsDisconnect`, decrements `g_ws_conns`, and unlinks from `g_ws_head`. Caches `Connection.ws_log_path` so the post-upgrade `WS-CLOSE` line still knows the path after `wsAfterWrite` cleared `conn.parsed`. Adds 13 lifecycle tests (`tests/test_ws_lifecycle.py`) covering close-code → HTTP status mapping, post-accept initial-state push, handshake-timeout cancellation, abrupt-disconnect resilience, access-log symmetry, `--ws-reject-log` content, and N sequential connect/close cycles. **122 tests pass.**
 >
 > **Status: 1.7.1 (historical entry) — Django Channels WebSocket runtime.** v1.7.0 fixed the WS scope shape (state, extensions, drop method, proxy_headers for WS); v1.7.1 fixes the WS runtime so Channels apps that work under daphne also work under saltare. Multi-tick pump during the upgrade (Phase 1 lets `AuthMiddlewareStack` async session lookup settle; Phase 2 lets `connect()` finish its `group_add` + initial state push before returning), periodic 50 ms asyncio pump for live WS conns + `bridge.wsDrain` so `channel_layer.group_send` actually reaches the wire (was: queued forever because saltare was idle between socket events), WS-task exception traceback surfaced to stderr + injected into `--ws-reject-log` reason, close-code → HTTP status forwarding (`4001 → 401`, `4003 → 403`, `4004 → 404`, `4008 → 408`, `4029 → 429`). Bench-stage Dockerfile now preloads mimalloc so the comparison vs uvicorn / granian runs under the same allocator. Release CI: 2-job → 4-job matrix (libc × arch) + tests split out → ~7 min wall (was 11–20 min).
 >
@@ -179,36 +181,45 @@ docker run --rm -e BENCH_LARGE_BYTES=1048576 saltare-bench \
 
 Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 0.136, pydantic 2.13, uvicorn 0.x plain — no `[standard]` extras, granian 2.x ASGI), v1.4.0 with default settings (single worker except where noted). Same host, same image. Each server's launcher imports the FastAPI app at module level so RSS readings reflect the same import footprint — without that normalisation, granian's master appears artificially small (~37 MiB) because it spawns a worker subprocess that holds the actual app, and the bench harness reads the master's `/proc/<pid>/status`.
 
-### Sequential — 1 client, 1000 requests (v1.7.0, mimalloc preload)
+### Sequential — 1 client, 1000 requests (v1.8.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.37 MiB |      45.50 MiB | **45.50 MiB** |    1000 | 1086 |
-| uvicorn | 48.04 MiB |      48.07 MiB | 48.07 MiB |    1000 | 1254 |
-| granian | 54.85 MiB |      54.85 MiB | 54.85 MiB |    1000 | 1123 |
+| saltare | 45.59 MiB |      45.66 MiB | **45.66 MiB** |    1000 | 1048 |
+| uvicorn | 48.11 MiB |      48.15 MiB | 48.15 MiB |    1000 | 1146 |
+| granian | 56.38 MiB |      56.38 MiB | 56.38 MiB |    1000 | 1024 |
 
-### Concurrent — 100 clients × 20 requests (2000 total) (v1.7.0, mimalloc preload)
+### Concurrent — 100 clients × 20 requests (2000 total) (v1.8.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 43.97 MiB |      44.34 MiB | **44.36 MiB** |    2000 | 1915 |
-| uvicorn | 47.98 MiB |      49.16 MiB | 49.16 MiB |    2000 | 1893 |
-| granian | 55.37 MiB |      55.37 MiB | 55.37 MiB |    2000 | 1702 |
+| saltare | 44.00 MiB |      44.33 MiB | **44.36 MiB** |    2000 | 1780 |
+| uvicorn | 48.06 MiB |      49.02 MiB | 49.02 MiB |    2000 | 1946 |
+| granian | 55.37 MiB |      55.37 MiB | 55.37 MiB |    2000 | 1857 |
 
-### Idle keep-alive — 500 connections held open (v1.7.0, mimalloc preload)
+### Idle keep-alive — 500 connections held open (v1.8.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 44.01 MiB |      44.28 MiB | **44.28 MiB** |     500 | 1266      |
-| uvicorn | 48.04 MiB |      53.41 MiB | 53.41 MiB |     500 | 1489      |
-| granian | 53.84 MiB |      53.84 MiB | 53.84 MiB |     500 | 1360      |
+| saltare | 43.93 MiB |      44.27 MiB | **44.27 MiB** |     500 | 1286      |
+| uvicorn | 47.96 MiB |      53.32 MiB | 53.32 MiB |     500 | 1529      |
+| granian | 56.16 MiB |      56.16 MiB | 56.16 MiB |     500 | 1252      |
 
-### Multi-worker idle — Pss across the whole cluster (saltare only) (v1.7.0)
+### Multi-worker idle — Pss across the whole cluster (saltare only) (v1.8.0)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  39.18 MiB |      0.00 MiB | 39.18 MiB |                 —  |
-|       4 |        4 |  14.38 MiB |     39.28 MiB | 53.65 MiB |  156.72 MiB (−66%) |
+|       1 |        — |  39.12 MiB |      0.00 MiB | 39.12 MiB |                 —  |
+|       4 |        4 |  14.21 MiB |     39.09 MiB | 53.30 MiB |  156.46 MiB (−66%) |
+
+> **v1.8 note**: header offset compression saves 768 B per active
+> in-flight request (Header struct dropped 32 B → 8 B). The bench
+> workload above tops out at ~100 concurrent in-flight, so the
+> visible delta vs v1.7.x sits inside the run-to-run noise floor.
+> The win is proportional to active in-flight count and matters on
+> deployments with 1k+ simultaneous requests, where the default
+> `max_concurrent_connections=1024` × 768 B = ~770 KiB reclaimed at
+> peak.
 
 > **mimalloc note (v1.7)**: The bench image now preloads
 > `libmimalloc.so.2` (matches the production Dockerfile) so all three
