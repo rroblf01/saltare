@@ -25,19 +25,44 @@ pub const ParseError = error{
     InvalidContentLength,
 };
 
+/// v1.8: compressed Header. Was: two `[]const u8` slices = 32 B per
+/// Header (16 B per fat pointer). Each pool Buffer holds
+/// `[max_headers]Header` = 32 × 32 B = 1 KiB. New: four `u16`s into
+/// `Buffer.data` = 8 B per Header, 256 B per Buffer. Saves 768 B per
+/// active in-flight request — at 1024 max concurrent ~770 KiB peak.
+/// u16 caps each header at 64 KiB which exceeds the read-buffer
+/// ceiling anyway, so no real-world request loses fidelity.
 pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
+    name_off: u16,
+    name_len: u16,
+    value_off: u16,
+    value_len: u16,
+
+    pub inline fn nameSlice(self: Header, data: []const u8) []const u8 {
+        return data[self.name_off..][0..self.name_len];
+    }
+    pub inline fn valueSlice(self: Header, data: []const u8) []const u8 {
+        return data[self.value_off..][0..self.value_len];
+    }
 };
 
 pub const Request = struct {
-    method: []const u8,
+    /// v1.8: backing buffer. All `*_off` fields below — `method`,
+    /// `target`, plus every `Header.name_off` / `value_off` in
+    /// `headers` — index into this slice. Stored once on the
+    /// Request rather than threaded through every accessor call.
+    data: []const u8,
+    /// Request method (`GET`, `POST`, …). Compressed to offset+len
+    /// into `data` for parity with the Header layout.
+    method_off: u16,
+    method_len: u16,
     /// Request-target (path + optional query). Untouched: no decoding.
-    target: []const u8,
+    target_off: u16,
+    target_len: u16,
     /// HTTP/1.x minor version (0 or 1).
     version_minor: u8,
-    /// Slice of the caller-provided headers array. Names and values point
-    /// into the read buffer; do not mutate it while reading these.
+    /// Slice of the caller-provided headers array. Each Header carries
+    /// `(name_off, name_len, value_off, value_len)` into `data`.
     headers: []const Header,
     /// Index in the read buffer where the body starts (just past \r\n\r\n).
     body_offset: usize,
@@ -48,12 +73,20 @@ pub const Request = struct {
     /// any token in a comma-separated list).
     is_chunked: bool,
 
+    pub inline fn method(self: Request) []const u8 {
+        return self.data[self.method_off..][0..self.method_len];
+    }
+    pub inline fn target(self: Request) []const u8 {
+        return self.data[self.target_off..][0..self.target_len];
+    }
+
     /// Returns the value of a header by name (case-insensitive), or null if
     /// not present. If the header appears more than once only the first
     /// occurrence is returned.
     pub fn header(self: Request, name: []const u8) ?[]const u8 {
         for (self.headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+            if (std.ascii.eqlIgnoreCase(h.nameSlice(self.data), name))
+                return h.valueSlice(self.data);
         }
         return null;
     }
@@ -64,7 +97,7 @@ pub const Request = struct {
     /// only speaks WS version 13.
     pub fn isWebSocketUpgrade(self: Request) bool {
         if (self.version_minor != 1) return false;
-        if (!std.ascii.eqlIgnoreCase(self.method, "GET")) return false;
+        if (!std.ascii.eqlIgnoreCase(self.method(), "GET")) return false;
 
         const upgrade = self.header("upgrade") orelse return false;
         if (!connectionTokenPresent(upgrade, "websocket")) return false;
@@ -86,14 +119,7 @@ pub const Request = struct {
     ///   - HTTP/1.1: persistent unless `Connection: close` is present.
     ///   - HTTP/1.0: close unless `Connection: keep-alive` is present.
     pub fn wantsKeepAlive(self: Request) bool {
-        var conn_value: ?[]const u8 = null;
-        for (self.headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "connection")) {
-                conn_value = h.value;
-                break;
-            }
-        }
-
+        const conn_value = self.header("connection");
         return switch (self.version_minor) {
             1 => if (conn_value) |v| !connectionTokenPresent(v, "close") else true,
             0 => if (conn_value) |v| connectionTokenPresent(v, "keep-alive") else false,
@@ -177,6 +203,13 @@ inline fn isTchar(b: u8) bool {
 }
 
 pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
+    // v1.8: u16 offsets impose a 64 KiB ceiling on the head section.
+    // The pool buffer's data slice (small 4 KiB / large 16 KiB) is
+    // already well under that — we'd hit the implicit pool ceiling
+    // long before u16 wraps. Guard anyway so a hypothetical large
+    // pool grow doesn't silently truncate offsets.
+    if (buf.len > std.math.maxInt(u16)) return error.HeadersTooLarge;
+
     // Locate the end of the head section. Without it the request is incomplete.
     const head_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.Incomplete;
     const head = buf[0..head_end];
@@ -186,12 +219,18 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
     const line_end = std.mem.indexOf(u8, head, "\r\n") orelse head.len;
     const request_line = head[0..line_end];
 
-    var parts = std.mem.splitScalar(u8, request_line, ' ');
-    const method = parts.next() orelse return error.BadRequestLine;
-    const target = parts.next() orelse return error.BadRequestLine;
-    const version = parts.next() orelse return error.BadRequestLine;
-    if (parts.next() != null) return error.BadRequestLine;
-    if (method.len == 0 or target.len == 0) return error.BadRequestLine;
+    // Manually walk the request line so we can capture offsets
+    // relative to `buf` (the parser's contract — header / target
+    // offsets must be resolvable from the same backing slice).
+    const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.BadRequestLine;
+    const sp2 = std.mem.indexOfScalarPos(u8, request_line, sp1 + 1, ' ') orelse return error.BadRequestLine;
+    if (std.mem.indexOfScalarPos(u8, request_line, sp2 + 1, ' ') != null) return error.BadRequestLine;
+    const method_off: u16 = 0;
+    const method_len: u16 = @intCast(sp1);
+    const target_off: u16 = @intCast(sp1 + 1);
+    const target_len: u16 = @intCast(sp2 - (sp1 + 1));
+    const version = request_line[sp2 + 1 ..];
+    if (method_len == 0 or target_len == 0) return error.BadRequestLine;
 
     if (version.len != 8 or !std.mem.startsWith(u8, version, "HTTP/1.")) {
         return error.UnsupportedVersion;
@@ -215,14 +254,13 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
 
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadHeader;
         if (colon == 0) return error.BadHeader;
-        const name = line[0..colon];
         // RFC 7230 §3.2.6 — header names are `tchar*`, i.e. ASCII
         // alphanumerics plus the punctuation set
         // `!#$%&'*+-.^_` `|~`. Reject any byte outside that set so a
         // malformed `Header\0Smuggled: x` can't slip through to the
         // user app and a downstream proxy reading it back as two
         // separate headers.
-        for (name) |b| {
+        for (line[0..colon]) |b| {
             if (!isTchar(b)) return error.BadHeader;
         }
 
@@ -235,12 +273,22 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
         while (v_end > v_start and (line[v_end - 1] == ' ' or line[v_end - 1] == '\t')) {
             v_end -= 1;
         }
-        const value = line[v_start..v_end];
+        const name_off: u16 = @intCast(pos);
+        const name_len: u16 = @intCast(colon);
+        const value_off: u16 = @intCast(pos + v_start);
+        const value_len: u16 = @intCast(v_end - v_start);
 
         if (header_count >= headers_out.len) return error.HeadersTooLarge;
-        headers_out[header_count] = .{ .name = name, .value = value };
+        headers_out[header_count] = .{
+            .name_off = name_off,
+            .name_len = name_len,
+            .value_off = value_off,
+            .value_len = value_len,
+        };
         header_count += 1;
 
+        const name = buf[name_off..][0..name_len];
+        const value = buf[value_off..][0..value_len];
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             content_length = std.fmt.parseInt(usize, value, 10) catch return error.InvalidContentLength;
         } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
@@ -251,8 +299,11 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
     }
 
     return Request{
-        .method = method,
-        .target = target,
+        .data = buf,
+        .method_off = method_off,
+        .method_len = method_len,
+        .target_off = target_off,
+        .target_len = target_len,
         .version_minor = version_minor,
         .headers = headers_out[0..header_count],
         .body_offset = body_offset,
@@ -383,12 +434,12 @@ test "parse minimal GET" {
     const buf = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
     var headers: [max_headers]Header = undefined;
     const req = try parse(buf, &headers);
-    try testing.expectEqualStrings("GET", req.method);
-    try testing.expectEqualStrings("/", req.target);
+    try testing.expectEqualStrings("GET", req.method());
+    try testing.expectEqualStrings("/", req.target());
     try testing.expectEqual(@as(u8, 1), req.version_minor);
     try testing.expectEqual(@as(usize, 1), req.headers.len);
-    try testing.expectEqualStrings("Host", req.headers[0].name);
-    try testing.expectEqualStrings("example.com", req.headers[0].value);
+    try testing.expectEqualStrings("Host", req.headers[0].nameSlice(req.data));
+    try testing.expectEqualStrings("example.com", req.headers[0].valueSlice(req.data));
     try testing.expectEqual(@as(?usize, null), req.content_length);
 }
 
@@ -400,8 +451,8 @@ test "parse POST with Content-Length and body" {
         "hello";
     var headers: [max_headers]Header = undefined;
     const req = try parse(buf, &headers);
-    try testing.expectEqualStrings("POST", req.method);
-    try testing.expectEqualStrings("/submit?id=7", req.target);
+    try testing.expectEqualStrings("POST", req.method());
+    try testing.expectEqualStrings("/submit?id=7", req.target());
     try testing.expectEqual(@as(?usize, 5), req.content_length);
     try testing.expectEqualStrings("hello", buf[req.body_offset..]);
 }
@@ -423,7 +474,7 @@ test "OWS around header values is trimmed" {
     const buf = "GET / HTTP/1.1\r\nX-Foo:   bar\t \r\n\r\n";
     var headers: [max_headers]Header = undefined;
     const req = try parse(buf, &headers);
-    try testing.expectEqualStrings("bar", req.headers[0].value);
+    try testing.expectEqualStrings("bar", req.headers[0].valueSlice(req.data));
 }
 
 test "rejects bogus version" {

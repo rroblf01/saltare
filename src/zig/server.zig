@@ -133,7 +133,7 @@ pub const Observability = struct {
     /// falls back to stderr writes.
     access_log_path: ?[]const u8 = null,
     /// v1.6 access-log path-filter list. Each entry is matched exactly
-    /// against `req.target` (request-line target, including query string
+    /// against `req.target()` (request-line target, including query string
     /// if present); a hit skips the log line for that request. Useful
     /// for muting noisy probes (`/metrics`, `/healthz`, `/favicon.ico`,
     /// `/admin/drain`, `/debug/dispatch`) without losing app-traffic
@@ -906,7 +906,7 @@ fn emitWsAccessLog(conn: *Connection, kind: []const u8, code: u16, bytes_sent: u
     const target: []const u8 = if (conn.ws_log_path) |p|
         p
     else if (conn.parsed) |req|
-        req.target
+        req.target()
     else
         return;
     for (g_obs.access_log_exclude) |skip_path| {
@@ -941,7 +941,7 @@ fn emitAccessLog(conn: *Connection) void {
     // an operator-supplied exclude entry exactly. Linear scan; the list is
     // typically <10 entries (the Zig-intercepted endpoints).
     for (g_obs.access_log_exclude) |skip_path| {
-        if (std.mem.eql(u8, req.target, skip_path)) return;
+        if (std.mem.eql(u8, req.target(), skip_path)) return;
     }
 
     var log: LogBuf = .{};
@@ -963,9 +963,9 @@ fn emitAccessLog(conn: *Connection) void {
         });
     }
     log.appendByte('[');
-    log.appendSlice(req.method);
+    log.appendSlice(req.method());
     log.appendSlice("] [");
-    log.appendSlice(req.target);
+    log.appendSlice(req.target());
     log.printFmt("] [{d}] [{d}]\n", .{ conn.response_status, conn.bytes_sent });
 
     if (!log.overflow) {
@@ -1542,7 +1542,7 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
     // emitting the body bytes after the head would corrupt the
     // pipeline on keep-alive (the client would parse them as the
     // start of the next response).
-    const is_head = std.mem.eql(u8, conn.parsed.?.method, "HEAD");
+    const is_head = std.mem.eql(u8, conn.parsed.?.method(), "HEAD");
     if (is_head) {
         _ = c.close(fd);
         conn.bytes_sent = 0;
@@ -1684,7 +1684,7 @@ fn serveDispatch(loop: *eventloop.Loop, conn: *Connection) void {
 /// Other verbs return 405 so a curl typo doesn't accidentally drain.
 fn serveDrainEndpoint(loop: *eventloop.Loop, conn: *Connection) void {
     const req = conn.parsed.?;
-    if (std.mem.eql(u8, req.method, "POST") or std.mem.eql(u8, req.method, "PUT")) {
+    if (std.mem.eql(u8, req.method(), "POST") or std.mem.eql(u8, req.method(), "PUT")) {
         const was_draining = g_draining.swap(true, .seq_cst);
         const body = if (was_draining)
             "{\"draining\":true,\"changed\":false}\n"
@@ -1692,7 +1692,7 @@ fn serveDrainEndpoint(loop: *eventloop.Loop, conn: *Connection) void {
             "{\"draining\":true,\"changed\":true}\n";
         return serveFixedBody(loop, conn, 200, "OK", "application/json; charset=utf-8", body, "");
     }
-    if (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "HEAD")) {
+    if (std.mem.eql(u8, req.method(), "GET") or std.mem.eql(u8, req.method(), "HEAD")) {
         const draining = g_draining.load(.seq_cst);
         const body = if (draining)
             "{\"draining\":true}\n"
@@ -3335,7 +3335,7 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
             if (http.parse(data[0..conn.read_total], &conn.read_buf.?.headers)) |req| {
                 // v1.4 414 URI Too Long. Cheaper to check here (post-parse)
                 // than mid-parse — the request line was already isolated.
-                if (g_limits.max_request_uri > 0 and req.target.len > g_limits.max_request_uri) {
+                if (g_limits.max_request_uri > 0 and req.target().len > g_limits.max_request_uri) {
                     sendStatus(loop, conn, 414, "URI Too Long");
                     return;
                 }
@@ -3652,39 +3652,39 @@ fn dispatchWithBody(loop: *eventloop.Loop, conn: *Connection, more_body: bool) v
 
     // Internal endpoints (only when explicitly opted in).
     if (g_obs.metrics_path) |path| {
-        if (std.mem.eql(u8, req.target, path)) {
+        if (std.mem.eql(u8, req.target(), path)) {
             return serveMetrics(loop, conn);
         }
     }
     if (g_obs.health_path) |path| {
-        if (std.mem.eql(u8, req.target, path)) {
+        if (std.mem.eql(u8, req.target(), path)) {
             return serveHealth(loop, conn);
         }
     }
     if (g_obs.tracemalloc_path) |path| {
-        if (std.mem.eql(u8, req.target, path)) {
+        if (std.mem.eql(u8, req.target(), path)) {
             return serveTracemalloc(loop, conn);
         }
     }
     if (g_obs.dispatch_path) |path| {
-        if (std.mem.eql(u8, req.target, path)) {
+        if (std.mem.eql(u8, req.target(), path)) {
             return serveDispatch(loop, conn);
         }
     }
     if (g_obs.drain_path) |path| {
-        if (std.mem.eql(u8, req.target, path)) {
+        if (std.mem.eql(u8, req.target(), path)) {
             return serveDrainEndpoint(loop, conn);
         }
     }
     if (g_obs.cors_preflight_allow_all and
-        std.mem.eql(u8, req.method, "OPTIONS") and
+        std.mem.eql(u8, req.method(), "OPTIONS") and
         req.header("origin") != null)
     {
         return serveCorsPreflight(loop, conn);
     }
     if (g_obs.favicon_204 and
-        std.mem.eql(u8, req.target, "/favicon.ico") and
-        (std.mem.eql(u8, req.method, "GET") or std.mem.eql(u8, req.method, "HEAD")))
+        std.mem.eql(u8, req.target(), "/favicon.ico") and
+        (std.mem.eql(u8, req.method(), "GET") or std.mem.eql(u8, req.method(), "HEAD")))
     {
         return serveFavicon(loop, conn);
     }
@@ -3863,7 +3863,7 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
             const line = std.fmt.bufPrint(
                 &line_buf,
                 "saltare: ws-reject path={s} code={d} reason={s}\n",
-                .{ req.target, opened.close_code, opened.close_reason },
+                .{ req.target(), opened.close_code, opened.close_reason },
             ) catch line_buf[0..0];
             if (line.len > 0) _ = c.write(2, line.ptr, line.len);
         }
@@ -3960,7 +3960,7 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // know which path the connection served. Best-effort: a
     // failed dup just means no path in the close log (still
     // emitted; the brackets carry an empty string).
-    if (conn.allocator.dupe(u8, req.target)) |dup| {
+    if (conn.allocator.dupe(u8, req.target())) |dup| {
         conn.ws_log_path = dup;
     } else |_| {}
     // v1.7.1: count this live WS conn so the main loop knows to keep
@@ -4556,7 +4556,7 @@ fn keepAliveReset(loop: *eventloop.Loop, conn: *Connection) void {
 fn tryParsePipelined(loop: *eventloop.Loop, conn: *Connection) void {
     const data = conn.read_buf.?.data;
     if (http.parse(data[0..conn.read_total], &conn.read_buf.?.headers)) |req| {
-        if (g_limits.max_request_uri > 0 and req.target.len > g_limits.max_request_uri) {
+        if (g_limits.max_request_uri > 0 and req.target().len > g_limits.max_request_uri) {
             sendStatus(loop, conn, 414, "URI Too Long");
             return;
         }

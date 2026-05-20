@@ -268,11 +268,11 @@ pub fn httpDispatchStart(
     const gstate = py.PyGILState_Ensure();
     defer py.PyGILState_Release(gstate);
 
-    const q_idx = std.mem.indexOfScalar(u8, req.target, '?');
-    const raw_path = if (q_idx) |i| req.target[0..i] else req.target;
-    const query = if (q_idx) |i| req.target[i + 1 ..] else "";
+    const q_idx = std.mem.indexOfScalar(u8, req.target(), '?');
+    const raw_path = if (q_idx) |i| req.target()[0..i] else req.target();
+    const query = if (q_idx) |i| req.target()[i + 1 ..] else "";
 
-    const headers_obj = buildHeadersList(req.headers) orelse return null;
+    const headers_obj = buildHeadersList(req) orelse return null;
     defer py.Py_DecRef(headers_obj);
 
     // v1.3: percent-decode the path in Zig instead of having Python call
@@ -295,8 +295,8 @@ pub fn httpDispatchStart(
         g_http_start.?,
         "Os#y#y#y#Oy#iOiiO",
         g_app.?,
-        @as([*c]const u8, @ptrCast(req.method.ptr)),
-        @as(py.Py_ssize_t, @intCast(req.method.len)),
+        @as([*c]const u8, @ptrCast(req.method().ptr)),
+        @as(py.Py_ssize_t, @intCast(req.method().len)),
         @as([*c]const u8, @ptrCast(raw_path.ptr)),
         @as(py.Py_ssize_t, @intCast(raw_path.len)),
         @as([*c]const u8, @ptrCast(decoded_path.ptr)),
@@ -628,11 +628,11 @@ pub fn wsOpen(req: http.Request, allocator: std.mem.Allocator) ?WsOpen {
     const gstate = py.PyGILState_Ensure();
     defer py.PyGILState_Release(gstate);
 
-    const q_idx = std.mem.indexOfScalar(u8, req.target, '?');
-    const raw_path = if (q_idx) |i| req.target[0..i] else req.target;
-    const query = if (q_idx) |i| req.target[i + 1 ..] else "";
+    const q_idx = std.mem.indexOfScalar(u8, req.target(), '?');
+    const raw_path = if (q_idx) |i| req.target()[0..i] else req.target();
+    const query = if (q_idx) |i| req.target()[i + 1 ..] else "";
 
-    const headers_obj = buildHeadersList(req.headers) orelse return null;
+    const headers_obj = buildHeadersList(req) orelse return null;
     defer py.Py_DecRef(headers_obj);
 
     var decoded_buf_owned: ?[]u8 = null;
@@ -648,8 +648,8 @@ pub fn wsOpen(req: http.Request, allocator: std.mem.Allocator) ?WsOpen {
         g_ws_open.?,
         "Os#y#y#y#OOiO",
         g_app.?,
-        @as([*c]const u8, @ptrCast(req.method.ptr)),
-        @as(py.Py_ssize_t, @intCast(req.method.len)),
+        @as([*c]const u8, @ptrCast(req.method().ptr)),
+        @as(py.Py_ssize_t, @intCast(req.method().len)),
         @as([*c]const u8, @ptrCast(raw_path.ptr)),
         @as(py.Py_ssize_t, @intCast(raw_path.len)),
         @as([*c]const u8, @ptrCast(decoded_path.ptr)),
@@ -922,29 +922,32 @@ fn lookupCachedHeaderName(name: []const u8) ?*py.PyObject {
     return null;
 }
 
-fn buildHeadersList(headers: []const http.Header) ?*py.PyObject {
+fn buildHeadersList(req: http.Request) ?*py.PyObject {
+    const headers = req.headers;
     const list = py.PyList_New(@intCast(headers.len)) orelse return null;
     for (headers, 0..) |hdr, i| {
+        const name = hdr.nameSlice(req.data);
+        const value = hdr.valueSlice(req.data);
         // ASGI requires lowercase header names. We lowercase in place
         // (the bytes live in the connection's read buffer, owned by
         // this request) so Python doesn't need to call `.lower()` on
         // every header — saving ~50 B per header in transient bytes
         // allocations and avoiding the per-header tuple rebuild that
         // a list-comprehension `.lower()` would force.
-        const mut_name = @constCast(hdr.name);
+        const mut_name = @constCast(name);
         for (mut_name) |*b| {
             b.* = std.ascii.toLower(b.*);
         }
-        const name_obj = lookupCachedHeaderName(hdr.name) orelse py.PyBytes_FromStringAndSize(
-            @as([*c]const u8, @ptrCast(hdr.name.ptr)),
-            @as(py.Py_ssize_t, @intCast(hdr.name.len)),
+        const name_obj = lookupCachedHeaderName(name) orelse py.PyBytes_FromStringAndSize(
+            @as([*c]const u8, @ptrCast(name.ptr)),
+            @as(py.Py_ssize_t, @intCast(name.len)),
         ) orelse {
             py.Py_DecRef(list);
             return null;
         };
         const value_obj = py.PyBytes_FromStringAndSize(
-            @as([*c]const u8, @ptrCast(hdr.value.ptr)),
-            @as(py.Py_ssize_t, @intCast(hdr.value.len)),
+            @as([*c]const u8, @ptrCast(value.ptr)),
+            @as(py.Py_ssize_t, @intCast(value.len)),
         ) orelse {
             py.Py_DecRef(name_obj);
             py.Py_DecRef(list);
