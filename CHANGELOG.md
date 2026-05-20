@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.7.2
+
+**Theme**: WebSocket lifecycle correctness + test coverage.
+
+v1.7.1 wired the multi-tick + periodic-pump runtime that made
+Channels apps work end-to-end. v1.7.2 closes the lifecycle-leak
+window that opened on socket-level errors (peer RST mid-write,
+abrupt TCP FIN) and grows the test surface so future refactors
+can't silently regress the WS path.
+
+### Default-on
+
+- **WS teardown centralised into `Connection.destroy()`.** Every
+  destroy callsite (timer expiry, `doWrite` `.closed`/`.fatal`,
+  peer RST, server shutdown drain) now emits the `WS-CLOSE`
+  access-log line, calls `bridge.wsDisconnect` to cancel the
+  Python consumer task, decrements `g_ws_conns`, and unlinks
+  from `g_ws_head`. Was: `doWrite`'s error arm called
+  `conn.destroy()` directly, leaking `_WsState` + asyncio Task
+  forever and printing a `WS-CONNECT` with no matching
+  `WS-CLOSE` for every dropped connection. Real leak under
+  churn.
+- **`Connection.ws_log_path` cache.** `wsAfterWrite` clears
+  `conn.parsed` to reuse the buffer between WS frames, so the
+  post-upgrade `WS-CLOSE` line emitted from `destroy()` would
+  otherwise see `parsed == null` and skip the log entirely.
+  Saltare now `dup()`s the request target at upgrade time and
+  reads it back from this cache; freed by `destroy()` after the
+  close line is written.
+- **`wsTeardown` simplified to `loop.remove + destroy`.** The
+  `bridge.wsDisconnect` call + log emit moved into `destroy()`
+  (above); `wsTeardown` is now a thin epoll-unregister wrapper
+  retained for the explicit close-frame path that still needs
+  `loop.remove` before destroy.
+
+### Tests
+
+122 total (+13 from v1.7.1's 109). `tests/test_ws_lifecycle.py`
+covers the invariants v1.7.2 protects:
+
+- Close-code → HTTP status forwarding (parametrised: 4001→401,
+  4002→402, 4003→403, 4004→404, 4008→408, 4029→429, fallthrough
+  4500→403).
+- Post-accept initial state push reaches the wire (Phase 2 of the
+  upgrade pump).
+- `--ws-handshake-timeout` cancels a consumer that never
+  accepts/closes (verifies the cancel + 4xx response without
+  hanging the test for 60 s on the consumer's `asyncio.sleep`).
+- Abrupt-disconnect-doesn't-break-server (open 20 WS, drop TCP
+  FIN on all, verify a fresh WS still upgrades + delivers the
+  welcome frame).
+- `WS-CONNECT` / `WS-CLOSE` access-log symmetry (subprocess test
+  capturing stderr — confirms the centralised-destroy fix).
+- `--ws-reject-log` line carries `code=4003 reason=...`.
+- N sequential connect+close cycles keep the server responsive.
+
+Also added a small `_WsClient` helper that buffers reads — the
+naive `recv(4096)` in earlier tests stranded the welcome frame
+because saltare coalesces the 101 head and the first server-
+pushed frame into one `write(2)`.
+
 ## 1.7.1
 
 **Theme**: Django Channels WebSocket runtime — closing the gap with daphne.

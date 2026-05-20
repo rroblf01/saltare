@@ -141,7 +141,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("1.7.1");
+    return py.PyUnicode_FromString("1.7.2");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {

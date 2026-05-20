@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "saltare"
-version = "1.7.1"
+version = "1.7.2"
 description = "Low-RAM ASGI HTTP server with a Zig backbone."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -67,7 +67,7 @@ test-command = "pytest -q {project}/tests"
 # images ship the runtime libs but not the headers; without -devel the zig
 # build fails before it can produce _core.so. auditwheel repair vendors the
 # runtime libs into the final wheel so end users don't need them installed.
-before-all = "bash {project}/scripts/install-zig.sh && dnf install -y openssl-devel"
+before-all = "bash {project}/scripts/install-zig.sh && dnf install -y --disablerepo=epel openssl-devel"
 environment = { PATH = "/usr/local/bin:$PATH", ZIG_VERSION = "0.16.0" }
 archs = ["x86_64", "aarch64"]
 # Match the local Docker pipeline (scripts/build-wheel.sh + Dockerfile use

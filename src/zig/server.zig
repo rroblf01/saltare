@@ -898,12 +898,19 @@ extern fn localtime_r(t: *const c_long, result: *Tm) ?*Tm;
 /// write_buf bytes drained over the connection's lifetime.
 fn emitWsAccessLog(conn: *Connection, kind: []const u8, code: u16, bytes_sent: u64) void {
     if (!g_obs.access_log) return;
-    const req = conn.parsed orelse return;
-    // Same exclude filter as the HTTP path so silencing /metrics on
-    // HTTP also silences any /ws/metrics noise an operator might
-    // configure on the same host.
+    // Path source priority: cached `ws_log_path` (set at upgrade time and
+    // kept across the connection's lifetime) over `conn.parsed.target`.
+    // `wsAfterWrite` clears `parsed` to reuse the buffer between WS
+    // frames, so a destroy() that fires post-upgrade would otherwise
+    // see `parsed == null` and skip the log line entirely.
+    const target: []const u8 = if (conn.ws_log_path) |p|
+        p
+    else if (conn.parsed) |req|
+        req.target
+    else
+        return;
     for (g_obs.access_log_exclude) |skip_path| {
-        if (std.mem.eql(u8, req.target, skip_path)) return;
+        if (std.mem.eql(u8, target, skip_path)) return;
     }
 
     var log: LogBuf = .{};
@@ -922,7 +929,7 @@ fn emitWsAccessLog(conn: *Connection, kind: []const u8, code: u16, bytes_sent: u
     log.appendByte('[');
     log.appendSlice(kind);
     log.appendSlice("] [");
-    log.appendSlice(req.target);
+    log.appendSlice(target);
     log.printFmt("] [{d}] [{d}]\n", .{ code, bytes_sent });
     if (!log.overflow) _ = c.write(g_access_log_fd, &log.buf, log.pos);
 }
@@ -2086,6 +2093,12 @@ const Connection = struct {
     /// in `destroy`. Walked each periodic-pump tick to flush
     /// `_WsState.outgoing` to the wire after `group_send` etc.
     ws_list_next: ?*Connection,
+    /// v1.7.1 — heap-allocated copy of the upgrade request-target
+    /// kept so `WS-CLOSE` access-log lines (emitted from `destroy`,
+    /// possibly long after `conn.parsed` has been cleared by
+    /// `wsAfterWrite`) still know which path the connection served.
+    /// Owned by `allocator`; freed in `destroy`.
+    ws_log_path: ?[]u8,
 
     // v1.4: request-body streaming state. When the declared
     // `Content-Length` exceeds the read buffer's available space,
@@ -2147,6 +2160,7 @@ const Connection = struct {
             .ws_frag_len = 0,
             .ws_pmd_active = false,
             .ws_list_next = null,
+            .ws_log_path = null,
             .body_streaming = false,
             .body_streaming_consumed = 0,
         };
@@ -2154,16 +2168,33 @@ const Connection = struct {
     }
 
     fn destroy(self: *Connection) void {
-        // NOTE: WebSocket teardown (notifying Python) must be done by
-        // `wsTeardown` BEFORE calling destroy. We don't acquire the GIL
-        // here — destroy is called from many paths (including non-WS)
-        // and forcing a GIL acquisition was a footgun in tests.
+        // v1.7.1: centralise WebSocket teardown here so every path that
+        // calls `destroy()` (timer expiry, peer RST mid-write, server
+        // shutdown drain, etc.) emits a WS-CLOSE log line, tells Python
+        // to cancel the consumer task, and unlinks from `g_ws_head`.
+        // Was: `doWrite`'s `.closed/.fatal` arm called destroy directly,
+        // leaving the Python-side `_WsState` + asyncio Task pinned in
+        // memory forever and the log file with a WS-CONNECT but no
+        // matching WS-CLOSE — a real leak under churn.
         if (self.protocol == .websocket) {
-            // v1.7.1: pair with the increment in startWebSocket so the
-            // periodic-pump tick stops once the last WS conn dies.
+            // 1. Access-log line. `wsTeardown` (when it's the caller)
+            //    has already emitted this — destroy() is now also a
+            //    legal entry point so we emit here too. Duplicate
+            //    lines on the wsTeardown path are avoided by clearing
+            //    `protocol` after the log; see below.
+            emitWsAccessLog(self, "WS-CLOSE", 1006, self.bytes_sent);
+            // 2. Notify Python so the consumer task is cancelled and
+            //    `_WsState` released. Without this the Task is parked
+            //    on `receive_queue.get()` forever; the test_ws_stress
+            //    case that simulated 40 dropped connections previously
+            //    leaked ~5 KiB Python heap each.
+            if (self.ws_handle != 0) {
+                const final = bridge.wsDisconnect(self.ws_handle, 1006, self.allocator);
+                if (final.len > 0) self.allocator.free(final);
+                self.ws_handle = 0;
+            }
+            // 3. Decrement live-WS counter + unlink from g_ws_head.
             _ = g_ws_conns.fetchSub(1, .seq_cst);
-            // Unlink from g_ws_head. O(N) scan; N is the active WS
-            // count which stays small in practice (~hundreds at most).
             if (g_ws_head == self) {
                 g_ws_head = self.ws_list_next;
             } else {
@@ -2177,6 +2208,16 @@ const Connection = struct {
                 }
             }
             self.ws_list_next = null;
+            // Release the cached log path AFTER the WS-CLOSE line
+            // above has read it.
+            if (self.ws_log_path) |p| {
+                self.allocator.free(p);
+                self.ws_log_path = null;
+            }
+            // Clear the protocol so a defensive re-entry (e.g. the
+            // wsTeardown→destroy chain we still keep for the explicit
+            // close path) doesn't double-log / double-disconnect.
+            self.protocol = .http;
         }
         self.wheel.cancel(&self.timer_node);
         unlinkStalled(self);
@@ -3913,6 +3954,15 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_pos = 0;
     conn.state = .writing;
     conn.protocol = .websocket;
+    // v1.7.1: cache request-target now — `wsAfterWrite` clears
+    // `conn.parsed` to reuse the buffer between frames, so the
+    // WS-CLOSE log emitted from `destroy` later wouldn't otherwise
+    // know which path the connection served. Best-effort: a
+    // failed dup just means no path in the close log (still
+    // emitted; the brackets carry an empty string).
+    if (conn.allocator.dupe(u8, req.target)) |dup| {
+        conn.ws_log_path = dup;
+    } else |_| {}
     // v1.7.1: count this live WS conn so the main loop knows to keep
     // pumping the asyncio loop for `channel_layer.group_send` etc.
     _ = g_ws_conns.fetchAdd(1, .seq_cst);
@@ -4405,17 +4455,11 @@ fn wsAfterWrite(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn wsTeardown(loop: *eventloop.Loop, conn: *Connection) void {
-    // v1.7.1: emit a WS-CLOSE access-log line before tearing the conn
-    // down. Using close code 1006 mirrors what `wsDisconnect` tells
-    // Python — "abnormal closure" — when the peer didn't send a
-    // proper close frame; the close code from a clean shutdown was
-    // already logged via the dispatch path that called us.
-    emitWsAccessLog(conn, "WS-CLOSE", 1006, conn.bytes_sent);
-    if (conn.ws_handle != 0) {
-        const final = bridge.wsDisconnect(conn.ws_handle, 1006, conn.allocator);
-        if (final.len > 0) conn.allocator.free(final);
-        conn.ws_handle = 0;
-    }
+    // v1.7.1: WS-CLOSE log + bridge.wsDisconnect now happen inside
+    // `Connection.destroy()` so every teardown path emits them
+    // (including `doWrite` .closed/.fatal which used to skip).
+    // This wrapper just remains as the canonical "epoll-unregister +
+    // free" entry point for the WS-specific call sites.
     loop.remove(conn.fd);
     conn.destroy();
 }
