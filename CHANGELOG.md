@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.9.0
+
+**Theme**: HTTP/2 dispatch integration + Connection HTTP/WS union + WebSocket compression config.
+
+### Default-on
+
+- **`Connection` struct HTTP/WS tagged union.** `WsState` struct holding all 10 WebSocket-only fields (handle, frag_*, pmd_active, list_next, log_path, last_activity_ns) stored in `data: union(Protocol) { http: void, websocket: WsState }`. HTTP connections pay **zero bytes for WebSocket state** (~52 B saved per HTTP conn, ~52 KiB at 1024 idle connections). The union tag replaces the separate `protocol` enum field — all ~52 access sites updated. Frag buffer freed inside the websocket arm of `destroy()` before the union transitions to `.http`. Was deferred from v1.8.0; 116-site mechanical refactor now complete.
+- **Six pre-existing test file fixes.** `test_cli_unit`, `test_dispatcher_unit`, `test_reload_unit`, `test_v16`, `test_ws_compression`, and `test_drain` failed in Docker because they assumed source-tree layout (`../src/saltare/`). Fixed by falling back to installed package when source files aren't available, wrapping `_brotli_available()` / `_zstd_available()` in try/except `ImportError`, and converting version checks to `1.9.0`.
+
+### Opt-in flags
+
+- **`--http2` flag** — enables HTTP/2 support via ALPN `h2` on every TLS handshake. When a client negotiates HTTP/2, requests are dispatched through `bridge.http2DispatchStart` → `_dispatcher.py` → existing ASGI dispatch with `http_version="2"` in the scope. The Python `http2_dispatch_start` signature was fixed to match the bridge's 14-arg call (`Oiiy#y#y#y#Oy#iOiO`), adding `reserved`, `method`/`scheme`/`path` as raw bytes, and a `server_scheme` fallback. Internal Zig HTTP/2 framing (`src/zig/h2.zig`) handles connection preface, SETTINGS, DATA, HEADERS, PING, RST_STREAM, GOAWAY, and WINDOW_UPDATE. Also exposed as `http2=True` kwarg on `saltare.run()`. Off by default; zero cost when off.
+- **WebSocket per-message-deflate configuration** — `--ws-compression-level INT`, `--ws-compression-server-takeover BOOL`, `--ws-pump-interval-ms INT` for fine-tuning WebSocket compression behaviour. The pump-interval flag replaces the hardcoded 50 ms tick cadence for live-WS asyncio loop pumps (`--ws-pump-interval-ms`, floor 10 ms).
+
+### Tests
+
+360 total (+221 from v1.8.0's 139). New file `tests/test_http2.py` covers:
+
+- **HTTP/2 dispatch unit tests** — `http2_dispatch_start` bridge wiring: basic dispatch, PushBody, Drain, edge cases (negative stream_id, reserved non-zero, stale dispatch handle).
+- **HTTP/2 server integration** — HTTP/1.1 client with `http2=True` flag, TLS with ALPN `h2` negotiation, `--http2` via CLI, `http_version="2"` in ASGI scope.
+- **HTTP/2 configuration** — `bad_http2_path` returns 404, `no_http2_path` keeps `http_version="1.1"`.
+
+All 6 pre-existing test failures fixed. WS lifecycle, channels, and observability suites unchanged.
+
+### Bench
+
+No bench delta — every v1.9 opt-in addition (HTTP/2 dispatch, ALPN, WS compression config) costs zero RAM when off; the hot path is unchanged from v1.8. The Connection union reclaims ~52 KiB at full 1024 conns — within bench noise at the 500-conn idle workload. Benchmarks re-run and README tables updated.
+
+### Deferred to v1.10+
+
+- **Free-threaded Python (`cp314t`)** evaluation — measure RSS + rps with GIL gone.
+- **Static-link OpenSSL build** — alternative wheel that embeds libssl/libcrypto for environments without system OpenSSL.
+- **io_uring event loop** (~2-3 weeks) — replaces epoll on hot path.
+- **Sub-interpreters (PEP 684)** (~4-6 weeks) — ~10 MiB Pss multi-worker saving.
+
 ## 1.8.0
 
 **Theme**: header memory compression + edge-case test coverage.

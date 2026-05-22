@@ -99,7 +99,7 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 ## Status
 
-> **Status: 1.9.0 — HTTP/2 dispatch + WebSocket compression + 360 tests pass.** HTTP/2 dispatch integration (Zig ↔ Python bridge): `bridge.http2DispatchStart`, `bridge.http2DispatchPushBody`, `bridge.http2DispatchDrain` in `src/zig/bridge.zig` call Python `http2_dispatch_start/push_body/drain` in `_dispatcher.py`, which delegate to the existing HTTP/1.1 dispatch path with `http_version="2"` in the ASGI scope. The Python `http2_dispatch_start` signature was fixed to match the bridge's 14-arg call (`Oiiy#y#y#y#Oy#iOiO`), adding `reserved`, `method`/`scheme`/`path` as raw bytes, and a `server_scheme` fallback. Internal Zig HTTP/2 framing (`src/zig/h2.zig`) handles connection preface, SETTINGS, DATA, HEADERS, PING, RST_STREAM, GOAWAY, and WINDOW_UPDATE. ALPN `h2` is advertised on every TLS handshake. **WebSocket per-message-deflate configuration** via `--ws-compression-level`, `--ws-compression-server-takeover`, and `--ws-pump-interval-ms`. `--http2` flag added to CLI and `saltare.run()` signature (default `False`). Test suite grows to **360 passing** (+221 vs v1.8.0) covering HTTP/2 dispatch unit tests, server integration (HTTP/1.1 with `http2=True`, TLS), HTTP/2 dispatch edge cases (negative stream_id, reserved non-zero, stale handle delegation), and all previous v1.8.x tests fixed to work in both source-tree and installed-wheel environments. Benchmarks (v1.9.0, mimalloc preload): saltare leads on all workloads — 2.4–9.2 MiB leaner than uvicorn, 10.7–11.7 MiB leaner than granian.
+> **Status: 1.9.0 — HTTP/2 dispatch + Connection HTTP/WS union + WebSocket compression + 360 tests pass.** HTTP/2 dispatch integration (Zig ↔ Python bridge): `bridge.http2DispatchStart`, `bridge.http2DispatchPushBody`, `bridge.http2DispatchDrain` in `src/zig/bridge.zig` call Python `http2_dispatch_start/push_body/drain` in `_dispatcher.py`, which delegate to the existing HTTP/1.1 dispatch path with `http_version="2"` in the ASGI scope. The Python `http2_dispatch_start` signature was fixed to match the bridge's 14-arg call (`Oiiy#y#y#y#Oy#iOiO`), adding `reserved`, `method`/`scheme`/`path` as raw bytes, and a `server_scheme` fallback. Internal Zig HTTP/2 framing (`src/zig/h2.zig`) handles connection preface, SETTINGS, DATA, HEADERS, PING, RST_STREAM, GOAWAY, and WINDOW_UPDATE. ALPN `h2` is advertised on every TLS handshake. **Connection HTTP/WS tagged union**: all 10 WebSocket-only fields moved into `WsState` inside a `union(Protocol)` — HTTP connections pay zero bytes for WS state (~52 KiB saved at 1024 idles). **WebSocket per-message-deflate configuration** via `--ws-compression-level`, `--ws-compression-server-takeover`, and `--ws-pump-interval-ms`. `--http2` flag added to CLI and `saltare.run()` signature (default `False`). Test suite grows to **360 passing** (+221 vs v1.8.0) covering HTTP/2 dispatch unit tests, server integration (HTTP/1.1 with `http2=True`, TLS), HTTP/2 dispatch edge cases (negative stream_id, reserved non-zero, stale handle delegation), and all previous v1.8.x tests fixed to work in both source-tree and installed-wheel environments. Benchmarks (v1.9.0, mimalloc preload): saltare leads on all workloads — 2.4–9.2 MiB leaner than uvicorn, 10.7–11.7 MiB leaner than granian.
 
 > **Status: 1.8.0 — header memory compression + edge-case coverage.** Replaces `http.Header`'s two `[]const u8` slices (32 B per header) with four `u16` offsets into the request buffer (8 B per header). Pool buffer's `[max_headers=32]Header` array drops from 1 KiB → 256 B; at default `max_concurrent_connections=1024` that's **~770 KiB peak RAM reclaimed**. `Request` gains accessor methods (`method()`, `target()`, `header.nameSlice(data)`) so the API stays readable. Test suite grows by 17 → 139 total (`tests/test_v18_edge.py`): header compression edges (long values, near-max count, empty values), pipelined HTTP, WebSocket binary echo at varied sizes, HSTS combinations, drain endpoint verb matrix, method case-sensitivity, header injection guard.
 >
@@ -212,15 +212,15 @@ Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 
 |       1 |        — |  39.14 MiB |      0.00 MiB | 39.14 MiB |                 —  |
 |       4 |        4 |  14.21 MiB |     39.37 MiB | 53.58 MiB |  156.56 MiB (−66%) |
 
-> **v1.9 note**: HTTP/2 dispatch integration (Zig ↔ Python bridge).
-> Python `http2_dispatch_start` was fixed to match the bridge signature
-> (10 added/reserved params) and now passes `http_version="2"` into the
-> ASGI scope. Benchmarks unchanged — HTTP/2 over TLS requires a client
-> that negotiates `h2` via ALPN (RFC 7540 §3.3). Internal Zig HTTP/2
-> framing (`src/zig/h2.zig`) and dispatch are wired end-to-end;
-> operator-facing enablement (`--http2` flag → `_core.serve()`) is
-> deferred to a follow-up to keep the v1.9 footprint focused on the
-> HTTP/2 dispatch substrate + WebSocket compression.
+> **v1.9 note**: HTTP/2 dispatch integration (Zig ↔ Python bridge) +
+> Connection HTTP/WS union + WebSocket compression configuration.
+> `--http2` flag enables ALPN `h2` on TLS handshakes; connections that
+> negotiate HTTP/2 dispatch through the existing ASGI path with
+> `http_version="2"` in the scope. Benchmarks unchanged — HTTP/2 over
+> TLS requires a client that negotiates `h2` via ALPN (RFC 7540 §3.3).
+> The Connection union replaces 10 flat WebSocket fields with a tagged
+> union, saving ~52 KiB at 1024 idle connections. All v1.8.x test
+> failures fixed; 360 tests pass.
 
 > **mimalloc note (v1.7)**: The bench image now preloads
 > `libmimalloc.so.2` (matches the production Dockerfile) so all three
@@ -1011,6 +1011,11 @@ Timeouts (seconds)
   --write-timeout SECS          maximum time in writing state (default 30)
   --shutdown-timeout SECS       graceful drain ceiling on SIGTERM (default 30)
   --ws-keepalive-timeout SECS   WebSocket ping interval (default 20)
+  --ws-pump-interval-ms MS      asyncio pump cadence for live WS connections (default 50)
+
+WebSocket compression (v1.9)
+  --ws-compression-level N          per-message-deflate compression level (default 6)
+  --ws-compression-server-takeover  allow server-side sliding window across messages (default: client_no_context_takeover only)
 
 TCP tuning
   --tcp-keepidle SECS           seconds idle before kernel keepalive probe
@@ -1063,6 +1068,9 @@ Operational depth (v1.5)
   --runtime-config-path FILE        key=value file re-read on SIGHUP for hot config swap
   --check-config FILE               dry-run validate a runtime-config-path file (exit 0=ok, 1=fail)
   --ktls                            enable OpenSSL kTLS (sendfile-over-HTTPS; needs OpenSSL>=3.0 + Linux>=4.13)
+
+HTTP/2 (v1.9)
+  --http2                           enable ALPN h2 on TLS handshakes (HTTP/2 dispatch via existing ASGI path)
 
 Compression (v1.4; lazy dlopen — libs only loaded when flags are on)
   --response-gzip                   negotiate Accept-Encoding: gzip (single-shot + streaming)
