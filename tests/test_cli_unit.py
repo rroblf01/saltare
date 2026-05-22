@@ -35,11 +35,19 @@ if os.path.exists(_SRC):
     _mock_saltare.run = _mock_run
 
     import sys as _sys
+    _orig_saltare = _sys.modules.get("saltare")
     _sys.modules["saltare"] = _mock_saltare
 
     _spec = _util.spec_from_file_location("saltare.cli", _SRC)
     CLI = _util.module_from_spec(_spec)
     _spec.loader.exec_module(CLI)
+
+    # Restore the real saltare so subsequent test files in the
+    # same pytest process don't import the mock instead.
+    if _orig_saltare is not None:
+        _sys.modules["saltare"] = _orig_saltare
+    else:
+        _sys.modules.pop("saltare", None)
 else:
     # Fall back to installed package (wheel has _core)
     import saltare.cli as _CLI
