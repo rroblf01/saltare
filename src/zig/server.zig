@@ -21,6 +21,7 @@ const pool_mod = @import("pool.zig");
 const tls = @import("tls.zig");
 const ws = @import("ws.zig");
 const timer = @import("timer.zig");
+const h2 = @import("h2.zig");
 
 const c = @cImport({
     // sys/types.h first so musl's `bits/types/struct_timespec.h` /
@@ -1944,6 +1945,9 @@ const ConnState = enum {
     /// TLS handshake in progress. Plaintext connections start in `.reading`.
     handshaking,
     reading,
+    /// v1.9: HTTP/2 over TLS detected via ALPN, or h2c upgrade accepted.
+    /// Active HTTP/2 connection with multiplexed streams.
+    http2,
     writing,
 };
 
@@ -2111,6 +2115,13 @@ const Connection = struct {
     body_streaming: bool,
     body_streaming_consumed: usize,
 
+    // v1.9: HTTP/2 connection state. Null for HTTP/1.1 connections.
+    // Allocated only when HTTP/2 is negotiated (TLS ALPN or h2c upgrade).
+    h2_conn: ?*h2.Connection,
+    /// v1.9: pending HTTP/2 upgrade state. Set when a plaintext connection
+    /// sends an upgrade request; cleared once the preface is processed.
+    h2_upgrade_pending: bool,
+
     fn create(
         allocator: std.mem.Allocator,
         pool: *pool_mod.Pool,
@@ -2163,6 +2174,8 @@ const Connection = struct {
             .ws_log_path = null,
             .body_streaming = false,
             .body_streaming_consumed = 0,
+            .h2_conn = null,
+            .h2_upgrade_pending = false,
         };
         return conn;
     }
@@ -2227,6 +2240,12 @@ const Connection = struct {
             bridge.httpDispatchAbort(self.dispatch_handle);
             self.dispatch_active = false;
             self.dispatch_handle = 0;
+        }
+        // v1.9: HTTP/2 connection state cleanup.
+        if (self.h2_conn) |hc| {
+            hc.deinit();
+            self.allocator.destroy(hc);
+            self.h2_conn = null;
         }
         if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b, monoNs());
@@ -2938,6 +2957,7 @@ fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event
         .proxy_pending => if (ev.readable or ev.writable) doProxyV1(loop, conn),
         .handshaking => doHandshake(loop, conn),
         .reading => if (ev.readable or ev.writable) doRead(loop, conn),
+        .http2 => if (ev.readable or ev.writable) doReadHttp2(loop, conn),
         .writing => if (ev.readable or ev.writable) doWrite(loop, conn),
     }
 }
@@ -3142,6 +3162,13 @@ fn doHandshake(loop: *eventloop.Loop, conn: *Connection) void {
             if (tls.sessionReused(ssl)) {
                 _ = g_tls_session_reuse_total.fetchAdd(1, .seq_cst);
             }
+            // v1.9: check ALPN for HTTP/2 negotiation.
+            if (tls.negotiatedAlpn(ssl)) |proto| {
+                if (std.mem.eql(u8, proto, "h2")) {
+                    initHttp2Conn(loop, conn);
+                    return;
+                }
+            }
             conn.state = .reading;
             loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
                 loop.remove(conn.fd);
@@ -3238,6 +3265,235 @@ fn wantsExpectContinue(req: http.Request) bool {
     const v = req.header("expect") orelse return false;
     const trimmed = std.mem.trim(u8, v, " \t");
     return std.ascii.eqlIgnoreCase(trimmed, "100-continue");
+}
+
+// ===================================================================
+// HTTP/2 Support (v1.9)
+// ===================================================================
+
+fn initHttp2Conn(loop: *eventloop.Loop, conn: *Connection) void {
+    if (conn.h2_conn == null) {
+        conn.h2_conn = conn.allocator.create(h2.Connection) catch {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
+        conn.h2_conn.?.* = h2.Connection.init(conn.allocator);
+    }
+    conn.state = .http2;
+    conn.armTimer(g_timeouts.header_secs);
+    loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+    };
+}
+
+fn acceptHttp2Upgrade(loop: *eventloop.Loop, conn: *Connection, h2_settings: []const u8) void {
+    _ = h2_settings;
+    initHttp2Conn(loop, conn);
+    const switch_proto = "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n";
+    var written: usize = 0;
+    while (written < switch_proto.len) {
+        const r = connWrite(conn, switch_proto[written..]);
+        if (r.status != .ok) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        written += r.n;
+    }
+    conn.state = .http2;
+    loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+    };
+}
+
+fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
+    const h2c = conn.h2_conn orelse {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    conn.ensureBuffer() catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+        return;
+    };
+    const data = conn.read_buf.?.data;
+
+    const r = connRead(conn, data[conn.read_total..]);
+    switch (r.status) {
+        .ok => {},
+        .would_block, .want_read => return,
+        .want_write => {
+            loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+            };
+            return;
+        },
+        .closed, .fatal => {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        },
+    }
+    conn.read_total += r.n;
+
+    if (!h2c.preface_received) {
+        _ = h2c.expectPreface(data[0..conn.read_total]) catch {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        };
+        if (h2c.preface_received) {
+            const settings_ack = h2c.buildSettingsAck();
+            _ = connWrite(conn, settings_ack);
+        }
+        return;
+    }
+
+    var processed: usize = 0;
+    while (processed < conn.read_total) {
+        const remaining = data[processed..conn.read_total];
+        const result = h2c.processFrame(remaining) catch {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        } orelse break;
+
+        if (result.settings_ack) {
+            const ack = h2c.buildSettingsAck();
+            _ = connWrite(conn, ack);
+        }
+        if (result.ping) |ping_data| {
+            var ack_frame = conn.allocator.alloc(u8, 17) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            ack_frame[0] = 0;
+            ack_frame[1] = 0;
+            ack_frame[2] = 8;
+            ack_frame[3] = h2.HTTP2_FRAME_TYPE_PING;
+            ack_frame[4] = h2.HTTP2_FLAG_ACK;
+            @memcpy(ack_frame[5..13], ping_data);
+            _ = connWrite(conn, ack_frame);
+            conn.allocator.free(ack_frame);
+        }
+        if (result.need_window_update) {
+            const wu = h2c.buildWindowUpdate(result.stream_id, @as(u31, @truncate(h2c.settings.initial_window_size))) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            _ = connWrite(conn, wu);
+            conn.allocator.free(wu);
+        }
+        if (result.headers) |headers| {
+            var hdrs = headers;
+            defer hdrs.deinit(conn.allocator);
+            _ = h2c.streams.get(result.stream_id);
+            var scheme: []const u8 = "https";
+            var method: []const u8 = "";
+            var path: []const u8 = "/";
+            for (headers.items) |hdr| {
+                if (std.mem.eql(u8, hdr.name, ":method")) method = hdr.value;
+                if (std.mem.eql(u8, hdr.name, ":path")) path = hdr.value;
+                if (std.mem.eql(u8, hdr.name, ":scheme")) scheme = hdr.value;
+            }
+            const start = bridge.http2DispatchStart(
+                result.stream_id,
+                headers.items,
+                scheme,
+                method,
+                path,
+                null, // initial body is null
+                conn.allocator,
+            ) orelse {
+                // If dispatch fails, tear down the connection for now.
+                // In a full H2 implementation, we'd send a RST_STREAM.
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+
+            conn.dispatch_handle = start.handle;
+            conn.dispatch_active = !start.done;
+            conn.request_in_flight = true;
+            _ = g_total_requests.fetchAdd(1, .seq_cst);
+            _ = g_in_flight.fetchAdd(1, .seq_cst);
+            conn.response_status = 0;
+            conn.bytes_sent = 0;
+            conn.request_start_ns = if (g_obs.access_log or g_obs.latency_histogram) monoNs() else 0;
+
+            if (start.chunks.len > 0) {
+                conn.write_buf = start.chunks;
+                conn.write_pos = 0;
+                // First chunk of the response holds the status line.
+                if (conn.response_status == 0) {
+                    conn.response_status = parseStatus(start.chunks);
+                }
+                // Since we have chunks, we want to write them.
+                loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                    conn.destroy();
+                    return;
+                };
+            } else if (start.done) {
+                conn.dispatch_active = false;
+                conn.dispatch_handle = 0;
+            }
+        }
+        if (result.data) |data_chunk| {
+            if (conn.dispatch_active and conn.dispatch_handle != 0) {
+                const tick = bridge.http2DispatchPushBody(
+                    conn.dispatch_handle,
+                    data_chunk,
+                    !result.end_stream,
+                    conn.allocator,
+                ) orelse {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                };
+                if (tick.chunks.len > 0) {
+                    // Append to write_buf instead of replacing, as HTTP/2 can interleave frames.
+                    conn.write_buf = conn.allocator.realloc(conn.write_buf, conn.write_buf.len + tick.chunks.len) catch {
+                         conn.destroy();
+                         return;
+                    };
+                    @memcpy(conn.write_buf[conn.write_buf.len - tick.chunks.len ..], tick.chunks);
+                    // Since we have new chunks, ensure we want to write.
+                    loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                        conn.destroy();
+                        return;
+                    };
+                }
+                conn.dispatch_active = !tick.done;
+                if (tick.done) {
+                    conn.dispatch_handle = 0;
+                }
+            }
+        }
+        if (result.stream_closed > 0) {
+            _ = h2c.streams.remove(result.stream_closed);
+        }
+        if (result.goaway) {
+            loop.remove(conn.fd);
+            conn.destroy();
+            return;
+        }
+        const frame = h2.Frame.parse(remaining) orelse break;
+        processed += 9 + frame.length;
+    }
+    if (processed < conn.read_total) {
+        const leftover = conn.read_total - processed;
+        std.mem.copyForwards(u8, data[0..leftover], data[processed..conn.read_total]);
+        conn.read_total = leftover;
+    } else {
+        conn.read_total = 0;
+    }
 }
 
 fn epollWantRead(loop: *eventloop.Loop, conn: *Connection) void {
@@ -3400,6 +3656,18 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                 // If the body is already complete in this iteration, dispatch
                 // will arm write_timeout and overwrite this — harmless.
                 conn.armTimer(g_timeouts.body_secs);
+
+                // v1.9: HTTP/2 cleartext (h2c) upgrade detection.
+                // RFC 7540 Section 3.4: client sends an HTTP/1.1 request with
+                // "Upgrade: h2c" + "HTTP2-Settings" headers. We respond with
+                // "101 Switching Protocols" then switch to HTTP/2 mode.
+                if (req.version_minor >= 1) {
+                    const upgrade = req.header("upgrade") orelse "";
+                    const h2_settings = req.header("http2-settings") orelse "";
+                    if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, upgrade, " \t"), "h2c") and h2_settings.len > 0) {
+                        return acceptHttp2Upgrade(loop, conn, h2_settings);
+                    }
+                }
             } else |err| switch (err) {
                 error.Incomplete => continue,
                 else => {
@@ -4042,7 +4310,12 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
         // Drain only — the global pump in the main loop is responsible for
         // advancing the asyncio Task. If chunks have been emitted since the
         // last drain, write them.
-        const tick = bridge.httpDispatchDrain(conn.dispatch_handle, conn.allocator) orelse {
+        const maybe_tick = if (conn.state == .http2)
+            bridge.http2DispatchDrain(conn.dispatch_handle, conn.allocator)
+        else
+            bridge.httpDispatchDrain(conn.dispatch_handle, conn.allocator);
+
+        const tick = maybe_tick orelse {
             loop.remove(conn.fd);
             conn.destroy();
             return;

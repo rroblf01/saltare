@@ -103,6 +103,15 @@ def set_gc_collect_every_n(n: int) -> None:
     _gc_collect_every_n = max(0, int(n))
 
 
+def set_http_pool_max(max_size: int) -> None:
+    """Set the maximum size of the HTTP state object pool. Higher values
+    reduce allocation churn at the cost of idle memory. 0 disables pooling.
+    The pool is only allocated on first use, so setting a high value doesn't
+    immediately consume RAM."""
+    global _HTTP_POOL_MAX
+    _HTTP_POOL_MAX = max(0, int(max_size))
+
+
 # v1.4 W3C Trace Context. When enabled, the dispatcher reads `traceparent`
 # (and optionally `tracestate`) from the request, exposes them on
 # `scope["traceparent"]` / `scope["tracestate"]` as ASGI extension keys,
@@ -346,7 +355,7 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/1.4.0"
+_SERVER_HEADER = b"saltare/1.9.0"
 
 
 # ---------------------------------------------------------------------------
@@ -834,14 +843,23 @@ def _status_line(status: int) -> bytes:
 # `client_no_context_takeover; server_no_context_takeover` — both sides
 # reset state every message. Simpler than carrying sliding-window state
 # across messages, and the compression hit is < 5% on typical text.
+# v1.9: Added configurable compression level and optional context takeover.
 _PMD_TRAIL = b"\x00\x00\xff\xff"
 _PMD_LEVEL = 6  # zlib default; matches gzip default.
+# v1.9: Enable context takeover for better compression on repeated messages.
+# When True, the compressor state is maintained across messages, improving
+# compression ratio for long-running connections. Adds ~8KB memory per conn.
+_PMD_SERVER_TAKEOVER = False
+_PMD_CLIENT_TAKEOVER = False
 
 
 def _pmd_negotiate(headers: list[tuple[bytes, bytes]]) -> tuple[bool, str]:
     """Inspect `Sec-WebSocket-Extensions`. Returns (active, response_token).
     Active iff client offered `permessage-deflate`. Response is the
     token to echo on the 101 (with our preferred params)."""
+    has_pmd_offer = False
+    client_requests_takeover = False
+
     for name, value in headers:
         if name != b"sec-websocket-extensions":
             continue
@@ -851,21 +869,41 @@ def _pmd_negotiate(headers: list[tuple[bytes, bytes]]) -> tuple[bool, str]:
                 continue
             head, *_rest = (p.strip() for p in tok.split(b";"))
             if head == b"permessage-deflate":
-                # We always reply with both no-context-takeover params
-                # — ignores any `server_max_window_bits` / `client_max_window_bits`
-                # the client requested. RFC 7692 lets the server pick a
-                # compatible subset of the offered params.
-                return (True, "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
-    return (False, "")
+                has_pmd_offer = True
+                # Check if client requests context takeover
+                for param in tok.split(b";"):
+                    param_lower = param.strip().lower()
+                    if param_lower == b"server_no_context_takeover":
+                        client_requests_takeover = False
+                    elif param_lower == b"server_max_window_bits":
+                        client_requests_takeover = True
+
+    if not has_pmd_offer:
+        return (False, "")
+
+    # Build response based on our configuration
+    if _PMD_SERVER_TAKEOVER and client_requests_takeover:
+        # Both sides maintain state - best compression
+        return (True, "permessage-deflate")
+    elif _PMD_SERVER_TAKEOVER:
+        # We maintain state, but client doesn't - we must reset anyway
+        return (True, "permessage-deflate; server_no_context_takeover")
+    else:
+        # Default: no context takeover on either side
+        return (True, "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
 
 
-def _pmd_deflate(co: Any, payload: bytes) -> bytes:
+def _pmd_deflate(co: Any, payload: bytes, reuse_compressor: bool = True) -> bytes:
     """RFC 7692 §7.2.1: deflate, append `Z_SYNC_FLUSH`, strip trailing
-    4 sync-bytes (`00 00 ff ff`). With no_context_takeover the encoder
-    is reset to a fresh state every message — we recreate a compressobj
-    each call to avoid sticky state."""
+    4 sync-bytes (`00 00 ff ff`).
+
+    When reuse_compressor is True (default), the compressor state is
+    maintained across messages for better compression on long-running
+    connections. When False, a fresh compressor is created for each
+    message (lower memory, slightly worse compression)."""
     import zlib as _zlib
-    if co is None:
+    # If no existing compressor or we're not reusing, create new one
+    if co is None or not reuse_compressor:
         co = _zlib.compressobj(_PMD_LEVEL, _zlib.DEFLATED, -15)
     out = co.compress(payload) + co.flush(_zlib.Z_SYNC_FLUSH)
     if out.endswith(_PMD_TRAIL):
@@ -977,15 +1015,16 @@ class _WsState:
             elif mtype == "websocket.send":
                 if self.closed:
                     return
+                reuse = _PMD_SERVER_TAKEOVER
                 if message.get("text") is not None:
                     payload = message["text"].encode("utf-8")
                     if self.pmd_active:
-                        payload = _pmd_deflate(self._pmd_deflater, payload)
+                        payload = _pmd_deflate(self._pmd_deflater, payload, reuse)
                     _queue(_build_server_frame(0x1, payload, rsv1=self.pmd_active))
                 elif message.get("bytes") is not None:
                     payload = message["bytes"]
                     if self.pmd_active:
-                        payload = _pmd_deflate(self._pmd_deflater, payload)
+                        payload = _pmd_deflate(self._pmd_deflater, payload, reuse)
                     _queue(_build_server_frame(0x2, payload, rsv1=self.pmd_active))
             elif mtype == "websocket.close":
                 code = int(message.get("code", 1000))
@@ -1053,6 +1092,58 @@ def http_global_pump() -> None:
     _pump_once()
 
 
+def http2_dispatch_start(
+    app: Any,
+    stream_id: int,
+    reserved: int,
+    method: bytes,
+    scheme: bytes,
+    path: bytes,
+    raw_path: bytes,
+    query_string: bytes,
+    headers: list[tuple[bytes, bytes]],
+    initial_body: bytes,
+    more_body: int,
+    server_host: str,
+    server_port: int,
+    server_scheme: str,
+) -> tuple[int, bytes, bool]:
+    """Start an HTTP/2 stream dispatch. Delegates to the existing
+    HTTP/1.1 dispatch path, building an appropriate ASGI scope with
+    http_version='2'. Returns (handle, chunks, done)."""
+    if stream_id < 0 or reserved != 0:
+        return (0, b"", True)
+
+    method_str = method.decode("ascii", errors="replace")
+    scheme_str = scheme.decode("ascii", errors="replace")
+    scheme_final = scheme_str if scheme_str else server_scheme
+
+    return http_dispatch_start(
+        app, method_str, raw_path, path, query_string,
+        headers, initial_body, more_body, server_host,
+        server_port, True, scheme_final,
+        http_version="2",
+    )
+
+
+def http2_dispatch_push_body(
+    handle: int,
+    body: bytes,
+    more_body: bool,
+) -> tuple[bytes, bool]:
+    """Push more body data to an existing HTTP/2 stream.
+    Delegates to the existing HTTP/1.1 push_body path."""
+    return http_dispatch_push_body(handle, body, more_body)
+
+
+def http2_dispatch_drain(
+    handle: int,
+) -> tuple[bytes, bool]:
+    """Drain buffered outgoing data from an HTTP/2 stream.
+    Delegates to the existing HTTP/1.1 drain path."""
+    return http_dispatch_drain(handle)
+
+
 def ws_open(
     app: Any,
     method: str,
@@ -1079,7 +1170,7 @@ def ws_open(
                     Bridge sets `conn.ws_pmd_active` so subsequent
                     rsv1 hints pass through.
     """
-    global _next_ws_handle
+
 
     try:
         path = decoded_path.decode("utf-8")
@@ -1456,6 +1547,24 @@ def set_ws_upgrade_deadline(secs: float) -> None:
     2 s. `<= 0` reverts to the compile-time default."""
     global _WS_UPGRADE_DEADLINE_S
     _WS_UPGRADE_DEADLINE_S = float(secs) if secs and secs > 0 else 2.0
+
+
+def set_ws_compression(level: int, server_takeover: bool, client_takeover: bool) -> None:
+    """v1.9 — configure WebSocket permessage-deflate compression.
+
+    level:           Compression level 1-9 (default 6). Higher = better
+                     compression but more CPU.
+    server_takeover:  If True, maintain compressor state across messages.
+                     Better compression ratio for long connections, adds
+                     ~8KB memory per connection. Default False.
+    client_takeover:  If True, expect client to maintain its compressor.
+                     If False, we always reset after each message regardless
+                     of what client offered. Default False."""
+    global _PMD_LEVEL, _PMD_SERVER_TAKEOVER, _PMD_CLIENT_TAKEOVER
+    if 1 <= level <= 9:
+        _PMD_LEVEL = level
+    _PMD_SERVER_TAKEOVER = bool(server_takeover)
+    _PMD_CLIENT_TAKEOVER = bool(client_takeover)
 
 # v1.7.1 WebSocket post-accept pump. After the consumer calls `accept()`
 # its `connect()` coroutine usually keeps running (group_add, initial DB
@@ -2185,6 +2294,7 @@ def http_dispatch_start(
     server_port: int,
     keep_alive: int,
     scheme: str,
+    http_version: str = "1.1",
 ) -> tuple[int, bytes, bool]:
     """Begin a streaming dispatch. Returns (handle, initial_chunks, done).
 
@@ -2231,7 +2341,7 @@ def http_dispatch_start(
     scope: dict[str, Any] = {
         "type": "http",
         "asgi": _ASGI_HTTP_SUB,
-        "http_version": "1.1",
+        "http_version": http_version,
         "method": method,
         "scheme": effective_scheme,
         "path": path,

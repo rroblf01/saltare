@@ -37,6 +37,7 @@ _DEFAULT_EXCLUDES: tuple[str, ...] = (
     "*/.git/*",
     "*/__pycache__/*",
     "*.pyc",
+    "*.pyo",
     "*/.venv/*",
     "*/venv/*",
     "*/node_modules/*",

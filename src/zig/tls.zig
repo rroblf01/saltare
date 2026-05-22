@@ -51,6 +51,7 @@ const Funcs = struct {
     SSL_CTX_check_private_key: *const fn (*Ctx) callconv(.c) c_int,
     SSL_CTX_load_verify_locations: *const fn (*Ctx, [*c]const u8, [*c]const u8) callconv(.c) c_int,
     SSL_CTX_set_verify: *const fn (*Ctx, c_int, ?*anyopaque) callconv(.c) void,
+    SSL_CTX_set_alpn_protos: *const fn (*Ctx, [*c]const u8, c_uint) callconv(.c) c_int,
     SSL_new: *const fn (*Ctx) callconv(.c) ?*Ssl,
     SSL_free: *const fn (*Ssl) callconv(.c) void,
     SSL_set_fd: *const fn (*Ssl, c_int) callconv(.c) c_int,
@@ -61,6 +62,7 @@ const Funcs = struct {
     SSL_pending: *const fn (*Ssl) callconv(.c) c_int,
     SSL_get_error: *const fn (*Ssl, c_int) callconv(.c) c_int,
     SSL_session_reused: *const fn (*Ssl) callconv(.c) c_int,
+    SSL_get0_alpn_selected: *const fn (*Ssl, [*c][*c]const u8, [*c]c_uint) callconv(.c) void,
 };
 
 const SSL_VERIFY_NONE: c_int = 0x00;
@@ -200,6 +202,12 @@ pub fn newContext(
         _ = f.SSL_CTX_ctrl(ctx, SSL_CTRL_OPTIONS, ktls_bits, null);
     }
 
+    // v1.9: HTTP/2 ALPN support. Advertise "h2" so clients can negotiate
+    // HTTP/2 via TLS ALPN (RFC 7540 Section 3.3). The wire format is
+    // length-prefixed: 0x02 'h' '2'.
+    const alpn_proto = "\x02h2";
+    _ = f.SSL_CTX_set_alpn_protos(ctx, alpn_proto.ptr, @as(c_uint, alpn_proto.len));
+
     return ctx;
 }
 
@@ -286,6 +294,19 @@ pub fn pending(ssl: *Ssl) usize {
 pub fn sessionReused(ssl: *Ssl) bool {
     const f = funcs orelse return false;
     return f.SSL_session_reused(ssl) != 0;
+}
+
+/// v1.9: Return the negotiated ALPN protocol after a successful TLS
+/// handshake, or null if no ALPN was negotiated. Typical values: "h2"
+/// (HTTP/2) or "http/1.1" (fallback). The returned slice is valid for
+/// the lifetime of the SSL object.
+pub fn negotiatedAlpn(ssl: *Ssl) ?[]const u8 {
+    const f = funcs orelse return null;
+    var proto: [*c]const u8 = undefined;
+    var proto_len: c_uint = 0;
+    f.SSL_get0_alpn_selected(ssl, &proto, &proto_len);
+    if (proto_len == 0) return null;
+    return proto[0..proto_len];
 }
 
 fn mapError(ssl: *Ssl, ret: c_int) IoStatus {

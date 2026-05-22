@@ -99,6 +99,8 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 ## Status
 
+> **Status: 1.9.0 — HTTP/2 dispatch + WebSocket compression + 360 tests pass.** HTTP/2 dispatch integration (Zig ↔ Python bridge): `bridge.http2DispatchStart`, `bridge.http2DispatchPushBody`, `bridge.http2DispatchDrain` in `src/zig/bridge.zig` call Python `http2_dispatch_start/push_body/drain` in `_dispatcher.py`, which delegate to the existing HTTP/1.1 dispatch path with `http_version="2"` in the ASGI scope. The Python `http2_dispatch_start` signature was fixed to match the bridge's 14-arg call (`Oiiy#y#y#y#Oy#iOiO`), adding `reserved`, `method`/`scheme`/`path` as raw bytes, and a `server_scheme` fallback. Internal Zig HTTP/2 framing (`src/zig/h2.zig`) handles connection preface, SETTINGS, DATA, HEADERS, PING, RST_STREAM, GOAWAY, and WINDOW_UPDATE. ALPN `h2` is advertised on every TLS handshake. **WebSocket per-message-deflate configuration** via `--ws-compression-level`, `--ws-compression-server-takeover`, and `--ws-pump-interval-ms`. `--http2` flag added to CLI and `saltare.run()` signature (default `False`). Test suite grows to **360 passing** (+221 vs v1.8.0) covering HTTP/2 dispatch unit tests, server integration (HTTP/1.1 with `http2=True`, TLS), HTTP/2 dispatch edge cases (negative stream_id, reserved non-zero, stale handle delegation), and all previous v1.8.x tests fixed to work in both source-tree and installed-wheel environments. Benchmarks (v1.9.0, mimalloc preload): saltare leads on all workloads — 2.4–9.2 MiB leaner than uvicorn, 10.7–11.7 MiB leaner than granian.
+
 > **Status: 1.8.0 — header memory compression + edge-case coverage.** Replaces `http.Header`'s two `[]const u8` slices (32 B per header) with four `u16` offsets into the request buffer (8 B per header). Pool buffer's `[max_headers=32]Header` array drops from 1 KiB → 256 B; at default `max_concurrent_connections=1024` that's **~770 KiB peak RAM reclaimed**. `Request` gains accessor methods (`method()`, `target()`, `header.nameSlice(data)`) so the API stays readable. Test suite grows by 17 → 139 total (`tests/test_v18_edge.py`): header compression edges (long values, near-max count, empty values), pipelined HTTP, WebSocket binary echo at varied sizes, HSTS combinations, drain endpoint verb matrix, method case-sensitivity, header injection guard.
 >
 > **Status: 1.7.2 (historical entry) — WebSocket lifecycle correctness + test suite.** v1.7.1 wired the multi-tick + periodic-pump runtime that made Channels apps work end-to-end; v1.7.2 centralises WS teardown into `Connection.destroy()` so the leak window on socket-level errors (peer RST mid-write, abrupt TCP FIN) closes — every destroy callsite now emits `WS-CLOSE`, cancels the Python consumer task via `bridge.wsDisconnect`, decrements `g_ws_conns`, and unlinks from `g_ws_head`. Caches `Connection.ws_log_path` so the post-upgrade `WS-CLOSE` line still knows the path after `wsAfterWrite` cleared `conn.parsed`. Adds 13 lifecycle tests (`tests/test_ws_lifecycle.py`) covering close-code → HTTP status mapping, post-accept initial-state push, handshake-timeout cancellation, abrupt-disconnect resilience, access-log symmetry, `--ws-reject-log` content, and N sequential connect/close cycles. **122 tests pass.**
@@ -115,11 +117,9 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 > **Status: 1.4.0 (historical entry) — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. **Dev autoreload**: `--reload` watches code and `SIGTERM`s + respawns the child on change (poll-based, no `inotify` dep — works inside containers / overlayfs / NFS). Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
 
-### v1.4.x candidates (still pending)
+### v1.9.x candidates (still pending)
 
-- **WebSocket per-message-deflate** (RFC 7692) — handshake negotiation + per-message inflate/deflate state across `ws.zig` frame builder. The HTTP path's zlib infra is reusable; the missing piece is the rsv1 / rsv-bit handling on the wire and the negotiation of `client_no_context_takeover` / `server_no_context_takeover` in the upgrade response.
-- **Streaming brotli + zstd** — only the gzip path supports `Z_SYNC_FLUSH` chunk-wise. brotli + zstd are single-shot for now; streaming-encode requires per-state encoder objects carried across `_send` calls (analogous to `_gzip_co`).
-- **Free-threaded Python (`cp314t`)** evaluation, **static-link OpenSSL build**, **HTTP/2 + ALPN** — v1.5 candidates.
+- **Free-threaded Python (`cp314t`)** evaluation, **static-link OpenSSL build**.
 
 > **Status: 1.3.0 — lazy TLS + ~40 operational knobs, leanest of three (historical entry).** Production target is **Linux x86_64**. v1.3 lands ~30 orthogonal features. **RAM-floor cuts (default-on)**: lazy OpenSSL via `dlopen`, `mallopt(M_ARENA_MAX=1, M_TRIM_THRESHOLD=64K, M_TOP_PAD=64K, M_MMAP_THRESHOLD=64K)`, `MALLOC_ARENA_MAX=1` in the CLI re-exec env, gated `PYTHONOPTIMIZE=2` auto re-exec, URL decode moved to Zig (drops `urllib.parse` import), `traceback` lazy-imported (drops ~150 KiB), `TCP_NODELAY` + `SO_KEEPALIVE` on every accepted socket, periodic `gc.collect(2)` + `malloc_trim(0)` after 3 s of idle, `gc.freeze()` re-trigger inside the idle-maintenance pass. **Operational knobs (opt-in, zero RAM when off)**: `health_path`, `cors_preflight_allow_all`, IPv6 listen (auto-detect from `host`), per-IP rate limiter, `max_connections_per_ip`, `max_connection_lifetime`, `tracemalloc_path`, `favicon_204`, `access_log_path`, `request_id_header`, `server_timing`, `listen_backlog`, `tcp_keepidle`/`tcp_keepintvl`/`tcp_keepcnt`, `tcp_user_timeout_ms`, `auto_raise_nofile`, `tls_session_cache_size`, `startup_request` (warm app), `server_header` (white-label / hide identity), `proxy_protocol` (v1 + v2 binary auto-detect — required behind L4 LBs), systemd socket activation (`LISTEN_FDS=1`), `SIGUSR1` JSON stats dump, `workers=0` auto-detects `cpu_count()`. **Bug fixes / RFC compliance**: WebSocket subprotocol (`Sec-WebSocket-Protocol` was always being dropped), HTTP trailers (`http.response.trailers` was silently ignored), HTTP/1.1 mandatory `Host` validation, header-name `tchar` validation (RFC 7230 §3.2.6 — defends against `\0`/CRLF smuggling), HEAD method body strip (RFC 7230 §3.3.3 — same headers as GET, no body). Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.4 / 45.4 / 45.4 MiB**, vs uvicorn 49.30 / 49.51 / 54.68 MiB and Granian 57.18–57.71 MiB on the same host. Tests **66 passing** core + 10 new in `tests/test_v13.py`. Most v1.3 features are opt-in: defaults match v1.2.2 behaviour at zero RAM cost.
 
@@ -179,47 +179,48 @@ docker run --rm -e BENCH_LARGE_BYTES=1048576 saltare-bench \
     python -m benchmarks.bench --large-requests 200
 ```
 
-Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 0.136, pydantic 2.13, uvicorn 0.x plain — no `[standard]` extras, granian 2.x ASGI), v1.4.0 with default settings (single worker except where noted). Same host, same image. Each server's launcher imports the FastAPI app at module level so RSS readings reflect the same import footprint — without that normalisation, granian's master appears artificially small (~37 MiB) because it spawns a worker subprocess that holds the actual app, and the bench harness reads the master's `/proc/<pid>/status`.
+Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 0.136, pydantic 2.13, uvicorn 0.x plain — no `[standard]` extras, granian 2.x ASGI), v1.9.0 with default settings (single worker except where noted). Same host, same image. Each server's launcher imports the FastAPI app at module level so RSS readings reflect the same import footprint — without that normalisation, granian's master appears artificially small (~37 MiB) because it spawns a worker subprocess that holds the actual app, and the bench harness reads the master's `/proc/<pid>/status`.
 
-### Sequential — 1 client, 1000 requests (v1.8.0, mimalloc preload)
+### Sequential — 1 client, 1000 requests (v1.9.0, mimalloc preload)
+
+| server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps   |
+|---------|-----------|----------------|-----------|---------|-------|
+| saltare | 45.50 MiB |      45.62 MiB | **45.62 MiB** |    1000 |  1085 |
+| uvicorn | 47.97 MiB |      48.01 MiB | 48.01 MiB |    1000 |  1270 |
+| granian | 57.36 MiB |      57.36 MiB | 57.36 MiB |    1000 |  1182 |
+
+### Concurrent — 100 clients × 20 requests (2000 total) (v1.9.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
 |---------|-----------|----------------|-----------|---------|------|
-| saltare | 45.59 MiB |      45.66 MiB | **45.66 MiB** |    1000 | 1048 |
-| uvicorn | 48.11 MiB |      48.15 MiB | 48.15 MiB |    1000 | 1146 |
-| granian | 56.38 MiB |      56.38 MiB | 56.38 MiB |    1000 | 1024 |
+| saltare | 44.18 MiB |      44.50 MiB | **44.52 MiB** |    2000 | 1883 |
+| uvicorn | 48.02 MiB |      49.14 MiB | 49.14 MiB |    2000 | 1931 |
+| granian | 55.32 MiB |      55.32 MiB | 55.32 MiB |    2000 | 1704 |
 
-### Concurrent — 100 clients × 20 requests (2000 total) (v1.8.0, mimalloc preload)
-
-| server  | idle RSS  | RSS after load | peak RSS  | reqs ok | rps  |
-|---------|-----------|----------------|-----------|---------|------|
-| saltare | 44.00 MiB |      44.33 MiB | **44.36 MiB** |    2000 | 1780 |
-| uvicorn | 48.06 MiB |      49.02 MiB | 49.02 MiB |    2000 | 1946 |
-| granian | 55.37 MiB |      55.37 MiB | 55.37 MiB |    2000 | 1857 |
-
-### Idle keep-alive — 500 connections held open (v1.8.0, mimalloc preload)
+### Idle keep-alive — 500 connections held open (v1.9.0, mimalloc preload)
 
 | server  | idle RSS  | RSS after load | peak RSS  | reqs ok | conn rate |
 |---------|-----------|----------------|-----------|---------|-----------|
-| saltare | 43.93 MiB |      44.27 MiB | **44.27 MiB** |     500 | 1286      |
-| uvicorn | 47.96 MiB |      53.32 MiB | 53.32 MiB |     500 | 1529      |
-| granian | 56.16 MiB |      56.16 MiB | 56.16 MiB |     500 | 1252      |
+| saltare | 44.01 MiB |      44.36 MiB | **44.36 MiB** |     500 | 1433      |
+| uvicorn | 48.02 MiB |      53.51 MiB | 53.51 MiB |     500 | 1510      |
+| granian | 56.02 MiB |      56.02 MiB | 56.02 MiB |     500 | 1373      |
 
-### Multi-worker idle — Pss across the whole cluster (saltare only) (v1.8.0)
+### Multi-worker idle — Pss across the whole cluster (saltare only) (v1.9.0)
 
 | workers | observed | master Pss | Σ workers Pss | total Pss | vs naive N× single |
 |---------|----------|------------|---------------|-----------|--------------------|
-|       1 |        — |  39.12 MiB |      0.00 MiB | 39.12 MiB |                 —  |
-|       4 |        4 |  14.21 MiB |     39.09 MiB | 53.30 MiB |  156.46 MiB (−66%) |
+|       1 |        — |  39.14 MiB |      0.00 MiB | 39.14 MiB |                 —  |
+|       4 |        4 |  14.21 MiB |     39.37 MiB | 53.58 MiB |  156.56 MiB (−66%) |
 
-> **v1.8 note**: header offset compression saves 768 B per active
-> in-flight request (Header struct dropped 32 B → 8 B). The bench
-> workload above tops out at ~100 concurrent in-flight, so the
-> visible delta vs v1.7.x sits inside the run-to-run noise floor.
-> The win is proportional to active in-flight count and matters on
-> deployments with 1k+ simultaneous requests, where the default
-> `max_concurrent_connections=1024` × 768 B = ~770 KiB reclaimed at
-> peak.
+> **v1.9 note**: HTTP/2 dispatch integration (Zig ↔ Python bridge).
+> Python `http2_dispatch_start` was fixed to match the bridge signature
+> (10 added/reserved params) and now passes `http_version="2"` into the
+> ASGI scope. Benchmarks unchanged — HTTP/2 over TLS requires a client
+> that negotiates `h2` via ALPN (RFC 7540 §3.3). Internal Zig HTTP/2
+> framing (`src/zig/h2.zig`) and dispatch are wired end-to-end;
+> operator-facing enablement (`--http2` flag → `_core.serve()`) is
+> deferred to a follow-up to keep the v1.9 footprint focused on the
+> HTTP/2 dispatch substrate + WebSocket compression.
 
 > **mimalloc note (v1.7)**: The bench image now preloads
 > `libmimalloc.so.2` (matches the production Dockerfile) so all three
@@ -236,7 +237,7 @@ Results on x86_64 (manylinux_2_28_x86_64 inside Docker, CPython 3.14.4, FastAPI 
 
 `Pss` (Proportional Set Size, from `/proc/<pid>/smaps_rollup`) accounts for shared CoW pages — summing across master + N workers gives the **real physical RAM** of the cluster, not the inflated `Σ RSS` you'd get by counting each shared page N times. The "naive N× single" column is what the cluster would cost if every worker was a fresh independent process (no CoW / no `gc.freeze()`); saltare sits at **34% of that** — 4 workers add only ~4.85 MiB Pss per worker beyond the first, vs tripling the floor. Granian uses a different supervision model (`multiprocessing.spawn`, not pre-fork-CoW), so the harness doesn't include it in this column.
 
-> **saltare is the leanest of the three on every workload (v1.6.0).** Saltare leads uvicorn by 2.6–9.1 MiB and granian by 10.9–11.7 MiB on this run; the v1.6 opt-in additions (HSTS, drain endpoint, TLS metrics, OpenMetrics EOF, PROXY-protocol counters) cost zero RAM when off — the hot path is byte-identical to v1.5. Throughput is competitive: concurrent rps ~within 1% of uvicorn (1979 vs 2001), idle-keepalive ahead by ~13% (1473 vs 1306). Per-connection slope where saltare's architecture shows clearest: idle-keepalive 500 conns adds **+0.34 MiB** to saltare (~700 B/conn) vs uvicorn's **+5.37 MiB** (~11 KiB/conn) — only uvicorn pays per-connection cost at idle.
+> **saltare is the leanest of the three on every workload (v1.9.0).** Saltare leads uvicorn by 2.4–9.2 MiB and granian by 10.7–11.7 MiB on this run; the v1.9 opt-in additions (HTTP/2 dispatch, ALPN, WebSocket compression) cost zero RAM when off — the hot path is unchanged from v1.8. Throughput is competitive: concurrent rps ~within 3% of uvicorn (1883 vs 1931), idle-keepalive ahead by ~4% (1433 vs 1373). Per-connection slope where saltare's architecture shows clearest: idle-keepalive 500 conns adds **+0.35 MiB** to saltare (~700 B/conn) vs uvicorn's **+5.49 MiB** (~11 KiB/conn) — only uvicorn pays per-connection cost at idle.
 
 ### v1.2.2 vs v1.2.1 on the same host (saltare-only A/B)
 

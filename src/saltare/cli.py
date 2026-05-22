@@ -18,9 +18,9 @@ def _is_saltare_main_entry() -> bool:
     base = os.path.basename(arg0)
     # pip's console_scripts wrapper is named exactly "saltare" (or
     # "saltare-script.py" on Windows). Strip a trailing extension to
-    # match either form.
+    # match both forms.
     base_stem = base.split(".")[0] if base else ""
-    if base_stem == "saltare":
+    if base_stem == "saltare" or base_stem == "saltare-script":
         return True
     # `python -m saltare` resolves argv[0] to the saltare package's
     # __main__.py, e.g. `/.../site-packages/saltare/__main__.py`.
@@ -93,7 +93,12 @@ def _load_app(target: str) -> Any:
             f"invalid app target: {target!r} (expected 'module:attribute')"
         )
     sys.path.insert(0, "")
-    module = importlib.import_module(module_name)
+    try:
+        module = importlib.import_module(module_name)
+    except ImportError as exc:
+        raise SystemExit(
+            f"cannot import module {module_name!r}: {exc}"
+        ) from exc
     try:
         return getattr(module, attr)
     except AttributeError as exc:
@@ -123,6 +128,9 @@ def _check_config(path: str) -> int:
             text = f.read()
     except OSError as exc:
         sys.stderr.write(f"saltare check-config: cannot open {path!r}: {exc}\n")
+        return 1
+    except UnicodeDecodeError as exc:
+        sys.stderr.write(f"saltare check-config: file {path!r} is not valid UTF-8: {exc}\n")
         return 1
     bad = 0
     seen = 0
@@ -416,6 +424,14 @@ def main(argv: list[str] | None = None) -> None:
         help="run gc.collect(0) every N completed dispatches (0 = leave-alone)",
     )
     parser.add_argument(
+        "--http-pool-max", type=int, default=128, metavar="N",
+        help="max HTTP state objects to pool (0 disables, default 128)",
+    )
+    parser.add_argument(
+        "--http2", action="store_true",
+        help="enable HTTP/2 support (ALPN required for TLS, default disabled)",
+    )
+    parser.add_argument(
         "--response-gzip", action="store_true",
         help="gzip-encode single-shot responses when client sent Accept-Encoding: gzip (lazy libz)",
     )
@@ -516,6 +532,10 @@ def main(argv: list[str] | None = None) -> None:
         help="POST/PUT to PATH (e.g. '/admin/drain') flips the worker into graceful drain — Zig-side intercept (no Python dispatch). Pair with --health-path for k8s rolling deploys.",
     )
     parser.add_argument(
+        "--drain-wait-seconds", type=int, default=5, metavar="N",
+        help="seconds to wait for in-flight requests during drain (default 5)",
+    )
+    parser.add_argument(
         "--access-log-exclude", action="append", default=None, metavar="PATH",
         help="path (request-target, exact match) to skip from --access-log output (repeatable). Typical use: silence noisy probes like /metrics, /healthz, /favicon.ico without losing app-traffic visibility.",
     )
@@ -530,6 +550,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--ws-handshake-timeout", type=float, default=2.0, metavar="SECS",
         help="seconds the WS-upgrade pump waits for the consumer to accept/close (default 2.0). Bump for slow cold-start middleware (long DB warm-up); drop for latency-sensitive deployments.",
+    )
+    parser.add_argument(
+        "--ws-compression-level", type=int, default=6, metavar="N",
+        help="WebSocket permessage-deflate level 1-9 (default 6)",
+    )
+    parser.add_argument(
+        "--ws-compression-server-takeover", action="store_true",
+        help="enable WS context takeover for better compression on long connections (adds ~8KB per connection)",
     )
     parser.add_argument(
         "--version",
@@ -611,6 +639,8 @@ def main(argv: list[str] | None = None) -> None:
         ssl_verify_client=args.ssl_verify_client,
         tcp_fastopen_qlen=args.tcp_fastopen_qlen,
         gc_collect_every_n_requests=args.gc_collect_every_n_requests,
+        http_pool_max=args.http_pool_max,
+        http2=args.http2,
         response_gzip=args.response_gzip,
         response_gzip_min_bytes=args.response_gzip_min_bytes,
         response_gzip_level=args.response_gzip_level,
@@ -639,8 +669,11 @@ def main(argv: list[str] | None = None) -> None:
         hsts_include_subdomains=args.hsts_include_subdomains,
         hsts_preload=args.hsts_preload,
         drain_path=args.drain_path,
+        drain_wait_seconds=args.drain_wait_seconds,
         access_log_exclude=args.access_log_exclude,
         ws_reject_log=args.ws_reject_log,
         ws_pump_interval_ms=args.ws_pump_interval_ms,
         ws_handshake_timeout=args.ws_handshake_timeout,
+        ws_compression_level=args.ws_compression_level,
+        ws_compression_server_takeover=args.ws_compression_server_takeover,
     )

@@ -67,12 +67,18 @@ def _serve(app: Any, port: int, **kwargs) -> None:
 
 
 def _brotli_available() -> bool:
-    from saltare import _core
+    try:
+        from saltare import _core
+    except ImportError:
+        return False
     return _core.brotli_encode(b"probe", 4) is not None
 
 
 def _zstd_available() -> bool:
-    from saltare import _core
+    try:
+        from saltare import _core
+    except ImportError:
+        return False
     return _core.zstd_encode(b"probe", 3) is not None
 
 

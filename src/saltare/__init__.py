@@ -56,6 +56,8 @@ def run(
     ssl_verify_client: bool = False,
     tcp_fastopen_qlen: int = 0,
     gc_collect_every_n_requests: int = 0,
+    http_pool_max: int = 128,
+    http2: bool = False,
     response_gzip: bool = False,
     response_gzip_min_bytes: int = 512,
     response_gzip_level: int = 6,
@@ -81,10 +83,13 @@ def run(
     hsts_include_subdomains: bool = False,
     hsts_preload: bool = False,
     drain_path: str | None = None,
+    drain_wait_seconds: int = 5,
     access_log_exclude: list[str] | tuple[str, ...] | None = None,
     ws_reject_log: bool = False,
     ws_pump_interval_ms: int = 50,
     ws_handshake_timeout: float = 2.0,
+    ws_compression_level: int = 6,
+    ws_compression_server_takeover: bool = False,
 ) -> None:
     """Run an ASGI application under saltare.
 
@@ -230,6 +235,10 @@ def run(
     _dispatcher.set_server_timing(bool(server_timing))
     _dispatcher.set_server_header(server_header)
     _dispatcher.set_gc_collect_every_n(int(gc_collect_every_n_requests))
+    # v1.9 HTTP state pool tuning. Default of 128 covers most concurrency
+    # curves while keeping idle RAM bounded (~75 KiB). Increase for high-
+    # concurrency bursts or reduce to save RAM on low-memory systems.
+    _dispatcher.set_http_pool_max(int(http_pool_max))
     # v1.4 zlib wiring. Both off by default — when off, libz stays unloaded.
     _dispatcher.set_response_gzip(
         bool(response_gzip),
@@ -272,6 +281,12 @@ def run(
     _dispatcher.set_traceparent_propagation(bool(traceparent_propagation))
     # v1.7.1: tunable WS handshake budget (Phase 1 + 2 pump deadline).
     _dispatcher.set_ws_upgrade_deadline(float(ws_handshake_timeout))
+    # v1.9: WebSocket permessage-deflate compression configuration.
+    _dispatcher.set_ws_compression(
+        int(ws_compression_level),
+        bool(ws_compression_server_takeover),
+        False,  # client_takeover - siempre reset desde el servidor por seguridad
+    )
     # v1.6 HSTS. `max_age=0` keeps the header line empty (zero-cost path).
     _dispatcher.set_hsts(
         int(hsts_max_age),

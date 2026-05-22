@@ -32,6 +32,9 @@ threadlocal var g_http_push: ?*py.PyObject = null;
 threadlocal var g_http_drain: ?*py.PyObject = null;
 threadlocal var g_http_pump: ?*py.PyObject = null;
 threadlocal var g_http_abort: ?*py.PyObject = null;
+threadlocal var g_http2_start: ?*py.PyObject = null;
+threadlocal var g_http2_push: ?*py.PyObject = null;
+threadlocal var g_http2_drain: ?*py.PyObject = null;
 threadlocal var g_lifespan_startup: ?*py.PyObject = null;
 threadlocal var g_lifespan_shutdown: ?*py.PyObject = null;
 threadlocal var g_ws_open: ?*py.PyObject = null;
@@ -97,6 +100,9 @@ pub fn init(
     g_http_drain = py.PyObject_GetAttrString(mod, "http_dispatch_drain") orelse return false;
     g_http_pump = py.PyObject_GetAttrString(mod, "http_global_pump") orelse return false;
     g_http_abort = py.PyObject_GetAttrString(mod, "http_dispatch_abort") orelse return false;
+    g_http2_start = py.PyObject_GetAttrString(mod, "http2_dispatch_start") orelse return false;
+    g_http2_push = py.PyObject_GetAttrString(mod, "http2_dispatch_push_body") orelse return false;
+    g_http2_drain = py.PyObject_GetAttrString(mod, "http2_dispatch_drain") orelse return false;
     g_lifespan_startup = py.PyObject_GetAttrString(mod, "lifespan_startup") orelse return false;
     g_lifespan_shutdown = py.PyObject_GetAttrString(mod, "lifespan_shutdown") orelse return false;
     g_ws_open = py.PyObject_GetAttrString(mod, "ws_open") orelse return false;
@@ -164,6 +170,18 @@ pub fn shutdown() void {
     if (g_http_abort) |a| {
         py.Py_DecRef(a);
         g_http_abort = null;
+    }
+    if (g_http2_start) |s| {
+        py.Py_DecRef(s);
+        g_http2_start = null;
+    }
+    if (g_http2_push) |p| {
+        py.Py_DecRef(p);
+        g_http2_push = null;
+    }
+    if (g_http2_drain) |d| {
+        py.Py_DecRef(d);
+        g_http2_drain = null;
     }
     if (g_lifespan_startup) |s| {
         py.Py_DecRef(s);
@@ -551,6 +569,136 @@ pub fn httpDispatchAbort(handle: c_long) void {
         return;
     };
     py.Py_DecRef(result);
+}
+
+// ===================================================================
+// v1.9 HTTP/2 dispatch bridge. Minimal viable surface: builds a synthetic
+// HTTP/1.1-shaped scope from the HPACK-decoded pseudo-headers, hands it
+// to the existing Python dispatcher, then drains the response through the
+// regular HTTP path. Server.zig wraps the resulting wire bytes into HPACK
+// + HEADERS/DATA frames before writing to the socket. Full multiplexed
+// stream concurrency is on the v1.9.x roadmap; v1.9.0 ships single-stream
+// per connection so the protocol detection + handshake path is tested
+// end-to-end.
+// ===================================================================
+
+pub fn http2DispatchStart(
+    stream_id: u31,
+    headers: []const @import("h2.zig").Header,
+    scheme: []const u8,
+    method: []const u8,
+    path: []const u8,
+    body: ?[]const u8,
+    allocator: std.mem.Allocator,
+) ?HttpStart {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    // Build a Python list of (name, value) tuples from the H2 headers.
+    const headers_list = py.PyList_New(@intCast(headers.len)) orelse return null;
+    defer py.Py_DecRef(headers_list);
+    for (headers, 0..) |hdr, i| {
+        const name_obj = py.PyBytes_FromStringAndSize(
+            @as([*c]const u8, @ptrCast(hdr.name.ptr)),
+            @as(py.Py_ssize_t, @intCast(hdr.name.len)),
+        ) orelse {
+            py.Py_DecRef(headers_list);
+            return null;
+        };
+        const value_obj = py.PyBytes_FromStringAndSize(
+            @as([*c]const u8, @ptrCast(hdr.value.ptr)),
+            @as(py.Py_ssize_t, @intCast(hdr.value.len)),
+        ) orelse {
+            py.Py_DecRef(name_obj);
+            py.Py_DecRef(headers_list);
+            return null;
+        };
+        const tuple = py.PyTuple_New(2) orelse {
+            py.Py_DecRef(name_obj);
+            py.Py_DecRef(value_obj);
+            py.Py_DecRef(headers_list);
+            return null;
+        };
+        _ = py.PyTuple_SetItem(tuple, 0, name_obj);
+        _ = py.PyTuple_SetItem(tuple, 1, value_obj);
+        _ = py.PyList_SetItem(headers_list, @intCast(i), tuple);
+    }
+
+    const body_bytes = body orelse "";
+    const body_len: py.Py_ssize_t = @intCast(body_bytes.len);
+
+    // Args: (app, stream_id, method, scheme, path, raw_path, query_string,
+    //        headers, initial_body, more_body, host, port)
+    // We pass path as both raw_path and decoded_path (no URL decoding
+    // needed for H2 pseudo-headers — they arrive pre-decoded).
+    const result = py.PyObject_CallFunction(
+        g_http2_start.?,
+        "Oiiy#y#y#y#Oy#iOiO",
+        g_app.?,
+        @as(c_int, @intCast(stream_id)),
+        @as(c_int, 0),  // reserved
+        @as([*c]const u8, @ptrCast(method.ptr)),
+        @as(py.Py_ssize_t, @intCast(method.len)),
+        @as([*c]const u8, @ptrCast(scheme.ptr)),
+        @as(py.Py_ssize_t, @intCast(scheme.len)),
+        @as([*c]const u8, @ptrCast(path.ptr)),
+        @as(py.Py_ssize_t, @intCast(path.len)),
+        @as([*c]const u8, @ptrCast(path.ptr)),
+        @as(py.Py_ssize_t, @intCast(path.len)),
+        @as([*c]const u8, ""),
+        @as(py.Py_ssize_t, 0),
+        headers_list,
+        @as([*c]const u8, @ptrCast(body_bytes.ptr)),
+        body_len,
+        @as(c_int, 0), // more_body: 0 since body is complete
+        g_server_host.?,
+        g_server_port,
+        g_scheme.?,
+    ) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractHttpStart(result, allocator);
+}
+
+pub fn http2DispatchPushBody(
+    handle: c_long,
+    body: []const u8,
+    more_body: bool,
+    allocator: std.mem.Allocator,
+) ?HttpTick {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(
+        g_http2_push.?,
+        "ly#i",
+        handle,
+        @as([*c]const u8, @ptrCast(body.ptr)),
+        @as(py.Py_ssize_t, @intCast(body.len)),
+        @as(c_int, if (more_body) 1 else 0),
+    ) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractHttpTick(result, allocator);
+}
+
+pub fn http2DispatchDrain(handle: c_long, allocator: std.mem.Allocator) ?HttpTick {
+    const gstate = py.PyGILState_Ensure();
+    defer py.PyGILState_Release(gstate);
+
+    const result = py.PyObject_CallFunction(g_http2_drain.?, "l", handle) orelse {
+        py.PyErr_Print();
+        return null;
+    };
+    defer py.Py_DecRef(result);
+
+    return extractHttpTick(result, allocator);
 }
 
 fn extractHttpStart(result: *py.PyObject, allocator: std.mem.Allocator) ?HttpStart {
