@@ -904,7 +904,7 @@ fn emitWsAccessLog(conn: *Connection, kind: []const u8, code: u16, bytes_sent: u
     // `wsAfterWrite` clears `parsed` to reuse the buffer between WS
     // frames, so a destroy() that fires post-upgrade would otherwise
     // see `parsed == null` and skip the log line entirely.
-    const target: []const u8 = if (conn.ws_log_path) |p|
+    const target: []const u8 = if (conn.data.websocket.log_path) |p|
         p
     else if (conn.parsed) |req|
         req.target()
@@ -1953,6 +1953,30 @@ const ConnState = enum {
 
 const Protocol = enum { http, websocket };
 
+/// WebSocket-only state stored in a tagged union alongside the http
+/// `void` variant so HTTP connections pay zero bytes for WS fields.
+/// ~52 B saved per HTTP conn; at 1024 idle connections ~52 KiB.
+const WsState = struct {
+    /// Opaque handle returned by Python's `ws_open`.
+    handle: c_long = 0,
+    /// Opcode of the first frame in a fragmented message.
+    frag_opcode: u8 = 0,
+    /// rsv1 of the first frame (RFC 7692 per-message-deflate hint).
+    frag_rsv1: bool = false,
+    /// Heap-allocated reassembly buffer.
+    frag_buf: ?[]u8 = null,
+    /// Bytes in frag buffer.
+    frag_len: usize = 0,
+    /// Per-message-deflate negotiated.
+    pmd_active: bool = false,
+    /// Singly-linked list pointer for g_ws_head chain.
+    list_next: ?*Connection = null,
+    /// Cached request-target copy for WS-CLOSE log lines.
+    log_path: ?[]u8 = null,
+    /// CLOCK_MONOTONIC ns of last inbound WS activity.
+    last_activity_ns: i64 = 0,
+};
+
 const Connection = struct {
     fd: c_int,
     state: ConnState,
@@ -2011,12 +2035,13 @@ const Connection = struct {
     /// Set when accept() handed us a TLS-bound fd. Null for plaintext.
     ssl: ?*tls.Ssl,
 
-    /// Started as `.http`. Switches to `.websocket` after a successful
-    /// upgrade handshake; from then on we parse WS frames instead of HTTP.
-    protocol: Protocol,
-    /// Opaque handle returned by Python's `ws_open` for the upgraded
-    /// connection. 0 while protocol == .http.
-    ws_handle: c_long,
+    /// Tagged union: `.http` (void) or `.websocket` (WsState).
+    /// HTTP connections pay zero RAM for WS state (~52 B saved per HTTP conn).
+    /// The tag doubles as the protocol discriminator.
+    data: union(Protocol) {
+        http: void,
+        websocket: WsState,
+    } = .{ .http = {} },
 
     /// Embedded directly so arming / cancelling is allocation-free. The
     /// wheel manages an intrusive doubly-linked list through this field.
@@ -2063,46 +2088,11 @@ const Connection = struct {
     /// decrement it. False on early sendStatus paths (parse errors).
     request_in_flight: bool,
 
-    /// CLOCK_MONOTONIC ns of the last inbound activity on this connection.
-    /// Updated on every successful WebSocket frame parse; used by the
-    /// WS keepalive logic in `fireExpired` to decide whether to send a
-    /// ping or tear down a silently-dead connection.
-    last_activity_ns: i64,
-
     /// CLOCK_MONOTONIC ns at accept time. Used by `max_connection_lifetime_secs`
     /// to force-close connections past their wall-clock budget — protects
     /// against per-conn state accumulation in long-lived clients beyond
     /// what `max_keepalive_requests` (request-count based) catches.
     accepted_ns: i64,
-
-    // WebSocket fragmentation reassembly (RFC 6455 §5.4). Initial frame
-    // with FIN=0 saves its opcode here; subsequent continuation frames
-    // append to `ws_frag_buf`. The final continuation (FIN=1, opcode=0)
-    // delivers the reassembled message and frees the buffer. Capped to
-    // 1 MiB so a slow producer can't OOM us.
-    ws_frag_opcode: u8,
-    /// rsv1 of the first frame in a fragmented message — RFC 7692
-    /// per-message-deflate sets it on the start frame only; the
-    /// reassembled message inherits the flag.
-    ws_frag_rsv1: bool,
-    ws_frag_buf: ?[]u8,
-    ws_frag_len: usize,
-    /// v1.6 WS per-message-deflate negotiated for this connection.
-    /// Set in `startWebSocket` when the client offered the extension
-    /// and the dispatcher accepted. Used to pass the rsv1 hint to
-    /// the bridge on every inbound message.
-    ws_pmd_active: bool,
-    /// v1.7.1 — singly-linked list of live WS conns rooted at
-    /// `g_ws_head`. Inserted at head on successful WS upgrade, removed
-    /// in `destroy`. Walked each periodic-pump tick to flush
-    /// `_WsState.outgoing` to the wire after `group_send` etc.
-    ws_list_next: ?*Connection,
-    /// v1.7.1 — heap-allocated copy of the upgrade request-target
-    /// kept so `WS-CLOSE` access-log lines (emitted from `destroy`,
-    /// possibly long after `conn.parsed` has been cleared by
-    /// `wsAfterWrite`) still know which path the connection served.
-    /// Owned by `allocator`; freed in `destroy`.
-    ws_log_path: ?[]u8,
 
     // v1.4: request-body streaming state. When the declared
     // `Content-Length` exceeds the read buffer's available space,
@@ -2149,8 +2139,7 @@ const Connection = struct {
             .allocator = allocator,
             .pool = pool,
             .ssl = null,
-            .protocol = .http,
-            .ws_handle = 0,
+            .data = .{ .http = {} },
             .timer_node = .{ .next = null, .prev = null, .bucket = 0, .armed = false },
             .wheel = wheel,
             .dispatch_handle = 0,
@@ -2163,15 +2152,7 @@ const Connection = struct {
             .bytes_sent = 0,
             .request_start_ns = 0,
             .request_in_flight = false,
-            .last_activity_ns = 0,
             .accepted_ns = monoNs(),
-            .ws_frag_opcode = 0,
-            .ws_frag_rsv1 = false,
-            .ws_frag_buf = null,
-            .ws_frag_len = 0,
-            .ws_pmd_active = false,
-            .ws_list_next = null,
-            .ws_log_path = null,
             .body_streaming = false,
             .body_streaming_consumed = 0,
             .h2_conn = null,
@@ -2189,7 +2170,7 @@ const Connection = struct {
         // leaving the Python-side `_WsState` + asyncio Task pinned in
         // memory forever and the log file with a WS-CONNECT but no
         // matching WS-CLOSE — a real leak under churn.
-        if (self.protocol == .websocket) {
+        if (self.data == .websocket) {
             // 1. Access-log line. `wsTeardown` (when it's the caller)
             //    has already emitted this — destroy() is now also a
             //    legal entry point so we emit here too. Duplicate
@@ -2201,36 +2182,38 @@ const Connection = struct {
             //    on `receive_queue.get()` forever; the test_ws_stress
             //    case that simulated 40 dropped connections previously
             //    leaked ~5 KiB Python heap each.
-            if (self.ws_handle != 0) {
-                const final = bridge.wsDisconnect(self.ws_handle, 1006, self.allocator);
+            if (self.data.websocket.handle != 0) {
+                const final = bridge.wsDisconnect(self.data.websocket.handle, 1006, self.allocator);
                 if (final.len > 0) self.allocator.free(final);
-                self.ws_handle = 0;
+                self.data.websocket.handle = 0;
             }
+            // Free frag buffer before transitioning the union.
+            if (self.data.websocket.frag_buf) |b| self.allocator.free(b);
             // 3. Decrement live-WS counter + unlink from g_ws_head.
             _ = g_ws_conns.fetchSub(1, .seq_cst);
             if (g_ws_head == self) {
-                g_ws_head = self.ws_list_next;
+                g_ws_head = self.data.websocket.list_next;
             } else {
                 var prev = g_ws_head;
                 while (prev) |p| {
-                    if (p.ws_list_next == self) {
-                        p.ws_list_next = self.ws_list_next;
+                    if (p.data.websocket.list_next == self) {
+                        p.data.websocket.list_next = self.data.websocket.list_next;
                         break;
                     }
-                    prev = p.ws_list_next;
+                    prev = p.data.websocket.list_next;
                 }
             }
-            self.ws_list_next = null;
+            self.data.websocket.list_next = null;
             // Release the cached log path AFTER the WS-CLOSE line
             // above has read it.
-            if (self.ws_log_path) |p| {
+            if (self.data.websocket.log_path) |p| {
                 self.allocator.free(p);
-                self.ws_log_path = null;
+                self.data.websocket.log_path = null;
             }
             // Clear the protocol so a defensive re-entry (e.g. the
             // wsTeardown→destroy chain we still keep for the explicit
             // close path) doesn't double-log / double-disconnect.
-            self.protocol = .http;
+            self.data = .{ .http = {} };
         }
         self.wheel.cancel(&self.timer_node);
         unlinkStalled(self);
@@ -2250,7 +2233,6 @@ const Connection = struct {
         if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b, monoNs());
         if (self.write_buf.len > 0) self.allocator.free(self.write_buf);
-        if (self.ws_frag_buf) |b| self.allocator.free(b);
         _ = c.close(self.fd);
         // Pair the per-IP connection counter inc'd at accept (no-op
         // when the cap was disabled or the peer is UDS).
@@ -2784,14 +2766,14 @@ const TickCtx = struct { loop: *eventloop.Loop };
 
 fn fireExpired(ctx: TickCtx, node: *timer.Node) void {
     const conn: *Connection = @fieldParentPtr("timer_node", node);
-    if (conn.protocol == .websocket) {
+    if (conn.data == .websocket) {
         // WS keepalive: a fire means either "send a ping" or "we've
         // gone too long without any inbound frame, give up". The cutoff
         // is twice the ping interval — one missed pong is a network
         // hiccup, two is a dead connection.
-        const idle_ns = monoNs() - conn.last_activity_ns;
+        const idle_ns = monoNs() - conn.data.websocket.last_activity_ns;
         const close_threshold = @as(i64, @intCast(g_timeouts.ws_keepalive_secs)) * 2 * std.time.ns_per_s;
-        if (conn.last_activity_ns != 0 and idle_ns >= close_threshold) {
+        if (conn.data.websocket.last_activity_ns != 0 and idle_ns >= close_threshold) {
             wsTeardown(ctx.loop, conn);
             return;
         }
@@ -2941,7 +2923,7 @@ fn acceptAll(
 
 fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event) void {
     if (ev.closed) {
-        if (conn.protocol == .websocket) {
+        if (conn.data == .websocket) {
             wsTeardown(loop, conn);
         } else {
             loop.remove(conn.fd);
@@ -3513,7 +3495,7 @@ fn epollWantWrite(loop: *eventloop.Loop, conn: *Connection) void {
 fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
     conn.ensureBuffer() catch {
         // For WS we don't have a clean status path — just close.
-        if (conn.protocol == .websocket) {
+        if (conn.data == .websocket) {
             loop.remove(conn.fd);
             conn.destroy();
             return;
@@ -3522,7 +3504,7 @@ fn doRead(loop: *eventloop.Loop, conn: *Connection) void {
         return;
     };
 
-    switch (conn.protocol) {
+    switch (conn.data) {
         .http => doReadHttp(loop, conn),
         .websocket => doReadWs(loop, conn),
     }
@@ -4099,7 +4081,6 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // (the reject branch sets reason.len = 0 before returning by freeing
     // and not nulling, but we early-return before this defer runs).
     defer if (opened.close_reason.len > 0) conn.allocator.free(opened.close_reason);
-    conn.ws_pmd_active = opened.pmd_active;
 
     if (!opened.accepted) {
         // App rejected by closing without accepting.
@@ -4221,7 +4202,17 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     conn.write_buf = heap;
     conn.write_pos = 0;
     conn.state = .writing;
-    conn.protocol = .websocket;
+    conn.data = .{ .websocket = .{
+        .handle = opened.handle,
+        .frag_opcode = 0,
+        .frag_rsv1 = false,
+        .frag_buf = null,
+        .frag_len = 0,
+        .pmd_active = opened.pmd_active,
+        .list_next = null,
+        .log_path = null,
+        .last_activity_ns = 0,
+    } };
     // v1.7.1: cache request-target now — `wsAfterWrite` clears
     // `conn.parsed` to reuse the buffer between frames, so the
     // WS-CLOSE log emitted from `destroy` later wouldn't otherwise
@@ -4229,26 +4220,25 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // failed dup just means no path in the close log (still
     // emitted; the brackets carry an empty string).
     if (conn.allocator.dupe(u8, req.target())) |dup| {
-        conn.ws_log_path = dup;
+        conn.data.websocket.log_path = dup;
     } else |_| {}
     // v1.7.1: count this live WS conn so the main loop knows to keep
     // pumping the asyncio loop for `channel_layer.group_send` etc.
     _ = g_ws_conns.fetchAdd(1, .seq_cst);
     // Link into `g_ws_head` so `drainWsOutbound` can flush this conn.
-    conn.ws_list_next = g_ws_head;
+    conn.data.websocket.list_next = g_ws_head;
     g_ws_head = conn;
     // v1.7.1: WS-CONNECT access-log line, parity with daphne's
     // `WSCONNECT` event. Emitted after the 101 head is queued so
     // operators can pair connect/close lines in the same log file
     // they already grep for HTTP traffic.
     emitWsAccessLog(conn, "WS-CONNECT", 101, 0);
-    conn.ws_handle = opened.handle;
     // If the app already finished (called close right after accept), close
     // after we drain the frames; otherwise stay alive.
     conn.keep_alive = !opened.done;
     // Replace the HTTP-phase timer with the WebSocket keepalive cadence.
     // `fireExpired`'s WS branch handles ping-or-teardown logic.
-    conn.last_activity_ns = monoNs();
+    conn.data.websocket.last_activity_ns = monoNs();
     conn.armTimer(g_timeouts.ws_keepalive_secs);
 
     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
@@ -4288,7 +4278,7 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
             }
         }
 
-        if (conn.protocol == .websocket) {
+        if (conn.data == .websocket) {
             wsAfterWrite(loop, conn);
             return;
         }
@@ -4399,7 +4389,7 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                     ws.unmask(payload, hdr.mask_key);
                     // Inbound frame counts as activity for the keepalive
                     // gate — including pongs from earlier server pings.
-                    conn.last_activity_ns = monoNs();
+                    conn.data.websocket.last_activity_ns = monoNs();
                     // RFC 6455 §5.4: fragmented messages span multiple
                     // frames. Control frames (opcode ≥ 8) interleave
                     // and aren't allowed to be fragmented.
@@ -4427,30 +4417,30 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                                 wsTeardown(loop, conn);
                                 return;
                             }
-                            const assembled_op = conn.ws_frag_opcode;
-                            const assembled = conn.ws_frag_buf.?[0..conn.ws_frag_len];
+                            const assembled_op = conn.data.websocket.frag_opcode;
+                            const assembled = conn.data.websocket.frag_buf.?[0..conn.data.websocket.frag_len];
                             // Hand off to wsDeliverToApp; it copies
                             // bytes to the Python side, so freeing
                             // after is safe.
-                            wsDeliverToApp(loop, conn, assembled_op, assembled, conn.ws_frag_rsv1);
-                            conn.allocator.free(conn.ws_frag_buf.?);
-                            conn.ws_frag_buf = null;
-                            conn.ws_frag_len = 0;
-                            conn.ws_frag_opcode = 0;
-                            conn.ws_frag_rsv1 = false;
+                            wsDeliverToApp(loop, conn, assembled_op, assembled, conn.data.websocket.frag_rsv1);
+                            conn.allocator.free(conn.data.websocket.frag_buf.?);
+                            conn.data.websocket.frag_buf = null;
+                            conn.data.websocket.frag_len = 0;
+                            conn.data.websocket.frag_opcode = 0;
+                            conn.data.websocket.frag_rsv1 = false;
                             const leftover2 = conn.read_total - total;
                             if (leftover2 > 0) {
                                 std.mem.copyForwards(u8, data[0..leftover2], data[total..total + leftover2]);
                             }
                             conn.read_total = leftover2;
-                            if (conn.protocol != .websocket) return;
+                            if (conn.data != .websocket) return;
                             if (conn.state == .writing) return;
                             continue;
                         }
                         // Single-frame text/binary (FIN=1, opcode 1|2).
                     }
                     handleWsFrame(loop, conn, hdr, payload);
-                    if (conn.protocol != .websocket) return;
+                    if (conn.data != .websocket) return;
 
                     // Compact: shift any bytes past this frame to the start.
                     const leftover = conn.read_total - total;
@@ -4506,29 +4496,29 @@ fn handleWsFragment(conn: *Connection, hdr: ws.Header, payload: []u8) bool {
     const WS_FRAG_MAX: usize = 1024 * 1024; // 1 MiB cap
     if (hdr.opcode_raw == 0) {
         // Continuation frame — must follow a start.
-        if (conn.ws_frag_buf == null) return false;
+        if (conn.data.websocket.frag_buf == null) return false;
     } else if (hdr.opcode_raw == 1 or hdr.opcode_raw == 2) {
         // Start of a new fragmented message — must NOT follow another
         // unfinished start.
-        if (conn.ws_frag_buf != null) return false;
+        if (conn.data.websocket.frag_buf != null) return false;
         const buf = conn.allocator.alloc(u8, @max(payload.len, 4096)) catch return false;
-        conn.ws_frag_buf = buf;
-        conn.ws_frag_len = 0;
-        conn.ws_frag_opcode = hdr.opcode_raw;
-        conn.ws_frag_rsv1 = hdr.rsv1;
+        conn.data.websocket.frag_buf = buf;
+        conn.data.websocket.frag_len = 0;
+        conn.data.websocket.frag_opcode = hdr.opcode_raw;
+        conn.data.websocket.frag_rsv1 = hdr.rsv1;
     } else {
         return false;
     }
-    const new_len = conn.ws_frag_len + payload.len;
+    const new_len = conn.data.websocket.frag_len + payload.len;
     if (new_len > WS_FRAG_MAX) return false;
-    var buf = conn.ws_frag_buf.?;
+    var buf = conn.data.websocket.frag_buf.?;
     if (new_len > buf.len) {
         const grown = conn.allocator.realloc(buf, @min(WS_FRAG_MAX, new_len * 2)) catch return false;
-        conn.ws_frag_buf = grown;
+        conn.data.websocket.frag_buf = grown;
         buf = grown;
     }
-    @memcpy(buf[conn.ws_frag_len .. conn.ws_frag_len + payload.len], payload);
-    conn.ws_frag_len = new_len;
+    @memcpy(buf[conn.data.websocket.frag_len .. conn.data.websocket.frag_len + payload.len], payload);
+    conn.data.websocket.frag_len = new_len;
     return true;
 }
 
@@ -4578,11 +4568,11 @@ fn drainWsOutbound(loop: *eventloop.Loop) void {
         var node = g_ws_head;
         var target: ?*Connection = null;
         while (node) |conn| {
-            if (conn.ws_handle == entry.handle) {
+            if (conn.data.websocket.handle == entry.handle) {
                 target = conn;
                 break;
             }
-            node = conn.ws_list_next;
+            node = conn.data.websocket.list_next;
         }
         if (target) |conn| {
             if (entry.frames.len > 0) {
@@ -4601,7 +4591,7 @@ fn drainWsOutbound(loop: *eventloop.Loop) void {
 }
 
 fn wsDeliverToApp(loop: *eventloop.Loop, conn: *Connection, opcode: u8, payload: []const u8, rsv1: bool) void {
-    const tick = bridge.wsEvent(conn.ws_handle, opcode, payload, rsv1, conn.allocator) orelse {
+    const tick = bridge.wsEvent(conn.data.websocket.handle, opcode, payload, rsv1, conn.allocator) orelse {
         wsTeardown(loop, conn);
         return;
     };
