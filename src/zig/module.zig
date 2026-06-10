@@ -206,10 +206,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     var access_log_exclude_z: [*c]const u8 = null;
     var ws_reject_log_flag: c_int = 0;
     var ws_pump_interval_ms: c_uint = 50;
+    var http2_flag: c_int = 0;
 
     if (py.PyArg_ParseTuple(
         args,
-        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzzizziI",
+        "Osizz|IIIIIIKIzziIIziIIziiIziiiiiiiIIizziiIIIizzzizziIi",
         &app,
         &host_z,
         &port,
@@ -263,6 +264,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         &access_log_exclude_z,
         &ws_reject_log_flag,
         &ws_pump_interval_ms,
+        &http2_flag,
     ) == 0) {
         return null;
     }
@@ -378,7 +380,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     // serve() time with a clear Python exception, not at first connection.
     var tls_ctx: ?*tls.Ctx = null;
     if (both_set) {
-        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache, ssl_ca_z, ssl_verify_client_flag != 0, ktls_flag != 0) catch |err| {
+        tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache, ssl_ca_z, ssl_verify_client_flag != 0, ktls_flag != 0, http2_flag != 0) catch |err| {
             var msg_buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrintZ(
                 &msg_buf,

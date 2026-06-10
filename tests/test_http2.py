@@ -281,5 +281,154 @@ class TestHttp2Configuration:
         assert "--http2" in src
 
 
+# -----------------------------------------------------------------------
+# Real HTTP/2 wire conformance (v1.12): drive the server with the `h2`
+# sans-IO library over TLS+ALPN and assert it speaks real HTTP/2 — HEADERS
+# frames with HPACK-encoded headers and DATA frames — not HTTP/1.1 bytes.
+# -----------------------------------------------------------------------
+
+h2_conn_mod = pytest.importorskip("h2.connection", reason="needs the `h2` library")
+import h2.config  # noqa: E402
+import h2.events  # noqa: E402
+
+
+async def _sized_app(scope: dict, receive, send) -> None:
+    """Responds with a body whose size is taken from the path (/<n>)."""
+    assert scope["type"] == "http"
+    await receive()
+    n = int(scope["raw_path"].decode().lstrip("/") or "5")
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"application/octet-stream")],
+    })
+    await send({"type": "http.response.body", "body": b"x" * n})
+
+
+async def _body_echo_app(scope: dict, receive, send) -> None:
+    """Echoes the request body back."""
+    assert scope["type"] == "http"
+    body = b""
+    while True:
+        msg = await receive()
+        body += msg.get("body", b"")
+        if not msg.get("more_body", False):
+            break
+    await send({
+        "type": "http.response.start",
+        "status": 200,
+        "headers": [(b"content-type", b"text/plain")],
+    })
+    await send({"type": "http.response.body", "body": body})
+
+
+def _as_str(v) -> str:
+    return v.decode("ascii") if isinstance(v, (bytes, bytearray)) else v
+
+
+def _h2_tls_request(port: int, method: str, path: str, body: bytes | None = None, timeout: float = 5.0):
+    """Perform one HTTP/2 request over TLS+ALPN with the real `h2` client.
+
+    Returns (status:int, headers:list[(str,str)], body:bytes). Skips the test
+    if ALPN can't negotiate h2 on the runtime's OpenSSL.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(["h2"])
+    raw = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    tls = ctx.wrap_socket(raw, server_hostname="localhost")
+    try:
+        if tls.selected_alpn_protocol() != "h2":
+            pytest.skip("ALPN did not negotiate h2 on this OpenSSL build")
+
+        conn = h2_conn_mod.H2Connection(config=h2.config.H2Configuration(client_side=True))
+        conn.initiate_connection()
+        headers = [
+            (":method", method),
+            (":authority", "localhost"),
+            (":scheme", "https"),
+            (":path", path),
+        ]
+        if body is not None:
+            headers.append(("content-length", str(len(body))))
+        conn.send_headers(1, headers, end_stream=(body is None))
+        if body is not None:
+            conn.send_data(1, body, end_stream=True)
+        tls.sendall(conn.data_to_send())
+
+        status: int | None = None
+        resp_headers: list[tuple[str, str]] = []
+        resp_body = b""
+        ended = False
+        tls.settimeout(timeout)
+        while not ended:
+            data = tls.recv(65535)
+            if not data:
+                break
+            for ev in conn.receive_data(data):
+                if isinstance(ev, h2.events.ResponseReceived):
+                    resp_headers = [(_as_str(k), _as_str(v)) for k, v in ev.headers]
+                    for k, v in resp_headers:
+                        if k == ":status":
+                            status = int(v)
+                elif isinstance(ev, h2.events.DataReceived):
+                    resp_body += ev.data
+                    if ev.flow_controlled_length:
+                        conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                elif isinstance(ev, (h2.events.StreamEnded, h2.events.StreamReset)):
+                    ended = True
+            out = conn.data_to_send()
+            if out:
+                tls.sendall(out)
+        return status, resp_headers, resp_body
+    finally:
+        try:
+            tls.close()
+        except OSError:
+            pass
+
+
+class TestHttp2RealClientConformance:
+    """End-to-end: a real h2 client must get valid HTTP/2 frames back."""
+
+    def test_real_h2_get(self, tmp_path: Path):
+        cert, key = _gen_cert(tmp_path)
+        port = _free_port()
+        _serve(_version_app, port, timeout=3.0, ssl_certfile=cert, ssl_keyfile=key, http2=True)
+        status, headers, body = _h2_tls_request(port, "GET", "/")
+        assert status == 200
+        # Real HTTP/2 path → ASGI scope http_version is "2".
+        assert body == b"2", f"expected http_version 2, got {body!r}"
+        # `:status` must be present and be the first header (HPACK pseudo-header).
+        assert headers[0][0] == ":status"
+        # Hop-by-hop headers illegal in HTTP/2 must be absent.
+        names = {k for k, _ in headers}
+        assert "connection" not in names
+        assert "transfer-encoding" not in names
+
+    def test_real_h2_post_body_echo(self, tmp_path: Path):
+        cert, key = _gen_cert(tmp_path)
+        port = _free_port()
+        _serve(_body_echo_app, port, timeout=3.0, ssl_certfile=cert, ssl_keyfile=key, http2=True)
+        payload = b"hello over http/2"
+        status, _headers, body = _h2_tls_request(port, "POST", "/", body=payload)
+        assert status == 200
+        assert body == payload
+
+    def test_real_h2_multi_frame_body(self, tmp_path: Path):
+        """A 60 KiB response spans several DATA frames (max frame 16 KiB) but
+        fits the default 64 KiB flow-control window — validates framing +
+        END_STREAM without needing outbound WINDOW_UPDATE."""
+        cert, key = _gen_cert(tmp_path)
+        port = _free_port()
+        _serve(_sized_app, port, timeout=3.0, ssl_certfile=cert, ssl_keyfile=key, http2=True)
+        n = 60000
+        status, _headers, body = _h2_tls_request(port, "GET", f"/{n}")
+        assert status == 200
+        assert len(body) == n
+        assert body == b"x" * n
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

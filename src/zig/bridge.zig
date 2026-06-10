@@ -589,6 +589,7 @@ pub fn http2DispatchStart(
     method: []const u8,
     path: []const u8,
     body: ?[]const u8,
+    more_body: bool,
     allocator: std.mem.Allocator,
 ) ?HttpStart {
     const gstate = py.PyGILState_Ensure();
@@ -631,9 +632,14 @@ pub fn http2DispatchStart(
     //        headers, initial_body, more_body, host, port)
     // We pass path as both raw_path and decoded_path (no URL decoding
     // needed for H2 pseudo-headers — they arrive pre-decoded).
+    // Format must declare FIVE y# byte-strings before the headers `O`:
+    // method, scheme, path, raw_path, query_string. v1.9 declared only four,
+    // so `O` consumed the query-string char* as a PyObject* and the call
+    // segfaulted — latent because the H2 dispatch path never actually ran
+    // until ALPN h2 negotiation was fixed in v1.11.
     const result = py.PyObject_CallFunction(
         g_http2_start.?,
-        "Oiiy#y#y#y#Oy#iOiO",
+        "Oiiy#y#y#y#y#Oy#iOiO",
         g_app.?,
         @as(c_int, @intCast(stream_id)),
         @as(c_int, 0),  // reserved
@@ -650,7 +656,7 @@ pub fn http2DispatchStart(
         headers_list,
         @as([*c]const u8, @ptrCast(body_bytes.ptr)),
         body_len,
-        @as(c_int, 0), // more_body: 0 since body is complete
+        @as(c_int, if (more_body) 1 else 0), // more DATA frames to follow?
         g_server_host.?,
         g_server_port,
         g_scheme.?,

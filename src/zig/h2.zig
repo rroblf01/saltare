@@ -37,6 +37,12 @@ pub const HTTP2_FLAG_PRIORITY: u8 = 0x20;
 
 pub const HTTP2_MAGIC = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 pub const HTTP2_SETTINGS_ACK = [_]u8{ 0x0, 0x0, 0x0, HTTP2_FRAME_TYPE_SETTINGS, HTTP2_FLAG_ACK, 0x0, 0x0, 0x0, 0x0 };
+// The server connection preface (RFC 7540 §3.5) MUST be a SETTINGS frame and
+// MUST be the first frame the server sends. An empty SETTINGS payload is the
+// minimal valid form — it means "I accept the protocol defaults" and can never
+// be wrong. (Distinct from the ACK above, which acknowledges the *peer's*
+// SETTINGS and is sent only after one arrives.)
+pub const HTTP2_SETTINGS_EMPTY = [_]u8{ 0x0, 0x0, 0x0, HTTP2_FRAME_TYPE_SETTINGS, 0x0, 0x0, 0x0, 0x0, 0x0 };
 
 pub const H2Error = error{
     CompressionError,

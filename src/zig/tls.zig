@@ -52,6 +52,11 @@ const Funcs = struct {
     SSL_CTX_load_verify_locations: *const fn (*Ctx, [*c]const u8, [*c]const u8) callconv(.c) c_int,
     SSL_CTX_set_verify: *const fn (*Ctx, c_int, ?*anyopaque) callconv(.c) void,
     SSL_CTX_set_alpn_protos: *const fn (*Ctx, [*c]const u8, c_uint) callconv(.c) c_int,
+    // Server-side ALPN selection. Unlike SSL_CTX_set_alpn_protos (which is the
+    // *client* offer list), a server picks the protocol from the client's
+    // offer via this callback. Setting only the protos list on a server has no
+    // effect — which is why h2 never negotiated before v1.11.
+    SSL_CTX_set_alpn_select_cb: *const fn (*Ctx, AlpnSelectCb, ?*anyopaque) callconv(.c) void,
     SSL_new: *const fn (*Ctx) callconv(.c) ?*Ssl,
     SSL_free: *const fn (*Ssl) callconv(.c) void,
     SSL_set_fd: *const fn (*Ssl, c_int) callconv(.c) c_int,
@@ -64,6 +69,48 @@ const Funcs = struct {
     SSL_session_reused: *const fn (*Ssl) callconv(.c) c_int,
     SSL_get0_alpn_selected: *const fn (*Ssl, [*c][*c]const u8, [*c]c_uint) callconv(.c) void,
 };
+
+// Server ALPN selection callback type (OpenSSL `SSL_CTX_alpn_select_cb_func`).
+pub const AlpnSelectCb = *const fn (
+    *Ssl,
+    [*c][*c]const u8, // out: selected protocol
+    [*c]u8, // outlen
+    [*c]const u8, // in: client's offered list (length-prefixed)
+    c_uint, // inlen
+    ?*anyopaque, // arg
+) callconv(.c) c_int;
+
+const SSL_TLSEXT_ERR_OK: c_int = 0;
+const SSL_TLSEXT_ERR_NOACK: c_int = 3;
+
+// Pick "h2" from the client's ALPN offer if present; otherwise decline (the
+// handshake then proceeds with no ALPN and saltare serves HTTP/1.1). Only
+// registered when the operator enabled HTTP/2, so an h2-capable client talking
+// to an http2=false server cleanly falls back to 1.1.
+fn alpnSelectH2(
+    ssl: *Ssl,
+    out: [*c][*c]const u8,
+    outlen: [*c]u8,
+    input: [*c]const u8,
+    inlen: c_uint,
+    arg: ?*anyopaque,
+) callconv(.c) c_int {
+    _ = ssl;
+    _ = arg;
+    var i: c_uint = 0;
+    while (i < inlen) {
+        const plen: u8 = input[i];
+        const start = i + 1;
+        if (start + plen > inlen) break;
+        if (plen == 2 and input[start] == 'h' and input[start + 1] == '2') {
+            out.* = input + start;
+            outlen.* = plen;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i = start + plen;
+    }
+    return SSL_TLSEXT_ERR_NOACK;
+}
 
 const SSL_VERIFY_NONE: c_int = 0x00;
 const SSL_VERIFY_PEER: c_int = 0x01;
@@ -146,6 +193,7 @@ pub fn newContext(
     ca_file: [*c]const u8,
     verify_client: bool,
     enable_ktls: bool,
+    enable_http2: bool,
 ) InitError!*Ctx {
     if (!loadFuncs()) return InitError.LibSslNotFound;
     const f = funcs.?;
@@ -202,11 +250,15 @@ pub fn newContext(
         _ = f.SSL_CTX_ctrl(ctx, SSL_CTRL_OPTIONS, ktls_bits, null);
     }
 
-    // v1.9: HTTP/2 ALPN support. Advertise "h2" so clients can negotiate
-    // HTTP/2 via TLS ALPN (RFC 7540 Section 3.3). The wire format is
-    // length-prefixed: 0x02 'h' '2'.
-    const alpn_proto = "\x02h2";
-    _ = f.SSL_CTX_set_alpn_protos(ctx, alpn_proto.ptr, @as(c_uint, alpn_proto.len));
+    // v1.9/v1.11: HTTP/2 ALPN. A *server* selects the protocol from the
+    // client's offer via SSL_CTX_set_alpn_select_cb (RFC 7540 §3.3). v1.9 set
+    // SSL_CTX_set_alpn_protos instead — that is the client-offer API and is a
+    // no-op on a server, so h2 never actually negotiated. Only register the
+    // callback when HTTP/2 is enabled; otherwise the handshake omits ALPN and
+    // the connection serves HTTP/1.1.
+    if (enable_http2) {
+        f.SSL_CTX_set_alpn_select_cb(ctx, &alpnSelectH2, null);
+    }
 
     return ctx;
 }

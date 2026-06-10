@@ -361,4 +361,5 @@ def run(
         (",".join(p for p in access_log_exclude if p) if access_log_exclude else None),
         int(bool(ws_reject_log)),
         int(ws_pump_interval_ms),
+        int(bool(http2)),
     )

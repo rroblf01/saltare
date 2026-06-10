@@ -22,6 +22,7 @@ const tls = @import("tls.zig");
 const ws = @import("ws.zig");
 const timer = @import("timer.zig");
 const h2 = @import("h2.zig");
+const h2_response = @import("h2_response.zig");
 
 const c = @cImport({
     // sys/types.h first so musl's `bits/types/struct_timespec.h` /
@@ -1033,6 +1034,13 @@ fn finishRequest(conn: *Connection) void {
         }
     }
     if (g_obs.access_log and conn.parsed != null) emitAccessLog(conn);
+    // v1.11: tear down the per-stream HTTP/2 response transcoder so the next
+    // stream on a kept-alive H2 connection starts from a clean state.
+    if (conn.h2_resp) |tc| {
+        tc.deinit();
+        conn.allocator.destroy(tc);
+        conn.h2_resp = null;
+    }
 }
 
 /// Read the cgroup memory limit (in bytes) from cgroup v2's
@@ -2143,6 +2151,11 @@ const Connection = struct {
     /// v1.9: pending HTTP/2 upgrade state. Set when a plaintext connection
     /// sends an upgrade request; cleared once the preface is processed.
     h2_upgrade_pending: bool,
+    /// v1.11: per-stream HTTP/1.1→HTTP/2 response transcoder. Created when a
+    /// stream's dispatch starts, freed in finishRequest when its response
+    /// completes (so the next stream on this connection gets a fresh one).
+    /// Null for HTTP/1.1 connections and between H2 streams.
+    h2_resp: ?*h2_response.Transcoder,
 
     fn create(
         allocator: std.mem.Allocator,
@@ -2191,6 +2204,7 @@ const Connection = struct {
             .body_streaming_consumed = 0,
             .h2_conn = null,
             .h2_upgrade_pending = false,
+            .h2_resp = null,
         };
         return conn;
     }
@@ -2263,6 +2277,12 @@ const Connection = struct {
             hc.deinit();
             self.allocator.destroy(hc);
             self.h2_conn = null;
+        }
+        // v1.11: per-stream HTTP/2 response transcoder.
+        if (self.h2_resp) |tc| {
+            tc.deinit();
+            self.allocator.destroy(tc);
+            self.h2_resp = null;
         }
         if (self.ssl) |s| tls.freeSsl(s);
         if (self.read_buf) |b| self.pool.release(b, monoNs());
@@ -2992,7 +3012,19 @@ fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event
         .proxy_pending => if (ev.readable or ev.writable) doProxyV1(loop, conn),
         .handshaking => doHandshake(loop, conn),
         .reading => if (ev.readable or ev.writable) doRead(loop, conn),
-        .http2 => if (ev.readable or ev.writable) doReadHttp2(loop, conn),
+        // HTTP/2 interleaves incoming frames and outgoing response frames on a
+        // single connection (the state never flips to .writing the way HTTP/1.1
+        // does). Route by the event: a writable wake drains queued response
+        // frames through doWrite; otherwise process incoming frames. Without
+        // the writable→doWrite arm, response frames queued in write_buf were
+        // never flushed (doReadHttp2 only reads).
+        .http2 => {
+            if (ev.writable) {
+                doWrite(loop, conn);
+            } else if (ev.readable) {
+                doReadHttp2(loop, conn);
+            }
+        },
         .writing => if (ev.readable or ev.writable) doWrite(loop, conn),
     }
 }
@@ -3344,6 +3376,34 @@ fn acceptHttp2Upgrade(loop: *eventloop.Loop, conn: *Connection, h2_settings: []c
     };
 }
 
+// Append `bytes` to conn.write_buf (a heap buffer owned by conn.allocator),
+// growing it in place. Handles the empty-buffer case. Returns false on OOM.
+fn appendWriteBuf(conn: *Connection, bytes: []const u8) bool {
+    if (bytes.len == 0) return true;
+    if (conn.write_buf.len == 0) {
+        conn.write_buf = conn.allocator.dupe(u8, bytes) catch return false;
+    } else {
+        const old = conn.write_buf.len;
+        const grown = conn.allocator.realloc(conn.write_buf, old + bytes.len) catch return false;
+        conn.write_buf = grown;
+        @memcpy(conn.write_buf[old..], bytes);
+    }
+    return true;
+}
+
+// Feed HTTP/1.1 response bytes produced by the dispatcher into the connection's
+// per-stream HTTP/2 transcoder, appending the resulting HEADERS/DATA frames to
+// write_buf. `done` finalises the stream (emits END_STREAM). Returns false on
+// any error (caller tears the connection down).
+fn h2Transcode(conn: *Connection, h1_bytes: []const u8, done: bool) bool {
+    const tc = conn.h2_resp orelse return false;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(conn.allocator);
+    tc.feed(h1_bytes, &out) catch return false;
+    if (done) tc.finish(&out) catch return false;
+    return appendWriteBuf(conn, out.items);
+}
+
 fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
     const h2c = conn.h2_conn orelse {
         loop.remove(conn.fd);
@@ -3385,8 +3445,12 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
             conn.destroy();
             return;
         };
-        const settings_ack = h2c.buildSettingsAck();
-        _ = connWrite(conn, settings_ack);
+        // Server connection preface (RFC 7540 §3.5): the first frame we send
+        // MUST be our own SETTINGS frame, not an ACK. (The ACK for the client's
+        // SETTINGS goes out below when that frame arrives.) Sending an ACK here
+        // — before any peer SETTINGS exists — is a protocol error that strict
+        // clients (nghttp2 / the `h2` library) reject.
+        _ = connWrite(conn, &h2.HTTP2_SETTINGS_EMPTY);
         // Consume the preface bytes from the buffer. The client's initial
         // SETTINGS frame usually arrives in the same segment right after the
         // magic; leaving the magic in the buffer made the frame loop parse it
@@ -3489,6 +3553,7 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
                 method,
                 path,
                 null, // initial body is null
+                !result.end_stream, // more_body: DATA frames follow unless END_STREAM
                 conn.allocator,
             ) orelse {
                 // If dispatch fails, tear down the connection for now.
@@ -3507,19 +3572,45 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
             conn.bytes_sent = 0;
             conn.request_start_ns = if (g_obs.access_log or g_obs.latency_histogram) monoNs() else 0;
 
+            // Set up the per-stream HTTP/1.1→HTTP/2 response transcoder. The
+            // dispatcher hands us HTTP/1.1-shaped bytes; the transcoder reframes
+            // them as HEADERS + DATA. Sized to the peer's advertised max frame.
+            const tc = conn.allocator.create(h2_response.Transcoder) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            tc.* = h2_response.Transcoder.init(conn.allocator, result.stream_id, h2c.settings.max_frame_size);
+            conn.h2_resp = tc;
+
+            conn.write_pos = 0;
             if (start.chunks.len > 0) {
-                conn.write_buf = start.chunks;
-                conn.write_pos = 0;
-                // First chunk of the response holds the status line.
+                // The status line lives in the HTTP/1.1 bytes — read it for
+                // metrics/access-log before transcoding consumes them.
                 if (conn.response_status == 0) {
                     conn.response_status = parseStatus(start.chunks);
                 }
-                // Since we have chunks, we want to write them.
+                const ok = h2Transcode(conn, start.chunks, start.done);
+                conn.allocator.free(start.chunks);
+                if (!ok) {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                }
+            }
+            // Drive the write path whenever we have frames queued OR the
+            // dispatch is still streaming (the common case: the app runs
+            // asynchronously, so `start` returns no bytes yet and the response
+            // is harvested by doWrite's drain loop / the global pump). Without
+            // this, an async response would never be flushed.
+            if (conn.dispatch_active or conn.write_pos < conn.write_buf.len) {
                 loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
                     conn.destroy();
                     return;
                 };
-            } else if (start.done) {
+            } else {
+                // No bytes and not active — nothing to send (e.g. immediate
+                // abort with an empty body).
                 conn.dispatch_active = false;
                 conn.dispatch_handle = 0;
             }
@@ -3536,14 +3627,18 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
                     conn.destroy();
                     return;
                 };
-                if (tick.chunks.len > 0) {
-                    // Append to write_buf instead of replacing, as HTTP/2 can interleave frames.
-                    conn.write_buf = conn.allocator.realloc(conn.write_buf, conn.write_buf.len + tick.chunks.len) catch {
-                         conn.destroy();
-                         return;
-                    };
-                    @memcpy(conn.write_buf[conn.write_buf.len - tick.chunks.len ..], tick.chunks);
-                    // Since we have new chunks, ensure we want to write.
+                // Transcode the dispatcher's HTTP/1.1 bytes into H2 frames. When
+                // a request carries a body, the app's response (status + headers
+                // + body) can first appear here rather than in `start.chunks`;
+                // the transcoder is stateful across feeds so it handles either.
+                const ok = h2Transcode(conn, tick.chunks, tick.done);
+                if (tick.chunks.len > 0) conn.allocator.free(tick.chunks);
+                if (!ok) {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                }
+                if (conn.write_pos < conn.write_buf.len) {
                     loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
                         conn.destroy();
                         return;
@@ -4408,21 +4503,40 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
             return;
         };
 
-        if (tick.chunks.len > 0) {
-            conn.write_buf = tick.chunks;
-            conn.write_pos = 0;
-            conn.dispatch_active = !tick.done;
-            // First chunk of the response holds the status line.
-            if (conn.response_status == 0) {
-                conn.response_status = parseStatus(tick.chunks);
+        if (conn.state == .http2) {
+            // HTTP/2: transcode the dispatcher's HTTP/1.1 bytes into DATA
+            // frames (and the trailing END_STREAM on `done`). The status line
+            // already went out with the HEADERS frame at dispatch start, so we
+            // don't re-parse it here.
+            const ok = h2Transcode(conn, tick.chunks, tick.done);
+            if (tick.chunks.len > 0) conn.allocator.free(tick.chunks);
+            if (!ok) {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
             }
-            continue;
-        }
+            conn.dispatch_active = !tick.done;
+            if (tick.done) conn.dispatch_handle = 0;
+            if (conn.write_pos < conn.write_buf.len) continue; // frames to write
+            if (tick.done) break;
+            // No new frames and not done → stall (handled below).
+        } else {
+            if (tick.chunks.len > 0) {
+                conn.write_buf = tick.chunks;
+                conn.write_pos = 0;
+                conn.dispatch_active = !tick.done;
+                // First chunk of the response holds the status line.
+                if (conn.response_status == 0) {
+                    conn.response_status = parseStatus(tick.chunks);
+                }
+                continue;
+            }
 
-        if (tick.done) {
-            conn.dispatch_active = false;
-            conn.dispatch_handle = 0;
-            break;
+            if (tick.done) {
+                conn.dispatch_active = false;
+                conn.dispatch_handle = 0;
+                break;
+            }
         }
 
         // No chunks, not done: Task is parked on something not driven by
@@ -4440,12 +4554,38 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
 
     // write_buf fully drained AND dispatch is no longer active.
     finishRequest(conn);
-    if (conn.keep_alive) {
+    if (conn.state == .http2) {
+        // HTTP/2 connections stay open in .http2 for the next stream rather
+        // than going through the HTTP/1.1 keep-alive reset (which would flip
+        // the connection back to .reading and parse subsequent frames as
+        // HTTP/1.1). The peer closes the connection when done.
+        h2StreamReset(loop, conn);
+    } else if (conn.keep_alive) {
         keepAliveReset(loop, conn);
     } else {
         loop.remove(conn.fd);
         conn.destroy();
     }
+}
+
+// Reset per-stream state after an HTTP/2 response is fully flushed, keeping the
+// connection in .http2 and re-armed for the next stream's frames. The
+// per-stream transcoder was already freed in finishRequest.
+fn h2StreamReset(loop: *eventloop.Loop, conn: *Connection) void {
+    if (conn.write_buf.len > 0) {
+        conn.allocator.free(conn.write_buf);
+        conn.write_buf = &.{};
+    }
+    conn.write_pos = 0;
+    conn.dispatch_handle = 0;
+    conn.dispatch_active = false;
+    conn.response_status = 0;
+    conn.request_in_flight = false;
+    conn.armTimer(g_timeouts.keep_alive_secs);
+    loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+    };
 }
 
 // ---------------------------------------------------------------------------
