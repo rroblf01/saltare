@@ -55,3 +55,36 @@ def test_core_imports_in_shared_gil_subinterpreter():
             _interpreters.destroy(iid)
         except Exception:  # noqa: BLE001
             pass
+
+
+def _own_gil_interpreters_module():
+    """The PEP 734 high-level module, which creates OWN-GIL interpreters.
+    Its name/location moved across versions; try the known spellings."""
+    for name in ("concurrent.interpreters", "interpreters"):
+        try:
+            import importlib
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    return None
+
+
+@pytest.mark.skipif(not _have_core(), reason="needs the built _core extension (installed wheel)")
+def test_core_imports_in_own_gil_subinterpreter():
+    """v1.11 declares Py_MOD_PER_INTERPRETER_GIL_SUPPORTED (3.12+). This is
+    the real PEP 684 gateway: a PEP 734 interpreter has its OWN GIL, and
+    CPython refuses to import an extension there unless it declares support.
+    Proves the slot is honoured end to end."""
+    interpreters = _own_gil_interpreters_module()
+    if interpreters is None:
+        pytest.skip("PEP 734 interpreters module unavailable on this Python")
+    interp = interpreters.create()  # own-GIL interpreter
+    try:
+        # .exec raises interpreters.ExecutionFailed if the sub-interpreter
+        # script raised. A clean run means own-GIL import works.
+        interp.exec("import saltare._core as c; assert c.version()")
+    finally:
+        try:
+            interp.close()
+        except Exception:  # noqa: BLE001
+            pass

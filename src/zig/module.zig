@@ -898,38 +898,53 @@ var methods = [_]py.PyMethodDef{
 
 var module_def: py.PyModuleDef = std.mem.zeroes(py.PyModuleDef);
 
-// PEP 489 multi-phase init slot id. Defined manually because Zig's
-// `@cImport` doesn't surface the `#define Py_mod_exec 2` macro as a decl.
-const Py_mod_exec: c_int = 2;
+// Multi-phase init slot ids (CPython moduleobject.h). Defined manually
+// because Zig's `@cImport` doesn't surface the `#define`s as decls.
+const Py_mod_exec: c_int = 2; // PEP 489, all supported versions
+const Py_mod_multiple_interpreters: c_int = 3; // PEP 489/684, CPython 3.12+
+const Py_mod_gil: c_int = 4; // PEP 703, CPython 3.13+
 
-// v1.11 PEP 684 groundwork: the module's execution slot. Multi-phase init
-// (PyModuleDef_Init + a Py_mod_exec slot) is the prerequisite for ever
-// importing `_core` under a sub-interpreter — single-phase modules
-// (PyModule_Create) are rejected there. This runs once per module load
-// (per interpreter); single-interpreter behaviour is unchanged.
+// v1.11 PEP 684: the module's execution slot. Runs once per module load
+// (per interpreter). Single-interpreter behaviour is unchanged.
 fn coreModExec(module: ?*py.PyObject) callconv(.c) c_int {
     _ = module;
     return 0;
 }
 
-var module_slots = [_]py.PyModuleDef_Slot{
-    .{ .slot = Py_mod_exec, .value = @ptrCast(@constCast(&coreModExec)) },
-    .{ .slot = 0, .value = null },
-};
+// Filled at PyInit time so the per-version pointer sentinels don't need to be
+// comptime-constructed. Max 4 entries: exec + multiple_interpreters + gil +
+// terminator.
+var module_slots: [4]py.PyModuleDef_Slot = undefined;
 
 export fn PyInit__core() ?*py.PyObject {
     // Cap glibc malloc arenas as early as possible so the Python heap
     // stays in one arena from here on. Skips on non-glibc targets.
     capMallocArenas();
+
+    module_slots[0] = .{ .slot = Py_mod_exec, .value = @ptrCast(@constCast(&coreModExec)) };
+    var n: usize = 1;
+    // PEP 684 per-interpreter-GIL support. Honest for saltare's worker model:
+    // the only process-global mutable state is (a) metric atomics (thread-safe;
+    // sharing them gives unified process-wide /metrics) and (b) config applied
+    // ONCE before any worker thread and read-only inside the re-entrant
+    // serveLoop(); the racy connection lists/loop-timers are per-`Runtime`.
+    // Slot ids are version-gated: multiple_interpreters is 3.12+, gil is 3.13+.
+    if (comptime py.PY_VERSION_HEX >= 0x030C0000) {
+        // Py_MOD_PER_INTERPRETER_GIL_SUPPORTED == (void *)2
+        module_slots[n] = .{ .slot = Py_mod_multiple_interpreters, .value = @ptrFromInt(2) };
+        n += 1;
+    }
+    if (comptime py.PY_VERSION_HEX >= 0x030D0000) {
+        // Py_MOD_GIL_USED == (void *)0 — saltare drives Python under the GIL.
+        module_slots[n] = .{ .slot = Py_mod_gil, .value = null };
+        n += 1;
+    }
+    module_slots[n] = .{ .slot = 0, .value = null };
+
     module_def.m_name = "_core";
     module_def.m_doc = "Saltare native core (Zig backbone).";
-    // Multi-phase init: m_size 0 (no per-module C state — the runtime state
-    // lives in Zig globals/threadlocals) and slots drive module creation.
-    // NOTE: this enables import under a shared-GIL sub-interpreter (PEP 489
-    // default). Per-interpreter-GIL (PEP 684) additionally needs the
-    // Py_mod_multiple_interpreters/Py_mod_gil slots AND all process-global
-    // mutable state in server.zig/bridge.zig made per-interpreter first —
-    // see the v1.11 CHANGELOG roadmap. Declaring it before that would race.
+    // Multi-phase init: m_size 0 (no per-module C state — runtime state lives
+    // in Zig globals/threadlocals/per-serve Runtime) and slots drive creation.
     module_def.m_size = 0;
     module_def.m_methods = @ptrCast(&methods[0]);
     module_def.m_slots = @ptrCast(&module_slots[0]);
