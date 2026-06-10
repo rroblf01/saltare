@@ -554,8 +554,8 @@ var g_dump_stats: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 // SIGHUP request flag for run-time config reopen — reserved for v1.4.
 // Currently unused; setting it does nothing.
 
-// Counters driven by the maintenance tick (idle GC + malloc_trim).
-var g_idle_ticks: u32 = 0;
+// Counters driven by the maintenance tick (idle GC + malloc_trim) live in
+// `Runtime.idle_ticks` (per-serve; see the Runtime struct).
 const IDLE_GC_TICKS: u32 = 30; // 30 × 100 ms = 3 s of zero events
 // Once this many consecutive idle ticks have passed since the last
 // maintenance pass, run a GC + malloc_trim to recover heap fragmentation
@@ -745,11 +745,40 @@ var g_tls_ctx: ?*tls.Ctx = null;
 /// change vs v1.4).
 var g_ktls_enabled: bool = false;
 
-/// Head of the doubly-linked list of stalled connections. A connection is
-/// stalled when its in-flight HTTP dispatch's Task is parked on something
-/// not driven by socket I/O (typically: framework setup chains spanning
-/// multiple awaits). Reset to null by `run()`.
-var g_stalled_head: ?*Connection = null;
+/// v1.11 PEP 684 groundwork — per-interpreter / per-serve runtime state.
+///
+/// These four were process-global `var`s. They are the ones that genuinely
+/// CANNOT be shared across sub-interpreters: the two connection lists are
+/// mutated without atomics (a data race if two interpreter threads touched
+/// them), and the loop-timing counters are per-event-loop. One `Runtime`
+/// lives on each serve() call's stack; the owning `Loop` points at it
+/// (`loop.runtime`) and every `Connection` carries a `*Runtime`, so both the
+/// loop-driven paths and `Connection.destroy` (which has no `loop`) reach it.
+///
+/// The metrics atomics and read-only config remain process-global on purpose:
+/// atomics are thread-safe and sharing them yields unified process-wide
+/// `/metrics` (better than per-worker), and config is set once before any
+/// worker thread starts.
+const Runtime = struct {
+    /// Head of the doubly-linked list of stalled connections. A connection is
+    /// stalled when its in-flight HTTP dispatch's Task is parked on something
+    /// not driven by socket I/O (framework setup chains spanning awaits).
+    stalled_head: ?*Connection = null,
+    /// Singly-linked list of live WebSocket connections. `drainWsOutbound`
+    /// walks it each pump tick to flush server-pushed frames queued into
+    /// `_WsState.outgoing` without inbound socket activity.
+    ws_head: ?*Connection = null,
+    /// Consecutive idle ticks, for the idle GC/trim heuristic.
+    idle_ticks: u32 = 0,
+    /// monotonic-ns timestamp of the last WebSocket pump.
+    last_ws_pump_ns: i64 = 0,
+};
+
+/// Fetch the per-serve `Runtime` from a `Loop`. Only valid after serve() has
+/// set `loop.runtime`; every code path that calls this runs inside serve().
+inline fn loopRuntime(loop: *eventloop.Loop) *Runtime {
+    return @ptrCast(@alignCast(loop.runtime.?));
+}
 
 // v1.7.1 — count of live WebSocket connections. When non-zero the
 // main loop calls `bridge.httpGlobalPump()` every WS_PUMP_INTERVAL_NS
@@ -762,12 +791,6 @@ pub var g_ws_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 /// Floor for `ws_pump_interval_ms` to keep pathological configs
 /// from spinning the worker thread at >100 Hz.
 const WS_PUMP_MIN_INTERVAL_MS: u32 = 10;
-var g_last_ws_pump_ns: i64 = 0;
-// Singly-linked list of live WebSocket connections. `drainWsOutbound`
-// walks this list each pump tick to flush server-pushed frames
-// (`channel_layer.group_send` and friends) that the consumer queued
-// into `_WsState.outgoing` without any inbound socket activity.
-var g_ws_head: ?*Connection = null;
 
 /// CLOCK_MONOTONIC nanoseconds. Wraps the libc call inline so the cost
 /// of a metrics scrape is dominated by the formatting, not by Zig
@@ -1723,9 +1746,9 @@ fn linkStalled(conn: *Connection) void {
     if (conn.stalled) return;
     conn.stalled = true;
     conn.stalled_prev = null;
-    conn.stalled_next = g_stalled_head;
-    if (g_stalled_head) |h| h.stalled_prev = conn;
-    g_stalled_head = conn;
+    conn.stalled_next = conn.runtime.stalled_head;
+    if (conn.runtime.stalled_head) |h| h.stalled_prev = conn;
+    conn.runtime.stalled_head = conn;
 }
 
 fn unlinkStalled(conn: *Connection) void {
@@ -1733,7 +1756,7 @@ fn unlinkStalled(conn: *Connection) void {
     if (conn.stalled_prev) |p| {
         p.stalled_next = conn.stalled_next;
     } else {
-        g_stalled_head = conn.stalled_next;
+        conn.runtime.stalled_head = conn.stalled_next;
     }
     if (conn.stalled_next) |n| n.stalled_prev = conn.stalled_prev;
     conn.stalled = false;
@@ -1969,7 +1992,7 @@ const WsState = struct {
     frag_len: usize = 0,
     /// Per-message-deflate negotiated.
     pmd_active: bool = false,
-    /// Singly-linked list pointer for g_ws_head chain.
+    /// Singly-linked list pointer for the per-serve WS list (Runtime.ws_head).
     list_next: ?*Connection = null,
     /// Cached request-target copy for WS-CLOSE log lines.
     log_path: ?[]u8 = null,
@@ -2049,6 +2072,10 @@ const Connection = struct {
     /// Pointer to the run()-local wheel, so destroy() can cancel the timer
     /// without needing the wheel passed through every call site.
     wheel: *timer.Wheel,
+    /// v1.11 — pointer to the per-serve `Runtime` (stalled/WS lists). Lets
+    /// `destroy()` and the link/unlink helpers reach the lists without a
+    /// `loop` param, and keeps that state per-interpreter rather than global.
+    runtime: *Runtime,
 
     /// Opaque handle into Python's `_dispatcher.http_states` for the
     /// in-flight request. Zero between requests.
@@ -2117,6 +2144,7 @@ const Connection = struct {
         pool: *pool_mod.Pool,
         fd: c_int,
         wheel: *timer.Wheel,
+        rt: *Runtime,
     ) !*Connection {
         const conn = try allocator.create(Connection);
         conn.* = .{
@@ -2142,6 +2170,7 @@ const Connection = struct {
             .data = .{ .http = {} },
             .timer_node = .{ .next = null, .prev = null, .bucket = 0, .armed = false },
             .wheel = wheel,
+            .runtime = rt,
             .dispatch_handle = 0,
             .dispatch_active = false,
             .stalled_next = null,
@@ -2165,7 +2194,7 @@ const Connection = struct {
         // v1.7.1: centralise WebSocket teardown here so every path that
         // calls `destroy()` (timer expiry, peer RST mid-write, server
         // shutdown drain, etc.) emits a WS-CLOSE log line, tells Python
-        // to cancel the consumer task, and unlinks from `g_ws_head`.
+        // to cancel the consumer task, and unlinks from the WS list.
         // Was: `doWrite`'s `.closed/.fatal` arm called destroy directly,
         // leaving the Python-side `_WsState` + asyncio Task pinned in
         // memory forever and the log file with a WS-CONNECT but no
@@ -2189,12 +2218,12 @@ const Connection = struct {
             }
             // Free frag buffer before transitioning the union.
             if (self.data.websocket.frag_buf) |b| self.allocator.free(b);
-            // 3. Decrement live-WS counter + unlink from g_ws_head.
+            // 3. Decrement live-WS counter + unlink from the WS list.
             _ = g_ws_conns.fetchSub(1, .seq_cst);
-            if (g_ws_head == self) {
-                g_ws_head = self.data.websocket.list_next;
+            if (self.runtime.ws_head == self) {
+                self.runtime.ws_head = self.data.websocket.list_next;
             } else {
-                var prev = g_ws_head;
+                var prev = self.runtime.ws_head;
                 while (prev) |p| {
                     if (p.data.websocket.list_next == self) {
                         p.data.websocket.list_next = self.data.websocket.list_next;
@@ -2580,6 +2609,12 @@ pub fn run(
     var loop = try eventloop.Loop.init();
     defer loop.deinit();
 
+    // v1.11 — per-serve runtime state (stalled/WS lists, loop timing). The
+    // loop and every Connection reference this; one instance per serve()
+    // call keeps the state per-interpreter for the sub-interpreter path.
+    var rt: Runtime = .{};
+    loop.runtime = &rt;
+
     try loop.add(listen_fd, @ptrCast(&listener_marker), true, false);
 
     const allocator = std.heap.c_allocator;
@@ -2636,7 +2671,7 @@ pub fn run(
         // connection is alive — otherwise a 100 ms idle would delay
         // `channel_layer.group_send` deliveries by up to that much.
         const ws_pump_ms: u32 = @max(g_obs.ws_pump_interval_ms, WS_PUMP_MIN_INTERVAL_MS);
-        const wait_timeout: c_int = if (g_stalled_head != null)
+        const wait_timeout: c_int = if (rt.stalled_head != null)
             0
         else if (g_ws_conns.load(.seq_cst) > 0)
             @intCast(ws_pump_ms)
@@ -2683,10 +2718,10 @@ pub fn run(
         // that gating it on idle-only matters. Skipped during graceful
         // drain so we don't spend time GC'ing on the way out.
         if (saw_event or g_in_flight.load(.seq_cst) > 0 or drain_started_sec >= 0) {
-            g_idle_ticks = 0;
+            rt.idle_ticks = 0;
         } else {
-            g_idle_ticks += 1;
-            if (g_idle_ticks == IDLE_GC_TICKS) {
+            rt.idle_ticks += 1;
+            if (rt.idle_ticks == IDLE_GC_TICKS) {
                 bridge.idleMaintenance();
                 if (comptime builtin.os.tag == .linux) {
                     _ = malloc_trim(0);
@@ -2699,7 +2734,7 @@ pub fn run(
         // stalled list and harvest each one's output. Connections that
         // got chunks transition back to .writing; those still parked
         // re-link themselves on the next stall path.
-        if (g_stalled_head != null) drainStalled(&loop);
+        if (rt.stalled_head != null) drainStalled(&loop);
 
         // v1.7.1: periodic asyncio pump for live WebSocket connections.
         // Without it, `channel_layer.group_send(...)` queues a message
@@ -2711,9 +2746,9 @@ pub fn run(
         if (g_ws_conns.load(.seq_cst) > 0) {
             const now_ns = monoNs();
             const interval_ns: i64 = @as(i64, ws_pump_ms) * std.time.ns_per_ms;
-            if (now_ns - g_last_ws_pump_ns >= interval_ns) {
+            if (now_ns - rt.last_ws_pump_ns >= interval_ns) {
                 bridge.httpGlobalPump();
-                g_last_ws_pump_ns = now_ns;
+                rt.last_ws_pump_ns = now_ns;
                 // Drain any frames the pumped consumers queued. The
                 // stalled-list walk above already harvested HTTP-side
                 // outgoing bytes; WS conns drain via the regular write
@@ -2726,7 +2761,7 @@ pub fn run(
         }
     }
 
-    g_stalled_head = null;
+    rt.stalled_head = null;
     g_draining.store(false, .seq_cst);
     if (owns_listen_fd) {
         _ = c.close(listen_fd);
@@ -2738,7 +2773,7 @@ fn drainStalled(loop: *eventloop.Loop) void {
 
     // Snapshot the head — connections may unlink themselves as we iterate
     // (transition back to .writing or get destroyed by an error path).
-    var node = g_stalled_head;
+    var node = loopRuntime(loop).stalled_head;
     while (node) |conn| {
         const next = conn.stalled_next;
         unlinkStalled(conn);
@@ -2820,7 +2855,7 @@ fn acceptAll(
         }
         _ = g_active_conns.fetchAdd(1, .seq_cst);
 
-        const conn = Connection.create(allocator, p, client, wheel) catch {
+        const conn = Connection.create(allocator, p, client, wheel, loopRuntime(loop)) catch {
             _ = c.close(client);
             _ = g_active_conns.fetchSub(1, .seq_cst);
             continue;
@@ -4269,9 +4304,9 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
     // v1.7.1: count this live WS conn so the main loop knows to keep
     // pumping the asyncio loop for `channel_layer.group_send` etc.
     _ = g_ws_conns.fetchAdd(1, .seq_cst);
-    // Link into `g_ws_head` so `drainWsOutbound` can flush this conn.
-    conn.data.websocket.list_next = g_ws_head;
-    g_ws_head = conn;
+    // Link into the per-serve WS list so `drainWsOutbound` can flush this conn.
+    conn.data.websocket.list_next = conn.runtime.ws_head;
+    conn.runtime.ws_head = conn;
     // v1.7.1: WS-CONNECT access-log line, parity with daphne's
     // `WSCONNECT` event. Emitted after the 101 head is queued so
     // operators can pair connect/close lines in the same log file
@@ -4627,16 +4662,17 @@ fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, paylo
 /// conn each tick — critical for high-fanout deployments where
 /// 200 conns × 20 Hz pump would otherwise be 4 000 GIL hops/s.
 fn drainWsOutbound(loop: *eventloop.Loop) void {
-    if (g_ws_head == null) return;
+    const rt = loopRuntime(loop);
+    if (rt.ws_head == null) return;
     const allocator = std.heap.c_allocator;
     const entries = bridge.wsDrainAll(allocator) orelse return;
     if (entries.len == 0) return;
     defer allocator.free(entries);
-    // Look up each entry's conn by walking g_ws_head once and
+    // Look up each entry's conn by walking the WS list once and
     // building a small handle→conn vector — O(N+M) on the active-
     // WS set + the dirty subset; both stay small in practice.
     for (entries) |entry| {
-        var node = g_ws_head;
+        var node = rt.ws_head;
         var target: ?*Connection = null;
         while (node) |conn| {
             if (conn.data.websocket.handle == entry.handle) {

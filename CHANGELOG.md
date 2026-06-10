@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.11.0
+
+**Theme**: PEP 684 (per-interpreter GIL) groundwork — phase 1 of moving multi-worker from pre-fork processes to sub-interpreters for lower per-worker RAM.
+
+Multi-worker today is pre-fork (`master.zig`): N OS processes, each a full CPython. fork shares code pages copy-on-write, but CPython's refcount writes dirty those shared pages, so resident memory diverges per worker. PEP 684 sub-interpreters (one process, N interpreters each with its own GIL on its own thread) keep the interpreter's immortal/static objects genuinely shared and avoid N process address spaces — the target saving is several MiB of Pss per worker. This is a multi-phase effort; v1.11 lands the unavoidable first brick and proves it.
+
+### Default-on
+
+- **`_core` now uses multi-phase initialisation** (`module.zig`) — `PyInit__core` returns `PyModuleDef_Init(&def)` with a `Py_mod_exec` slot and `m_size = 0`, replacing the single-phase `PyModule_Create2`. Single-phase extensions are *rejected* by sub-interpreters, so this is the prerequisite for everything that follows. Single-interpreter behaviour is unchanged (full suite green); the new capability is that `saltare._core` can now be imported inside a **shared-GIL** sub-interpreter (`Py_NewInterpreter` / legacy `_interpreters` semantics). Verified by `tests/test_subinterp.py` on CPython 3.14.
+- **Per-interpreter runtime state** (`server.zig`, `eventloop.zig`) — the event-loop state that genuinely cannot be shared across interpreters now lives in a per-serve `Runtime` struct instead of file-scope globals: the stalled-connection list (`stalled_head`), the live-WebSocket list (`ws_head`), and the loop-timing counters (`idle_ticks`, `last_ws_pump_ns`). These were mutated without atomics, so sharing them across two interpreter threads would have raced. The owning `Loop` carries an opaque `runtime` pointer and every `Connection` carries a `*Runtime`, so both loop-driven paths and `Connection.destroy` (which has no `loop`) reach it. No behaviour change for the single-interpreter / pre-fork paths (full suite green). The metrics atomics and read-only config stay process-global on purpose — atomics are thread-safe and sharing them yields *unified* process-wide `/metrics` (better than per-worker counters), and config is set once before any worker thread starts.
+
+### Not yet (the rest of the roadmap)
+
+The module loads under a sub-interpreter and the racy event-loop state is now isolated, but per-interpreter-**GIL** hosting is not wired up yet. saltare intentionally does **not** declare `Py_mod_multiple_interpreters = Py_MOD_PER_INTERPRETER_GIL_SUPPORTED` until the remaining items land — doing so earlier would be a false promise.
+
+- **Audit the remaining shared mutable state** — `g_tls_ctx`/`g_ktls_enabled`, `g_server_line_owned`, and the bridge's `threadlocal` Python handles are effectively per-thread/set-once today; confirm each is either immutable-after-init or moved into `Runtime` before declaring own-GIL support.
+- **Threading / event-loop model** — spawn N threads, each `Py_NewInterpreterFromConfig({.gil = OWN})`, each importing the app and running its own asyncio loop + epoll loop on a shared `SO_REUSEPORT`/inherited listen fd. Replaces the fork in `module.zig`/`master.zig` for the `workers>1` path (fork stays as the fallback and for Python < 3.12).
+- **Declare support + the GIL slot** — add `Py_mod_multiple_interpreters` and `Py_mod_gil` slots (3.12+/3.13+, version-gated via `PY_VERSION_HEX`) once state isolation is complete.
+- **Measure** — wire the RAM benchmark to compare fork vs sub-interpreter workers and confirm the per-worker Pss saving before flipping the default.
+
+### Tests
+
+- `tests/test_subinterp.py` — proves `_core` imports in a shared-GIL sub-interpreter (skips on source-only runs and where the low-level sub-interpreter API isn't exposed). 361 passed, 6 skipped.
+
 ## 1.10.0
 
 **Theme**: HTTP/2 HPACK correctness + protocol-robustness bug fixes (HTTP/2 framing, WebSocket framing, permessage-deflate context takeover, ASGI lifespan).

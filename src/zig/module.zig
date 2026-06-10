@@ -141,7 +141,7 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("1.10.0");
+    return py.PyUnicode_FromString("1.11.0");
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -898,13 +898,40 @@ var methods = [_]py.PyMethodDef{
 
 var module_def: py.PyModuleDef = std.mem.zeroes(py.PyModuleDef);
 
+// PEP 489 multi-phase init slot id. Defined manually because Zig's
+// `@cImport` doesn't surface the `#define Py_mod_exec 2` macro as a decl.
+const Py_mod_exec: c_int = 2;
+
+// v1.11 PEP 684 groundwork: the module's execution slot. Multi-phase init
+// (PyModuleDef_Init + a Py_mod_exec slot) is the prerequisite for ever
+// importing `_core` under a sub-interpreter — single-phase modules
+// (PyModule_Create) are rejected there. This runs once per module load
+// (per interpreter); single-interpreter behaviour is unchanged.
+fn coreModExec(module: ?*py.PyObject) callconv(.c) c_int {
+    _ = module;
+    return 0;
+}
+
+var module_slots = [_]py.PyModuleDef_Slot{
+    .{ .slot = Py_mod_exec, .value = @ptrCast(@constCast(&coreModExec)) },
+    .{ .slot = 0, .value = null },
+};
+
 export fn PyInit__core() ?*py.PyObject {
     // Cap glibc malloc arenas as early as possible so the Python heap
     // stays in one arena from here on. Skips on non-glibc targets.
     capMallocArenas();
     module_def.m_name = "_core";
     module_def.m_doc = "Saltare native core (Zig backbone).";
-    module_def.m_size = -1;
+    // Multi-phase init: m_size 0 (no per-module C state — the runtime state
+    // lives in Zig globals/threadlocals) and slots drive module creation.
+    // NOTE: this enables import under a shared-GIL sub-interpreter (PEP 489
+    // default). Per-interpreter-GIL (PEP 684) additionally needs the
+    // Py_mod_multiple_interpreters/Py_mod_gil slots AND all process-global
+    // mutable state in server.zig/bridge.zig made per-interpreter first —
+    // see the v1.11 CHANGELOG roadmap. Declaring it before that would race.
+    module_def.m_size = 0;
     module_def.m_methods = @ptrCast(&methods[0]);
-    return py.PyModule_Create2(&module_def, py.PYTHON_API_VERSION);
+    module_def.m_slots = @ptrCast(&module_slots[0]);
+    return py.PyModuleDef_Init(&module_def);
 }

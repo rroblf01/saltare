@@ -42,6 +42,10 @@ pub const Loop = struct {
     epfd: c_int,
     raw_events: [max_events_per_wait]c.struct_epoll_event = undefined,
     out_events: [max_events_per_wait]Event = undefined,
+    // v1.11 PEP 684 groundwork: opaque pointer to the owning serve()'s
+    // per-interpreter `Runtime` (server.zig). Held as `?*anyopaque` to avoid
+    // a circular import on the Connection type. Set once right after init.
+    runtime: ?*anyopaque = null,
 
     pub fn init() !Loop {
         const fd = c.epoll_create1(c.EPOLL_CLOEXEC);
