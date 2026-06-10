@@ -2606,12 +2606,36 @@ pub fn run(
     // Record process start time for `process_start_time_seconds`.
     g_process_start_unix_secs.store(@intCast(c.time(null)), .seq_cst);
 
+    if (uds_path) |path| {
+        std.log.info("saltare listening on unix:{s}", .{path});
+    } else {
+        std.log.info("saltare listening on {s}:{d}", .{ host, port });
+    }
+
+    // v1.11 PEP 684 groundwork: the event loop is now a re-entrant function
+    // (its own Loop + Runtime + pool + wheel), so an own-GIL sub-interpreter
+    // spawner can eventually run one instance per thread. The single-worker
+    // and pre-fork-worker paths run exactly one.
+    try serveLoop(listen_fd);
+
+    g_draining.store(false, .seq_cst);
+    if (owns_listen_fd) {
+        _ = c.close(listen_fd);
+    }
+}
+
+/// Re-entrant event loop, extracted from run(). Owns its Loop, Runtime,
+/// buffer pool and timer wheel as locals; reads only process-shared,
+/// set-once config and thread-safe atomics. Therefore safe to run one
+/// instance per thread — the foundation the sub-interpreter worker model
+/// will build on. Config application + bind/listen stay in run() (done
+/// once, before any worker thread).
+fn serveLoop(listen_fd: c_int) !void {
     var loop = try eventloop.Loop.init();
     defer loop.deinit();
 
-    // v1.11 — per-serve runtime state (stalled/WS lists, loop timing). The
-    // loop and every Connection reference this; one instance per serve()
-    // call keeps the state per-interpreter for the sub-interpreter path.
+    // Per-serve runtime state (stalled/WS lists, loop timing). One instance
+    // per serveLoop() call keeps this state per-interpreter.
     var rt: Runtime = .{};
     loop.runtime = &rt;
 
@@ -2622,12 +2646,6 @@ pub fn run(
     defer rb_pool.deinit();
 
     var wheel = try timer.Wheel.init();
-
-    if (uds_path) |path| {
-        std.log.info("saltare listening on unix:{s}", .{path});
-    } else {
-        std.log.info("saltare listening on {s}:{d}", .{ host, port });
-    }
 
     const tick_ctx = TickCtx{ .loop = &loop };
 
@@ -2644,7 +2662,7 @@ pub fn run(
             drain_started_sec = @intCast(wheel.nowSec());
             loop.remove(listen_fd);
             std.log.info("saltare draining: {d}s timeout, {d} active conns", .{
-                timeouts.shutdown_secs,
+                g_timeouts.shutdown_secs,
                 g_active_conns.load(.seq_cst),
             });
         }
@@ -2655,7 +2673,7 @@ pub fn run(
             //   - shutdown_secs elapsed → force exit (in-flight clipped)
             if (g_active_conns.load(.seq_cst) == 0) break;
             const elapsed = @as(i64, @intCast(wheel.nowSec())) - drain_started_sec;
-            if (elapsed >= @as(i64, @intCast(timeouts.shutdown_secs))) {
+            if (elapsed >= @as(i64, @intCast(g_timeouts.shutdown_secs))) {
                 std.log.warn("saltare drain deadline reached, {d} conns still in flight", .{
                     g_active_conns.load(.seq_cst),
                 });
@@ -2761,11 +2779,6 @@ pub fn run(
         }
     }
 
-    rt.stalled_head = null;
-    g_draining.store(false, .seq_cst);
-    if (owns_listen_fd) {
-        _ = c.close(listen_fd);
-    }
 }
 
 fn drainStalled(loop: *eventloop.Loop) void {
