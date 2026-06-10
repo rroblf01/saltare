@@ -1,5 +1,55 @@
 # Changelog
 
+## 1.10.0
+
+**Theme**: HTTP/2 HPACK correctness + protocol-robustness bug fixes (HTTP/2 framing, WebSocket framing, permessage-deflate context takeover, ASGI lifespan).
+
+This release fixes a batch of latent correctness/DoS bugs surfaced by an audit. Several were unreachable by the existing test suite because the HTTP/2 tests mocked the bridge and never exercised the real Zig codec — every fix below ships with a regression test that does.
+
+### HPACK (RFC 7541) — was broken for real HTTP/2 clients
+
+The v1.9 HPACK implementation could not interoperate with real clients (browsers, curl, python-h2), which Huffman-encode header strings by default. Rewritten and verified against the RFC 7541 Appendix C vectors:
+
+- **New `src/zig/huffman.zig`** — the canonical static Huffman table (generated from the authoritative `hpack` table, validated as a proper prefix code and against RFC 7541 §C.4 wire vectors) plus decode/encode. The old decoder ignored the Huffman bit entirely and returned raw Huffman bytes as if literal.
+- **Decoder rewrite** (`h2.zig`) — correct RFC 7541 §5.1 prefix-integer decoding (the old code mis-parsed multi-byte lengths and double-advanced the cursor), Huffman string decoding, and a **working dynamic table** with owned copies and RFC-correct indexing/eviction. The previous dynamic table was a no-op that only bumped a size counter, so any cross-request header indexing silently dropped headers — and the index math (`62 - index`) underflowed and could panic.
+- **Encoder rewrite** (`h2_encoder.zig`) — emits Indexed Header Fields with the `0x80` high bit and integer-encoded string lengths. The old encoder wrote string lengths as a single byte (truncating/panicking on any value ≥ 128 bytes — `Set-Cookie`, `Location`, CSP) and emitted malformed indexed-field representations. (Still not wired into the response path — see below — but now correct, with an encode→decode round-trip test.)
+
+### HTTP/2 framing robustness
+
+- **Flow-control window overflow** (`h2.zig`) — `WINDOW_UPDATE` now rejects increments that would push a window past 2³¹-1 (`FLOW_CONTROL_ERROR`) instead of wrapping a `u32` / panicking in safe builds. Connection-level flow control is now tracked, and DATA frames replenish both the stream and connection windows so large uploads keep flowing.
+- **`MAX_CONCURRENT_STREAMS` enforced** — a new stream over the cap is refused with `RST_STREAM(REFUSED_STREAM)` instead of being created unbounded (HEADERS-flood DoS).
+- **CONTINUATION frames assembled** — HEADERS without `END_HEADERS` now accumulate CONTINUATION fragments (bounded by a 64 KiB header-block cap) before HPACK-decoding, and a non-CONTINUATION frame mid-block is a connection error. Previously CONTINUATION bytes were silently dropped (header truncation) with no flood bound (CVE-2024-27316 class).
+- **SETTINGS validation** — a payload not a multiple of 6, or an ACK with a non-empty payload, is a `FRAME_SIZE_ERROR`; `MAX_FRAME_SIZE`/`INITIAL_WINDOW_SIZE` are range-checked.
+- **Connection preface consumed** (`server.zig`) — the 24-byte preface is now shifted out of the read buffer, so the client's initial SETTINGS frame (which usually arrives in the same segment) is processed instead of being mis-parsed as a frame. A partial preface now waits for more bytes instead of tearing down the connection.
+- **Frame loop fixed** — frames whose handler returns nothing (WINDOW_UPDATE, PRIORITY, in-progress CONTINUATION, unknown types) no longer stop the loop and strand following frames; a partial frame at the buffer tail is kept rather than killing the connection.
+
+> **Note on HTTP/2 scope.** The HTTP/2 *response* path still emits HTTP/1.1-shaped bytes (`http2_dispatch_start` delegates to the HTTP/1.1 dispatch), so end-to-end HTTP/2 responses are not yet wire-complete — that remains feature work, not covered here. These fixes harden the request-parsing/framing side and make the HPACK codec correct.
+
+### WebSocket framing (RFC 6455)
+
+- **RSV / control-frame validation** (`ws.zig`) — reject RSV2/RSV3 (and RSV1 when permessage-deflate wasn't negotiated, checked in `server.zig`), fragmented control frames (FIN=0), oversized control frames, and a 64-bit length with its MSB set (which also prevents `header_len + payload_len` from overflowing `usize`).
+- **Inbound close code echoed** (`server.zig`) — the peer's close code is validated (RFC 6455 §7.4.1) and echoed back; a malformed/reserved code or 1-byte payload replies `1002`. Previously every close echoed a hardcoded `1000`.
+
+### WebSocket permessage-deflate (RFC 7692)
+
+- **Context takeover actually works** (`_dispatcher.py`) — `_pmd_deflate`/`_pmd_inflate` now return the compressor/decompressor so the caller persists it across messages when takeover is negotiated. Previously the compressor was recreated every message while the negotiated token told the client to keep context, corrupting the client's decode from the second message on (the shipped `--ws-compression-server-takeover` flag was unusable).
+- **Negotiation matches behaviour** — `_pmd_negotiate` now returns the negotiated server/client takeover flags, honours a client's `server_no_context_takeover`, and echoes a token consistent with the actual codec behaviour.
+
+### ASGI lifespan
+
+- **Clearer handling of an unexpected startup message** (`_dispatcher.py`) — when an app that isn't lifespan-aware replies with an unexpected first message (e.g. `http.response.start` because it didn't check `scope["type"]`), saltare now logs it explicitly and continues serving with lifespan disabled (uvicorn `lifespan="auto"` semantics), instead of the previous silent pass-through.
+
+### Tests
+
+- New Zig unit tests: `huffman.zig` (prefix-code validity, all-256-byte round-trip, RFC §C.4 vectors, embedded-EOS rejection), `h2.zig` (RFC §C.4 request sequence with Huffman + cross-request dynamic indexing, long-literal integer continuation, SETTINGS validation, WINDOW_UPDATE overflow, `MAX_CONCURRENT_STREAMS`, CONTINUATION reassembly), `h2_encoder.zig` (encode→decode round-trip incl. ≥ 300-byte values), `ws.zig` (fragmented/oversized control frames, RSV2/3, 64-bit MSB length).
+- New/updated Python tests: server-takeover round-trip + negotiation-token consistency in `test_ws_compression.py`, lifespan unexpected-message handling in `test_dispatcher_unit.py`. Existing PMD unit tests updated to the new `(compressor, bytes)` / 4-tuple signatures.
+
+### Deferred to v1.10+
+
+- **HTTP/2 response framing** — emit real HEADERS/DATA frames (wire-complete end-to-end HTTP/2) using the now-correct HPACK encoder; multiplexed streams.
+- **`abi3` / limited-API wheel** — a single wheel per (libc, arch) instead of one per CPython ABI, to roughly halve release CI wall time.
+- Items carried over from 1.9.0 below.
+
 ## 1.9.0
 
 **Theme**: HTTP/2 dispatch integration + Connection HTTP/WS union + WebSocket compression config.

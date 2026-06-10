@@ -90,4 +90,14 @@ pub fn staticIndex(name: []const u8, value: []const u8) ?u8 {
     return null;
 }
 
+/// First static-table index whose name matches `name` (value ignored).
+/// Lets the encoder reference a common header name even when the value
+/// isn't in the table.
+pub fn staticNameIndex(name: []const u8) ?u8 {
+    for (STATIC_TABLE, 1..) |entry, idx| {
+        if (std.mem.eql(u8, entry.name, name)) return @intCast(idx);
+    }
+    return null;
+}
+
 const std = @import("std");

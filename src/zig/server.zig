@@ -3324,28 +3324,51 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
     conn.read_total += r.n;
 
     if (!h2c.preface_received) {
-        _ = h2c.expectPreface(data[0..conn.read_total]) catch {
+        _ = h2c.expectPreface(data[0..conn.read_total]) catch |err| {
+            // Not enough bytes yet → wait for the rest of the 24-byte magic
+            // instead of tearing down a slow client.
+            if (err == error.IncompleteFrame) return;
             loop.remove(conn.fd);
             conn.destroy();
             return;
         };
-        if (h2c.preface_received) {
-            const settings_ack = h2c.buildSettingsAck();
-            _ = connWrite(conn, settings_ack);
+        const settings_ack = h2c.buildSettingsAck();
+        _ = connWrite(conn, settings_ack);
+        // Consume the preface bytes from the buffer. The client's initial
+        // SETTINGS frame usually arrives in the same segment right after the
+        // magic; leaving the magic in the buffer made the frame loop parse it
+        // as a (garbage) frame. Shift it out and fall through to process any
+        // frames that followed.
+        const consumed = h2.HTTP2_MAGIC.len;
+        const leftover = conn.read_total - consumed;
+        if (leftover > 0) {
+            std.mem.copyForwards(u8, data[0..leftover], data[consumed..conn.read_total]);
         }
-        return;
+        conn.read_total = leftover;
+        if (conn.read_total == 0) return;
     }
 
     var processed: usize = 0;
     while (processed < conn.read_total) {
         const remaining = data[processed..conn.read_total];
-        const result = h2c.processFrame(remaining) catch {
+        const maybe = h2c.processFrame(remaining) catch |err| {
+            // A partial frame at the buffer tail — keep it and wait for more
+            // bytes (IncompleteFrame is not a protocol error).
+            if (err == error.IncompleteFrame) break;
             loop.remove(conn.fd);
             conn.destroy();
             return;
-        } orelse break;
+        };
+        // We have a complete frame; advance past it regardless of whether the
+        // handler produced a result. WINDOW_UPDATE / PRIORITY / an in-progress
+        // CONTINUATION / unknown frame types legitimately return null and must
+        // NOT stop the loop or leave the frame unconsumed (the old `orelse
+        // break` did exactly that, stalling any frame that followed them).
+        const frame = h2.Frame.parse(remaining).?;
+        const frame_size = 9 + @as(usize, frame.length);
 
-        if (result.settings_ack) {
+        if (maybe) |result| {
+            if (result.settings_ack) {
             const ack = h2c.buildSettingsAck();
             _ = connWrite(conn, ack);
         }
@@ -3364,14 +3387,35 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
             _ = connWrite(conn, ack_frame);
             conn.allocator.free(ack_frame);
         }
-        if (result.need_window_update) {
-            const wu = h2c.buildWindowUpdate(result.stream_id, @as(u31, @truncate(h2c.settings.initial_window_size))) catch {
+        if (result.need_window_update and result.data_consumed > 0) {
+            // Replenish both the stream and the connection (stream 0) windows
+            // by exactly what we just consumed, so the peer can keep sending.
+            const inc: u31 = @intCast(result.data_consumed);
+            const wu_stream = h2c.buildWindowUpdate(result.stream_id, inc) catch {
                 loop.remove(conn.fd);
                 conn.destroy();
                 return;
             };
-            _ = connWrite(conn, wu);
-            conn.allocator.free(wu);
+            _ = connWrite(conn, wu_stream);
+            conn.allocator.free(wu_stream);
+            const wu_conn = h2c.buildWindowUpdate(0, inc) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            _ = connWrite(conn, wu_conn);
+            conn.allocator.free(wu_conn);
+        }
+        if (result.rst_stream != 0) {
+            // e.g. REFUSED_STREAM when over the concurrency cap. Send the
+            // RST and skip dispatch (this result carries no headers).
+            const rst = h2c.buildRstStream(result.rst_stream, result.rst_error) catch {
+                loop.remove(conn.fd);
+                conn.destroy();
+                return;
+            };
+            _ = connWrite(conn, rst);
+            conn.allocator.free(rst);
         }
         if (result.headers) |headers| {
             var hdrs = headers;
@@ -3466,8 +3510,8 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
             conn.destroy();
             return;
         }
-        const frame = h2.Frame.parse(remaining) orelse break;
-        processed += 9 + frame.length;
+        } // end: if (maybe) |result|
+        processed += frame_size;
     }
     if (processed < conn.read_total) {
         const leftover = conn.read_total - processed;
@@ -4376,6 +4420,14 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                     wsTeardown(loop, conn);
                     return;
                 }
+                if (hdr.rsv1 and !conn.data.websocket.pmd_active) {
+                    // RFC 6455 §5.2 / RFC 7692: RSV1 is only legal when
+                    // permessage-deflate was negotiated. Otherwise it's a
+                    // protocol error — fail the connection rather than hand
+                    // the app an undecodable "compressed" frame.
+                    wsTeardown(loop, conn);
+                    return;
+                }
                 const total = hdr.header_len + hdr.payload_len;
                 if (total > data.len) {
                     // Frame bigger than our buffer. Will retry as
@@ -4522,13 +4574,32 @@ fn handleWsFragment(conn: *Connection, hdr: ws.Header, payload: []u8) bool {
     return true;
 }
 
+// RFC 6455 §7.4.1: close codes a peer is allowed to send. 1004/1005/1006/1015
+// are reserved and never appear on the wire; <1000 and the 1012-2999 range are
+// not valid from a peer either.
+fn validCloseCode(code: u16) bool {
+    return switch (code) {
+        1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011 => true,
+        else => code >= 3000 and code <= 4999,
+    };
+}
+
 fn handleWsFrame(loop: *eventloop.Loop, conn: *Connection, hdr: ws.Header, payload: []u8) void {
     switch (hdr.opcode) {
         .text => wsDeliverToApp(loop, conn, 0x1, payload, hdr.rsv1),
         .binary => wsDeliverToApp(loop, conn, 0x2, payload, hdr.rsv1),
         .close => {
-            // Echo close + tear down.
-            sendCloseFrame(conn, 1000) catch {};
+            // RFC 6455 §5.5.1: echo the peer's close code back. A 1-byte
+            // payload is malformed and a bad/reserved code is a protocol
+            // error → reply 1002; an empty close → reply 1000.
+            var echo_code: u16 = 1000;
+            if (payload.len == 1) {
+                echo_code = 1002;
+            } else if (payload.len >= 2) {
+                const code = (@as(u16, payload[0]) << 8) | @as(u16, payload[1]);
+                echo_code = if (validCloseCode(code)) code else 1002;
+            }
+            sendCloseFrame(conn, echo_code) catch {};
             conn.keep_alive = false;
             flushOutbound(loop, conn);
         },

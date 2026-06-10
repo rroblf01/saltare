@@ -1,15 +1,29 @@
 // HPACK Encoder (RFC 7541).
 //
-// Encodes header lists into HPACK wire format.
-// Uses static table indexing for compression.
+// v1.10 rewrite. The previous encoder was incorrect in three ways and is
+// not yet wired into the response path (HTTP/2 response framing is on the
+// roadmap; v1.9 emitted HTTP/1.1-shaped bytes). The bugs it had:
+//   * Indexed Header Fields were emitted without the 0x80 high bit (and the
+//     ":status" path emitted a bare index), so the representation was a
+//     malformed literal.
+//   * Full static matches were emitted as `0x40 | idx` (literal with
+//     incremental indexing) but then returned without the value string.
+//   * String lengths were written as a single byte (`@intCast(value.len)`),
+//     truncating/panicking for any value >= 128 bytes (Set-Cookie, Location,
+//     CSP, ...).
+//
+// This implementation is stateless (static table only, no dynamic table —
+// the prior dynamic table was a no-op). It emits:
+//   * Indexed Header Field (0x80) for a full name+value static match.
+//   * Literal without Indexing (0x00) otherwise, referencing a static name
+//     index when available, with RFC 7541 §5.1 integer-encoded lengths and
+//     optional Huffman (§5.2) when it is shorter.
 
 const std = @import("std");
 const h2_static = @import("h2_static.zig");
+const huffman = @import("huffman.zig");
 
-pub const EncoderError = error{
-    TableSizeExceeded,
-    EncodeError,
-};
+pub const EncoderError = error{OutOfMemory};
 
 pub const Header = struct {
     name: []const u8,
@@ -17,113 +31,87 @@ pub const Header = struct {
 };
 
 pub const Encoder = struct {
-    allocator: std.mem.Allocator,
-    max_size: u32 = 4096,
-    table_size: u32 = 0,
-    entry_names: [][]const u8 = &.{},
-    entry_values: [][]const u8 = &.{},
-
-    pub fn init(allocator: std.mem.Allocator) Encoder {
-        return .{ .allocator = allocator };
-    }
-
-    pub fn deinit(self: *Encoder) void {
-        if (self.entry_names.len > 0) {
-            self.allocator.free(self.entry_names);
-            self.allocator.free(self.entry_values);
-        }
-    }
-
-    pub fn reset(self: *Encoder) void {
-        self.entry_names.len = 0;
-        self.entry_values.len = 0;
-        self.table_size = 0;
-    }
-
-    fn evictToFit(self: *Encoder) void {
-        while (self.table_size + 32 > self.max_size and self.entry_names.len > 0) {
-            self.entry_names.len -= 1;
-            self.entry_values.len -= 1;
-            self.table_size -= 32;
-        }
-    }
-
-    fn addEntry(self: *Encoder, name: []const u8, value: []const u8) void {
-        const size: u32 = @intCast(32 + name.len + value.len);
-        if (size > self.max_size) return;
-        self.evictToFit();
-        if (self.table_size + size <= self.max_size) {
-            self.table_size += size;
-        }
-    }
-
-    pub fn encode(self: *Encoder, headers: []const Header, allocator: std.mem.Allocator) EncoderError![]u8 {
-        var output = std.ArrayList(u8).init(allocator);
-        errdefer output.deinit();
-
+    pub fn encode(headers: []const Header, allocator: std.mem.Allocator) EncoderError![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
         for (headers) |header| {
-            try self.encodeHeader(&output, header.name, header.value);
+            try encodeHeader(allocator, &output, header.name, header.value);
         }
-
-        return output.toOwnedSlice();
-    }
-
-    fn encodeHeader(self: *Encoder, output: *std.ArrayList(u8), name: []const u8, value: []const u8) EncoderError!void {
-        if (std.mem.eql(u8, name, ":status") and value.len == 3) {
-            if (h2_static.staticIndex(name, value)) |idx| {
-                try output.append(idx);
-                return;
-            }
-        }
-
-        if (h2_static.staticIndex(name, value)) |idx| {
-            try output.append(0x40 | @as(u8, idx));
-            return;
-        }
-
-        for (self.entry_names, 0..) |entry_name, dyn_idx| {
-            if (std.mem.eql(u8, entry_name, name) and std.mem.eql(u8, self.entry_values[dyn_idx], value)) {
-                const idx = @as(u8, @intCast(62 - dyn_idx));
-                try output.append(0x40 | idx);
-                return;
-            }
-        }
-
-        var name_idx: ?u8 = h2_static.staticIndex(name, "");
-        if (name_idx == null) {
-            for (self.entry_names, 0..) |entry_name, dyn_idx| {
-                if (std.mem.eql(u8, entry_name, name)) {
-                    name_idx = @as(u8, @intCast(62 - dyn_idx));
-                    break;
-                }
-            }
-        }
-
-        if (name_idx) |ni| {
-            try output.append(0x40 | ni);
-            try self.encodeString(output, value);
-            self.addEntry(name, value);
-        } else {
-            try output.append(0x40);
-            try self.encodeString(output, name);
-            try self.encodeString(output, value);
-            self.addEntry(name, value);
-        }
-    }
-
-    fn encodeString(self: *Encoder, output: *std.ArrayList(u8), value: []const u8) EncoderError!void {
-        try output.append(@as(u8, @intCast(value.len)));
-        try output.appendSlice(value);
-    }
-
-    pub fn setMaxSize(self: *Encoder, new_size: u32) void {
-        self.max_size = new_size;
-        self.evictToFit();
+        return output.toOwnedSlice(allocator);
     }
 };
 
-test "Encoder basic" {
-    var enc: Encoder = .{ .allocator = std.testing.allocator };
-    defer enc.deinit();
-    try std.testing.expect(enc.entry_names.len == 0);
+fn encodeHeader(allocator: std.mem.Allocator, out: *std.ArrayList(u8), name: []const u8, value: []const u8) EncoderError!void {
+    if (h2_static.staticIndex(name, value)) |idx| {
+        // Indexed Header Field — 7-bit prefix, high bit set.
+        try encodeInteger(allocator, out, idx, 7, 0x80);
+        return;
+    }
+    // Literal Header Field without Indexing — 4-bit name-index prefix.
+    if (h2_static.staticNameIndex(name)) |ni| {
+        try encodeInteger(allocator, out, ni, 4, 0x00);
+    } else {
+        try encodeInteger(allocator, out, 0, 4, 0x00);
+        try encodeString(allocator, out, name);
+    }
+    try encodeString(allocator, out, value);
+}
+
+// RFC 7541 §5.1 prefix-integer encode. `flags` holds the representation's
+// high bits OR'd into the prefix byte.
+fn encodeInteger(allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: usize, comptime prefix_bits: u4, flags: u8) EncoderError!void {
+    const max_prefix: usize = (@as(usize, 1) << prefix_bits) - 1;
+    if (value < max_prefix) {
+        try out.append(allocator, flags | @as(u8, @intCast(value)));
+        return;
+    }
+    try out.append(allocator, flags | @as(u8, @intCast(max_prefix)));
+    var v = value - max_prefix;
+    while (v >= 128) {
+        try out.append(allocator, @as(u8, @intCast((v & 0x7F) | 0x80)));
+        v >>= 7;
+    }
+    try out.append(allocator, @as(u8, @intCast(v)));
+}
+
+// RFC 7541 §5.2 string literal: H-bit + integer length (7-bit prefix) +
+// octets. Huffman-encodes when that is strictly shorter.
+fn encodeString(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) EncoderError!void {
+    const hlen = huffman.encodedLen(s);
+    if (hlen < s.len) {
+        try encodeInteger(allocator, out, hlen, 7, 0x80);
+        const enc = try huffman.encode(allocator, s);
+        defer allocator.free(enc);
+        try out.appendSlice(allocator, enc);
+    } else {
+        try encodeInteger(allocator, out, s.len, 7, 0x00);
+        try out.appendSlice(allocator, s);
+    }
+}
+
+const h2 = @import("h2.zig");
+
+test "encoder/decoder round-trip incl. long values and Huffman" {
+    const a = std.testing.allocator;
+    const headers = [_]Header{
+        .{ .name = ":status", .value = "200" }, // full static index
+        .{ .name = "content-type", .value = "text/html; charset=utf-8" }, // static name, literal value
+        .{ .name = "location", .value = "https://example.com/" ++ "a" ** 300 }, // value >> 128 bytes
+        .{ .name = "x-custom-header", .value = "some-value-123" }, // literal name + value
+        .{ .name = "set-cookie", .value = "sid=" ++ "b" ** 200 ++ "; Path=/; HttpOnly" },
+    };
+    const wire = try Encoder.encode(&headers, a);
+    defer a.free(wire);
+
+    var dec = h2.Decoder.init(a);
+    defer dec.deinit();
+    var out: std.ArrayList(h2.Header) = .empty;
+    defer out.deinit(a);
+    try dec.decode(wire, &out);
+
+    try std.testing.expectEqual(headers.len, out.items.len);
+    for (headers, out.items) |expected, got| {
+        try std.testing.expectEqualStrings(expected.name, got.name);
+        try std.testing.expectEqualStrings(expected.value, got.value);
+    }
 }

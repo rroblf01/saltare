@@ -62,6 +62,17 @@ pub fn parseHeader(buf: []const u8) ParseResult {
     const masked = (b1 & 0x80) != 0;
     const len7: u7 = @intCast(b1 & 0x7F);
 
+    // RFC 6455 §5.2: RSV2/RSV3 must be zero (no extension here defines them).
+    // RSV1 is only valid when permessage-deflate was negotiated — that check
+    // belongs to the caller, which knows the per-connection extension state.
+    if ((b0 & 0x30) != 0) return .invalid;
+
+    // RFC 6455 §5.5: control frames (opcode high bit set) MUST NOT be
+    // fragmented and MUST carry <= 125 bytes, so they never use the 126/127
+    // extended-length forms.
+    const is_control = (opcode_raw & 0x08) != 0;
+    if (is_control and (!fin or len7 > 125)) return .invalid;
+
     var idx: usize = 2;
     var payload_len: usize = len7;
 
@@ -71,6 +82,10 @@ pub fn parseHeader(buf: []const u8) ParseResult {
         idx += 2;
     } else if (len7 == 127) {
         if (buf.len < idx + 8) return .needs_more;
+        // RFC 6455 §5.2: the most-significant bit of the 64-bit length MUST
+        // be 0. Rejecting it also prevents `header_len + payload_len` from
+        // overflowing usize in the caller's frame-size arithmetic.
+        if (buf[idx] & 0x80 != 0) return .invalid;
         payload_len = 0;
         var i: usize = 0;
         while (i < 8) : (i += 1) {
@@ -232,6 +247,30 @@ test "writeFrame: 200-byte payload uses extended length" {
     try testing.expectEqual(@as(u8, 126), out[1]);
     try testing.expectEqual(@as(u8, 0), out[2]);
     try testing.expectEqual(@as(u8, 200), out[3]);
+}
+
+test "parseHeader: rejects fragmented control frame (FIN=0 ping)" {
+    // ping (0x9) with FIN=0, masked, len 0.
+    const buf = [_]u8{ 0x09, 0x80, 0, 0, 0, 0 };
+    try testing.expectEqual(ParseResult.invalid, parseHeader(&buf));
+}
+
+test "parseHeader: rejects oversized control frame (close with extended length)" {
+    // close (0x8) with FIN=1 but len7 == 126 (extended) → invalid.
+    const buf = [_]u8{ 0x88, 0xFE, 0x01, 0x00, 0, 0, 0, 0 };
+    try testing.expectEqual(ParseResult.invalid, parseHeader(&buf));
+}
+
+test "parseHeader: rejects RSV2/RSV3 set" {
+    // text frame with RSV2 (0x20) set, no extension → invalid.
+    const buf = [_]u8{ 0xA1, 0x80, 0, 0, 0, 0 };
+    try testing.expectEqual(ParseResult.invalid, parseHeader(&buf));
+}
+
+test "parseHeader: rejects 64-bit length with MSB set" {
+    // binary frame, len7=127, first length byte has the high bit set.
+    const buf = [_]u8{ 0x82, 0xFF, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    try testing.expectEqual(ParseResult.invalid, parseHeader(&buf));
 }
 
 test "computeAccept: RFC 6455 §1.3 example" {

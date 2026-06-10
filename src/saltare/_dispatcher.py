@@ -269,7 +269,15 @@ def lifespan_startup(app: Any) -> bool:
                 f"{value.get('message', '') if isinstance(value, dict) else ''}\n"
             )
             return False
-        sys.stderr.write(f"saltare: unexpected lifespan startup message: {value}\n")
+        # The app sent something other than startup.complete / startup.failed
+        # as its first lifespan message — typically an app that doesn't check
+        # scope["type"] and replied with an http.response.start. Like uvicorn's
+        # default lifespan="auto", treat this as "app isn't lifespan-aware":
+        # log it and continue serving rather than refusing to boot.
+        sys.stderr.write(
+            f"saltare: unexpected lifespan startup message {msg_type!r}; "
+            f"treating as 'no lifespan support' and continuing\n"
+        )
         return True
 
     if kind == "exception":
@@ -853,12 +861,20 @@ _PMD_SERVER_TAKEOVER = False
 _PMD_CLIENT_TAKEOVER = False
 
 
-def _pmd_negotiate(headers: list[tuple[bytes, bytes]]) -> tuple[bool, str]:
-    """Inspect `Sec-WebSocket-Extensions`. Returns (active, response_token).
-    Active iff client offered `permessage-deflate`. Response is the
-    token to echo on the 101 (with our preferred params)."""
+def _pmd_negotiate(
+    headers: list[tuple[bytes, bytes]],
+) -> tuple[bool, str, bool, bool]:
+    """Inspect `Sec-WebSocket-Extensions`. Returns
+    (active, response_token, server_takeover, client_takeover).
+
+    The two takeover booleans report what was actually negotiated — the
+    frame codec MUST follow them so the deflate/inflate behaviour matches
+    the directives echoed to the client (otherwise the peer's stream
+    desyncs and decompression fails from the second message on)."""
     has_pmd_offer = False
-    client_requests_takeover = False
+    # RFC 7692: the client may forbid the server from keeping context with
+    # `server_no_context_takeover`.
+    client_forbids_server_takeover = False
 
     for name, value in headers:
         if name != b"sec-websocket-extensions":
@@ -870,61 +886,71 @@ def _pmd_negotiate(headers: list[tuple[bytes, bytes]]) -> tuple[bool, str]:
             head, *_rest = (p.strip() for p in tok.split(b";"))
             if head == b"permessage-deflate":
                 has_pmd_offer = True
-                # Check if client requests context takeover
                 for param in tok.split(b";"):
-                    param_lower = param.strip().lower()
-                    if param_lower == b"server_no_context_takeover":
-                        client_requests_takeover = False
-                    elif param_lower == b"server_max_window_bits":
-                        client_requests_takeover = True
+                    if param.strip().lower() == b"server_no_context_takeover":
+                        client_forbids_server_takeover = True
 
     if not has_pmd_offer:
-        return (False, "")
+        return (False, "", False, False)
 
-    # Build response based on our configuration
-    if _PMD_SERVER_TAKEOVER and client_requests_takeover:
-        # Both sides maintain state - best compression
-        return (True, "permessage-deflate")
-    elif _PMD_SERVER_TAKEOVER:
-        # We maintain state, but client doesn't - we must reset anyway
-        return (True, "permessage-deflate; server_no_context_takeover")
-    else:
-        # Default: no context takeover on either side
-        return (True, "permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+    # Server keeps its deflater state only if configured AND not forbidden.
+    server_takeover = _PMD_SERVER_TAKEOVER and not client_forbids_server_takeover
+    # Server keeps its inflater state only if client takeover is enabled.
+    client_takeover = _PMD_CLIENT_TAKEOVER
+
+    params: list[str] = []
+    # If the client must NOT keep context (so we can inflate with a fresh
+    # decompressor each message), require it via the response token.
+    if not client_takeover:
+        params.append("client_no_context_takeover")
+    # If the server will reset each message, announce it so the client
+    # inflates with a fresh decompressor too.
+    if not server_takeover:
+        params.append("server_no_context_takeover")
+
+    token = "permessage-deflate"
+    if params:
+        token += "; " + "; ".join(params)
+    return (True, token, server_takeover, client_takeover)
 
 
-def _pmd_deflate(co: Any, payload: bytes, reuse_compressor: bool = True) -> bytes:
+def _pmd_deflate(co: Any, payload: bytes, reuse_compressor: bool = True) -> tuple[Any, bytes]:
     """RFC 7692 §7.2.1: deflate, append `Z_SYNC_FLUSH`, strip trailing
     4 sync-bytes (`00 00 ff ff`).
 
-    When reuse_compressor is True (default), the compressor state is
-    maintained across messages for better compression on long-running
-    connections. When False, a fresh compressor is created for each
-    message (lower memory, slightly worse compression)."""
+    Returns `(compressor, out)`. The caller MUST store the returned
+    compressor back when `reuse_compressor` is True — otherwise context is
+    silently dropped while the negotiated token claims it is maintained,
+    corrupting the client's decode from the second message on."""
     import zlib as _zlib
-    # If no existing compressor or we're not reusing, create new one
+    # If no existing compressor or we're not reusing, create a fresh one.
     if co is None or not reuse_compressor:
         co = _zlib.compressobj(_PMD_LEVEL, _zlib.DEFLATED, -15)
     out = co.compress(payload) + co.flush(_zlib.Z_SYNC_FLUSH)
     if out.endswith(_PMD_TRAIL):
         out = out[:-4]
-    return out
+    return co, out
 
 
-def _pmd_inflate(co: Any, payload: bytes, max_size: int = 1 * 1024 * 1024) -> bytes | None:
+def _pmd_inflate(
+    co: Any, payload: bytes, reuse_decompressor: bool = False, max_size: int = 1 * 1024 * 1024
+) -> tuple[Any, bytes | None]:
     """Append the 4-byte sync trailer back + raw inflate. Cap at
-    `max_size` to defend against zip-bomb messages. Returns None on
-    overflow / invalid stream."""
+    `max_size` to defend against zip-bomb messages.
+
+    Returns `(decompressor, out)` where `out` is None on overflow / invalid
+    stream. The caller MUST store the returned decompressor back when
+    `reuse_decompressor` is True (client context takeover)."""
     import zlib as _zlib
-    if co is None:
+    if co is None or not reuse_decompressor:
         co = _zlib.decompressobj(-15)
     try:
         out = co.decompress(payload + _PMD_TRAIL, max_size)
     except _zlib.error:
-        return None
+        return co, None
     if co.unconsumed_tail:
-        return None  # exceeded max_size
-    return out
+        return co, None  # exceeded max_size
+    return co, out
 
 
 def _build_server_frame(opcode: int, payload: bytes, rsv1: bool = False) -> bytes:
@@ -958,6 +984,11 @@ class _WsState:
         "pmd_active",          # bool — extension negotiated this conn
         "_pmd_inflater",       # zlib.decompressobj or None
         "_pmd_deflater",       # zlib.compressobj or None
+        # Whether context is actually maintained across messages, as
+        # *negotiated* (not merely as configured). The frame codec must agree
+        # with the token echoed to the client, or the peer's decode desyncs.
+        "_pmd_server_takeover",  # bool — server keeps its deflater state
+        "_pmd_client_takeover",  # bool — server keeps its inflater state
         # v1.7 close-code forwarding. When the app emits `websocket.close`
         # *before* accepting (Channels' AuthMiddleware rejecting on Origin
         # / Host / session), saltare maps the code to an HTTP status so
@@ -983,6 +1014,8 @@ class _WsState:
         self.pmd_active: bool = False
         self._pmd_inflater: Any = None
         self._pmd_deflater: Any = None
+        self._pmd_server_takeover: bool = False
+        self._pmd_client_takeover: bool = False
         self.closed: bool = False
         self.close_code: int = 0
         self.close_reason: str = ""
@@ -1015,16 +1048,16 @@ class _WsState:
             elif mtype == "websocket.send":
                 if self.closed:
                     return
-                reuse = _PMD_SERVER_TAKEOVER
+                reuse = self._pmd_server_takeover
                 if message.get("text") is not None:
                     payload = message["text"].encode("utf-8")
                     if self.pmd_active:
-                        payload = _pmd_deflate(self._pmd_deflater, payload, reuse)
+                        self._pmd_deflater, payload = _pmd_deflate(self._pmd_deflater, payload, reuse)
                     _queue(_build_server_frame(0x1, payload, rsv1=self.pmd_active))
                 elif message.get("bytes") is not None:
                     payload = message["bytes"]
                     if self.pmd_active:
-                        payload = _pmd_deflate(self._pmd_deflater, payload, reuse)
+                        self._pmd_deflater, payload = _pmd_deflate(self._pmd_deflater, payload, reuse)
                     _queue(_build_server_frame(0x2, payload, rsv1=self.pmd_active))
             elif mtype == "websocket.close":
                 code = int(message.get("code", 1000))
@@ -1247,10 +1280,12 @@ def ws_open(
     # v1.6 RFC 7692 negotiate before the app runs, so the app sees a
     # consistent extensions value if it inspects scope. The connection
     # state machine + frame builder consult `pmd_active` from here on.
-    pmd_active, pmd_response = _pmd_negotiate(headers)
+    pmd_active, pmd_response, pmd_server_takeover, pmd_client_takeover = _pmd_negotiate(headers)
     if pmd_active:
         ws_state.pmd_active = True
         ws_state.extensions = pmd_response
+        ws_state._pmd_server_takeover = pmd_server_takeover
+        ws_state._pmd_client_takeover = pmd_client_takeover
     tstate.ws_states[handle] = ws_state
     ws_state.push({"type": "websocket.connect"})
 
@@ -1370,7 +1405,9 @@ def ws_event(handle: int, opcode: int, payload: bytes, rsv1: int = 0) -> tuple[b
         return (b"", True)
 
     if rsv1 and ws_state.pmd_active:
-        decoded = _pmd_inflate(ws_state._pmd_inflater, payload)
+        ws_state._pmd_inflater, decoded = _pmd_inflate(
+            ws_state._pmd_inflater, payload, ws_state._pmd_client_takeover
+        )
         if decoded is None:
             # Malformed compressed frame or zip-bomb cap exceeded.
             # Treat as protocol error — close the conn.

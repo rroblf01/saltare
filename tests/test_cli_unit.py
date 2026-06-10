@@ -27,7 +27,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src", "saltare", "cli.py")
 if os.path.exists(_SRC):
     # Load from source (no _core dependency needed)
     _mock_saltare = _types.ModuleType("saltare")
-    _mock_saltare.__version__ = "1.9.0"
+    _mock_saltare.__version__ = "1.10.0"
 
     def _mock_run(**kwargs):
         pass

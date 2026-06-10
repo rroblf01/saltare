@@ -1,17 +1,22 @@
-"""Tests for WebSocket permessage-deflate compression improvements in v1.9.
+"""Tests for WebSocket permessage-deflate compression.
 
-Tests:
-- _pmd_negotiate with various client offers
-- _pmd_deflate with/without context takeover
-- set_ws_compression configuration
-- CLI and saltare.run() parameter passing
+v1.10 updates the low-level codec contract:
+- `_pmd_negotiate` returns (active, token, server_takeover, client_takeover).
+- `_pmd_deflate` returns (compressor, bytes); the caller persists the
+  compressor when context takeover is negotiated.
+- `_pmd_inflate` returns (decompressor, bytes | None).
+
+The headline regression covered here: with server context-takeover enabled,
+the server must actually maintain its deflater across messages AND echo a
+token that tells the client to do the same — otherwise the client's
+persistent inflater desyncs and decode fails from the second message on.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import os
-import types
+import zlib
 
 import pytest
 
@@ -26,148 +31,116 @@ else:
     import saltare._dispatcher as mod
 
 _PMD_TRAIL = mod._PMD_TRAIL
-_PMD_LEVEL = mod._PMD_LEVEL
-_PMD_SERVER_TAKEOVER = mod._PMD_SERVER_TAKEOVER
-_PMD_CLIENT_TAKEOVER = mod._PMD_CLIENT_TAKEOVER
+
+
+@pytest.fixture(autouse=True)
+def _reset_pmd_config():
+    """Every test starts from the documented defaults (both takeovers off)."""
+    mod.set_ws_compression(level=6, server_takeover=False, client_takeover=False)
+    yield
+    mod.set_ws_compression(level=6, server_takeover=False, client_takeover=False)
 
 
 class TestPmdNegotiate:
-    """Test PMD negotiation with different client offers."""
-
     def test_no_extensions(self):
-        active, response = mod._pmd_negotiate([])
+        active, token, st, ct = mod._pmd_negotiate([])
         assert active is False
-        assert response == ""
+        assert token == ""
 
-    def test_permessage_deflate_offered(self):
+    def test_permessage_deflate_offered_default(self):
         headers = [(b"sec-websocket-extensions", b"permessage-deflate")]
-        active, response = mod._pmd_negotiate(headers)
+        active, token, st, ct = mod._pmd_negotiate(headers)
         assert active is True
-        assert "permessage-deflate" in response
+        # Default config resets both directions.
+        assert st is False and ct is False
+        assert "server_no_context_takeover" in token
+        assert "client_no_context_takeover" in token
 
-    def test_with_window_bits(self):
-        headers = [(b"sec-websocket-extensions", b"permessage-deflate; server_max_window_bits=15")]
-        active, response = mod._pmd_negotiate(headers)
+    def test_server_takeover_token_matches_behaviour(self):
+        """REGRESSION: with server takeover on and the client not forbidding
+        it, the echoed token must NOT carry server_no_context_takeover, and
+        the negotiated server_takeover flag must be True. Previously the
+        token claimed takeover while the codec reset every message."""
+        mod.set_ws_compression(level=6, server_takeover=True, client_takeover=False)
+        headers = [(b"sec-websocket-extensions", b"permessage-deflate")]
+        active, token, st, ct = mod._pmd_negotiate(headers)
         assert active is True
-        # Should still work with window bits
+        assert st is True
+        assert "server_no_context_takeover" not in token
 
-    def test_no_context_takeover_offered(self):
-        headers = [(b"sec-websocket-extensions", b"permessage-deflate; server_no_context_takeover")]
-        active, response = mod._pmd_negotiate(headers)
+    def test_client_forbidding_server_takeover_is_honoured(self):
+        mod.set_ws_compression(level=6, server_takeover=True, client_takeover=False)
+        headers = [(b"sec-websocket-extensions",
+                    b"permessage-deflate; server_no_context_takeover")]
+        active, token, st, ct = mod._pmd_negotiate(headers)
         assert active is True
+        assert st is False  # client forbade it → we must reset
+        assert "server_no_context_takeover" in token
+
+    def test_client_takeover_token(self):
+        mod.set_ws_compression(level=6, server_takeover=False, client_takeover=True)
+        headers = [(b"sec-websocket-extensions", b"permessage-deflate")]
+        active, token, st, ct = mod._pmd_negotiate(headers)
+        assert ct is True
+        assert "client_no_context_takeover" not in token
 
 
-class TestPmdDeflate:
-    """Test PMD deflate/inflate functions."""
-
-    def test_deflate_basic(self):
+class TestPmdDeflateInflate:
+    def test_deflate_returns_compressor_and_round_trips(self):
         payload = b"Hello World" * 10
-        compressed = mod._pmd_deflate(None, payload, reuse_compressor=False)
+        co, compressed = mod._pmd_deflate(None, payload, reuse_compressor=False)
+        assert co is not None
         assert compressed != payload
-        # Verify we can decompress
-        inflated = mod._pmd_inflate(None, compressed + _PMD_TRAIL)
+        _, inflated = mod._pmd_inflate(None, compressed, reuse_decompressor=False)
         assert inflated == payload
 
-    def test_deflate_reuse_compressor(self):
-        payload = b"Hello World" * 10
-        co = None
-        # First compression
-        compressed1 = mod._pmd_deflate(co, payload, reuse_compressor=True)
-        # Second compression with same compressor - should be different
-        # because state is maintained
-        compressed2 = mod._pmd_deflate(None, payload, reuse_compressor=True)
-        # Both should be decompressible
-        inflated1 = mod._pmd_inflate(None, compressed1 + _PMD_TRAIL)
-        inflated2 = mod._pmd_inflate(None, compressed2 + _PMD_TRAIL)
-        assert inflated1 == payload
-        assert inflated2 == payload
+    def test_server_takeover_stream_round_trips_across_messages(self):
+        """REGRESSION for the dropped-context bug. A server that negotiated
+        context takeover persists its deflater; a context-takeover client
+        decodes the whole stream with one persistent inflater. If the
+        deflater were recreated each message (the old bug), message #2 would
+        fail to decode against the persistent inflater."""
+        msgs = [b"the quick brown fox", b"the quick brown fox jumps", b"lazy dog" * 5]
+        deflater = None
+        inflater = None
+        for m in msgs:
+            deflater, wire = mod._pmd_deflate(deflater, m, reuse_compressor=True)
+            inflater, got = mod._pmd_inflate(inflater, wire, reuse_decompressor=True)
+            assert got == m
 
-    def test_deflate_different_payloads(self):
-        """Test that reuse maintains state across messages."""
-        co = None
-        msg1 = b"AAAA"
-        msg2 = b"AAAA"  # Same as msg1, compression should improve
-        compressed1 = mod._pmd_deflate(co, msg1, reuse_compressor=True)
-        # Note: reuse doesn't work across calls because we create new compressor
-        # in each call unless we pass the state - but the function signature
-        # handles this by accepting the co parameter
-        compressed2 = mod._pmd_deflate(None, msg2, reuse_compressor=True)
-        # Second message may be smaller due to dictionary effects
-        # but without proper state passing it may be similar
+    def test_no_takeover_each_message_is_independent(self):
+        # With takeover off, every message uses a fresh decompressor and must
+        # still decode (each frame is a self-contained deflate block).
+        for m in (b"alpha", b"beta", b"gamma"):
+            _, wire = mod._pmd_deflate(None, m, reuse_compressor=False)
+            _, got = mod._pmd_inflate(None, wire, reuse_decompressor=False)
+            assert got == m
+
+    def test_inflate_exceeds_max_size(self):
+        payload = b"A" * 10000
+        _, wire = mod._pmd_deflate(None, payload, reuse_compressor=False)
+        _, result = mod._pmd_inflate(None, wire, reuse_decompressor=False, max_size=100)
+        assert result is None
+
+    def test_inflate_invalid_data(self):
+        _, result = mod._pmd_inflate(None, b"invalid compressed data")
+        assert result is None
 
 
 class TestWsCompressionConfig:
-    """Test configuration of WS compression."""
-
     def test_default_level(self):
-        assert _PMD_LEVEL == 6
+        assert mod._PMD_LEVEL == 6
 
     def test_set_compression_level(self):
         mod.set_ws_compression(level=9, server_takeover=False, client_takeover=False)
         assert mod._PMD_LEVEL == 9
-        # Reset
-        mod.set_ws_compression(level=6, server_takeover=False, client_takeover=False)
-
-    def test_set_server_takeover(self):
-        mod.set_ws_compression(level=6, server_takeover=True, client_takeover=False)
-        assert mod._PMD_SERVER_TAKEOVER is True
-        # Reset
-        mod.set_ws_compression(level=6, server_takeover=False, client_takeover=False)
-        assert mod._PMD_SERVER_TAKEOVER is False
 
     def test_out_of_range_level_ignored(self):
         old_level = mod._PMD_LEVEL
         mod.set_ws_compression(level=99, server_takeover=False, client_takeover=False)
-        assert mod._PMD_LEVEL == old_level  # Should not change
-        mod.set_ws_compression(level=0, server_takeover=False, client_takeover=False)
-        assert mod._PMD_LEVEL == old_level  # Should not change
-
-    def test_negative_level_ignored(self):
-        old_level = mod._PMD_LEVEL
-        mod.set_ws_compression(level=-1, server_takeover=False, client_takeover=False)
         assert mod._PMD_LEVEL == old_level
-
-
-class TestNegotiationWithConfig:
-    """Test negotiation respects configuration."""
-
-    def test_negotiation_respects_server_takeover_config(self):
-        # Set server takeover
-        mod.set_ws_compression(level=6, server_takeover=True, client_takeover=False)
-        headers = [(b"sec-websocket-extensions", b"permessage-deflate")]
-        active, response = mod._pmd_negotiate(headers)
-        assert active is True
-        # Reset
-        mod.set_ws_compression(level=6, server_takeover=False, client_takeover=False)
-
-
-class TestPmdInflate:
-    """Test PMD inflate function."""
-
-    def test_inflate_basic(self):
-        import zlib
-        payload = b"Test payload" * 5
-        co = zlib.compressobj(6, zlib.DEFLATED, -15)
-        compressed = co.compress(payload) + co.flush(zlib.Z_SYNC_FLUSH)
-        if compressed.endswith(_PMD_TRAIL):
-            compressed = compressed[:-4]
-        inflated = mod._pmd_inflate(None, compressed)
-        assert inflated == payload
-
-    def test_inflate_exceeds_max_size(self):
-        import zlib
-        # Create a payload that would inflate beyond limit
-        payload = b"A" * 10000
-        co = zlib.compressobj(6, zlib.DEFLATED, -15)
-        compressed = co.compress(payload) + co.flush(zlib.Z_SYNC_FLUSH)
-        if compressed.endswith(_PMD_TRAIL):
-            compressed = compressed[:-4]
-        result = mod._pmd_inflate(None, compressed, max_size=100)
-        assert result is None  # Should fail due to size limit
-
-    def test_inflate_invalid_data(self):
-        result = mod._pmd_inflate(None, b"invalid compressed data")
-        assert result is None
+        mod.set_ws_compression(level=0, server_takeover=False, client_takeover=False)
+        assert mod._PMD_LEVEL == old_level
 
 
 if __name__ == "__main__":

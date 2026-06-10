@@ -35,10 +35,6 @@ jobs:
   # Python versions (cp310 .. cp314) for its one (libc, arch) combo.
   # GitHub free-tier concurrency caps at ~20 parallel jobs; 4 is safely
   # under that and runs in parallel with build_sdist + test_wheels.
-  #
-  # Wall-time math (per job): 5 wheels × ~80 s each (no per-wheel test
-  # install thanks to CIBW_TEST_SKIP) ≈ 7 min. Was: 10 wheels serial
-  # per arch × ~150 s = 25 min.
   build_wheels:
     name: wheels ${{ matrix.libc }} ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
@@ -71,6 +67,14 @@ jobs:
           ZIG_SKIP_SYMLINK: "1"
         run: bash scripts/install-zig.sh
 
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/zig-global-cache
+          key: zig-build-${{ matrix.arch }}-${{ matrix.libc }}-${{ github.sha }}
+          restore-keys: |
+            zig-build-${{ matrix.arch }}-${{ matrix.libc }}-
+
       # Tier-5: cache pip's download/wheel cache across runs so the
       # build-time dependency install (`scikit-build-core`, `ninja`) skips
       # the PyPI round-trip on cache hits. Keyed by pyproject.toml so
@@ -84,15 +88,7 @@ jobs:
             pip-${{ matrix.arch }}-${{ matrix.libc }}-
 
       # Tier-3: skip cibuildwheel's per-wheel test pass entirely. Tests
-      # run once in the separate `test_wheels` job below — much cheaper
-      # than re-installing pytest/fastapi/httpx/websockets inside every
-      # one of the 5 manylinux containers. The trade-off is per-Python-
-      # version coverage of the import path; the separate test job
-      # exercises a representative subset (cp310, cp312, cp314) so a
-      # version-specific ABI regression still surfaces.
-      #
-      # CIBW_BUILD limits the matrix slot to one (libc, arch) combo so
-      # the 4 parallel jobs don't all rebuild the same wheels.
+      # run once in the separate `test_wheels` job below.
       - name: Build wheels
         uses: nick-fields/retry@v3
         with:
@@ -101,11 +97,12 @@ jobs:
           retry_wait_seconds: 30
           retry_on: error
           command: |
+            mkdir -p ${{ runner.temp }}/zig-global-cache
             CIBW_ARCHS=${{ matrix.arch }} \
             CIBW_BUILD='cp31?-${{ matrix.libc }}_*' \
             CIBW_TEST_SKIP='*' \
-            CIBW_CONTAINER_ENGINE='docker; create_args: --volume ${{ runner.temp }}/zig:/host-zig:ro' \
-            CIBW_ENVIRONMENT_LINUX='PATH=/host-zig:/usr/local/bin:$PATH ZIG_VERSION=${{ env.ZIG_VERSION }}' \
+            CIBW_CONTAINER_ENGINE='docker; create_args: --volume ${{ runner.temp }}/zig:/host-zig:ro --volume ${{ runner.temp }}/zig-global-cache:/host-zig-cache:rw' \
+            CIBW_ENVIRONMENT_LINUX='PATH=/host-zig:/usr/local/bin:$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/host-zig-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0' \
             pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
@@ -181,9 +178,7 @@ jobs:
           path: ./dist/*.tar.gz
 
   # ---------------------------------------------------------------------------
-  # PyPI publish. Gated on tag pushes AND on test_wheels passing — the
-  # latter is the v1.7 addition (was: published as soon as wheels built,
-  # before any test confirmed they were installable).
+  # PyPI publish. Gated on tag pushes AND on test_wheels passing.
   publish:
     name: Publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')

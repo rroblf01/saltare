@@ -384,20 +384,20 @@ class TestBuildServerFrame:
 class TestPmdNegotiate:
     def test_no_extensions_header(self):
         mod = _import()
-        active, response = mod._pmd_negotiate([])
+        active, response, _st, _ct = mod._pmd_negotiate([])
         assert active is False
         assert response == ""
 
     def test_unrelated_extension(self):
         mod = _import()
         headers = [(b"sec-websocket-extensions", b"foo-bar")]
-        active, response = mod._pmd_negotiate(headers)
+        active, response, _st, _ct = mod._pmd_negotiate(headers)
         assert active is False
 
     def test_permessage_deflate_offered(self):
         mod = _import()
         headers = [(b"sec-websocket-extensions", b"permessage-deflate")]
-        active, response = mod._pmd_negotiate(headers)
+        active, response, _st, _ct = mod._pmd_negotiate(headers)
         assert active is True
         assert "permessage-deflate" in response
         assert "client_no_context_takeover" in response
@@ -409,13 +409,13 @@ class TestPmdNegotiate:
             (b"sec-websocket-extensions",
              b"permessage-deflate; client_max_window_bits=15")
         ]
-        active, response = mod._pmd_negotiate(headers)
+        active, response, _st, _ct = mod._pmd_negotiate(headers)
         assert active is True
 
     def test_multiple_extensions(self):
         mod = _import()
         headers = [(b"sec-websocket-extensions", b"foo, permessage-deflate, bar")]
-        active, response = mod._pmd_negotiate(headers)
+        active, response, _st, _ct = mod._pmd_negotiate(headers)
         assert active is True
 
     def test_multiple_header_lines(self):
@@ -424,7 +424,7 @@ class TestPmdNegotiate:
             (b"sec-websocket-extensions", b"foo"),
             (b"sec-websocket-extensions", b"permessage-deflate"),
         ]
-        active, response = mod._pmd_negotiate(headers)
+        active, response, _st, _ct = mod._pmd_negotiate(headers)
         assert active is True
 
 
@@ -437,39 +437,39 @@ class TestPmdDeflateInflate:
     def test_roundtrip_small_payload(self):
         mod = _import()
         original = b"hello world"
-        compressed = mod._pmd_deflate(None, original)
+        _, compressed = mod._pmd_deflate(None, original)
         assert compressed != original
-        decompressed = mod._pmd_inflate(None, compressed)
+        _, decompressed = mod._pmd_inflate(None, compressed)
         assert decompressed == original
 
     def test_roundtrip_large_payload(self):
         mod = _import()
         original = b"x" * 10000
-        compressed = mod._pmd_deflate(None, original)
-        decompressed = mod._pmd_inflate(None, compressed)
+        _, compressed = mod._pmd_deflate(None, original)
+        _, decompressed = mod._pmd_inflate(None, compressed)
         assert decompressed == original
 
     def test_invalid_compressed_data_returns_none(self):
         mod = _import()
-        result = mod._pmd_inflate(None, b"garbage data that is not deflate")
+        _, result = mod._pmd_inflate(None, b"garbage data that is not deflate")
         assert result is None
 
     def test_payload_exceeds_max_size(self):
         mod = _import()
         # Create a payload that inflates to > max_size
         original = b"A" * 2000
-        compressed = mod._pmd_deflate(None, original)
-        result = mod._pmd_inflate(None, compressed, max_size=100)
+        _, compressed = mod._pmd_deflate(None, original)
+        _, result = mod._pmd_inflate(None, compressed, max_size=100)
         assert result is None
 
     def test_compressor_recreated_per_call(self):
         mod = _import()
-        c1 = mod._pmd_deflate(None, b"msg1")
-        c2 = mod._pmd_deflate(None, b"msg2")
+        _, c1 = mod._pmd_deflate(None, b"msg1")
+        _, c2 = mod._pmd_deflate(None, b"msg2")
         # Without context takeover, each call uses a fresh compressor
         # and produces independent output.
-        d1 = mod._pmd_inflate(None, c1)
-        d2 = mod._pmd_inflate(None, c2)
+        _, d1 = mod._pmd_inflate(None, c1)
+        _, d2 = mod._pmd_inflate(None, c2)
         assert d1 == b"msg1"
         assert d2 == b"msg2"
 
@@ -1021,3 +1021,43 @@ async def _dummy_http_app(scope, receive, send):
         "headers": [(b"content-type", b"text/plain")],
     })
     await send({"type": "http.response.body", "body": b"ok"})
+
+
+# ===================================================================
+# lifespan_startup protocol handling (v1.10)
+# ===================================================================
+
+
+class TestLifespanStartup:
+    def test_startup_complete_returns_true(self):
+        mod = _import()
+
+        async def app(scope, receive, send):
+            assert scope["type"] == "lifespan"
+            assert (await receive())["type"] == "lifespan.startup"
+            await send({"type": "lifespan.startup.complete"})
+            await receive()  # park awaiting shutdown
+
+        assert mod.lifespan_startup(app) is True
+
+    def test_startup_failed_returns_false(self):
+        mod = _import()
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "lifespan.startup.failed", "message": "boom"})
+
+        assert mod.lifespan_startup(app) is False
+
+    def test_unexpected_startup_message_is_lenient(self):
+        """An app that doesn't check scope["type"] and replies with an
+        unexpected message (e.g. http.response.start during lifespan) is
+        treated as 'not lifespan-aware' — saltare logs it and keeps serving
+        (uvicorn lifespan="auto" semantics), rather than refusing to boot."""
+        mod = _import()
+
+        async def app(scope, receive, send):
+            await receive()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+
+        assert mod.lifespan_startup(app) is True
