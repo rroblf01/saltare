@@ -74,7 +74,12 @@ fn malloc_trim(pad: usize) c_int {
     return 0; // musl path: no-op, succeed silently
 }
 
-const SERVER_HEADER = "saltare/1.6.0";
+/// Single source of truth for the version string across the Zig core.
+/// `module.zig`'s `version()` returns this, and it backs the default
+/// `Server:` header below — keeping both from drifting the way the old
+/// hardcoded "1.6.0" / "1.9.0" literals did.
+pub const VERSION = "1.11.0";
+const SERVER_HEADER = "saltare/" ++ VERSION;
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
 /// one `serve()` call. Defaults match what the Python `saltare.run()`

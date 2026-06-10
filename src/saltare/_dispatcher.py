@@ -363,7 +363,18 @@ _REASONS: dict[int, str] = {
     502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout",
 }
 
-_SERVER_HEADER = b"saltare/1.9.0"
+# Derive the default Server header from the single source of truth
+# (`_core.version()`) so it can't silently drift from the package version
+# the way a hardcoded literal did (was pinned at "1.9.0" while the package
+# was 1.11.0). Fall back to an unversioned token if _core isn't importable
+# yet for any reason — the header is cosmetic and must never block startup.
+try:
+    from saltare import _core as _server_hdr_core
+
+    _SERVER_HEADER = b"saltare/" + _server_hdr_core.version().encode("ascii")
+    del _server_hdr_core
+except Exception:  # noqa: BLE001 - cosmetic header; never fail import over it
+    _SERVER_HEADER = b"saltare"
 
 
 # ---------------------------------------------------------------------------

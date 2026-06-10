@@ -141,7 +141,10 @@ inline fn pyReturnNone() ?*py.PyObject {
 }
 
 fn saltareVersion(_: ?*py.PyObject, _: ?*py.PyObject) callconv(.c) ?*py.PyObject {
-    return py.PyUnicode_FromString("1.11.0");
+    // Single source of truth lives in server.zig (also backs the default
+    // Server header). String literals are sentinel-terminated, so this
+    // coerces to the [*c]const u8 PyUnicode_FromString wants.
+    return py.PyUnicode_FromString(server.VERSION);
 }
 
 fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObject {
@@ -928,6 +931,21 @@ export fn PyInit__core() ?*py.PyObject {
     // sharing them gives unified process-wide /metrics) and (b) config applied
     // ONCE before any worker thread and read-only inside the re-entrant
     // serveLoop(); the racy connection lists/loop-timers are per-`Runtime`.
+    //
+    // KNOWN LIMITATION (one serve per process): the config globals are
+    // set-once, not per-`Runtime` — `g_timeouts`, `g_limits`, `g_obs`,
+    // `g_tls_ctx`, `g_listen_fd`, `g_server_line`. That is safe for how the
+    // module is actually used (a single `serve()` per process, optionally
+    // pre-forking workers that inherit the already-applied config). It is
+    // NOT safe to have *two own-GIL interpreters in the same process each
+    // call `serve()` with different config* — the second clobbers the
+    // first's listen fd / timeouts / TLS context. Finishing that isolation
+    // (moving config into `Runtime` too) is only worth doing if a real
+    // multi-serve-per-process driver appears; the v1.11 measurement showed
+    // sub-interpreter *workers* cost more RAM than fork, so there is no
+    // such driver today. The declaration stands because it is true for the
+    // supported single-serve model and costs nothing at runtime.
+    //
     // Slot ids are version-gated: multiple_interpreters is 3.12+, gil is 3.13+.
     if (comptime py.PY_VERSION_HEX >= 0x030C0000) {
         // Py_MOD_PER_INTERPRETER_GIL_SUPPORTED == (void *)2
