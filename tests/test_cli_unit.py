@@ -88,6 +88,21 @@ class TestIsSaltareMainEntry:
         finally:
             sys.argv = old_argv
 
+    def test_foreign_main_py_under_saltare_dir_is_not_entry(self):
+        """Regression: the project / venv may live under a directory whose
+        name contains "saltare" (e.g. cloned into ~/code/saltare). A naive
+        `"saltare" in arg0` substring check then matched *any* `python -m
+        <tool>` run from that tree — pytest, build, mypy — and re-execed it
+        as the saltare CLI, which died parsing the foreign tool's argv.
+        Only the saltare package's own __main__.py (parent dir == saltare)
+        is a real entry point."""
+        old_argv = sys.argv
+        try:
+            sys.argv = ["/home/me/saltare/.venv/lib/python3.14/site-packages/pytest/__main__.py"]
+            assert CLI._is_saltare_main_entry() is False
+        finally:
+            sys.argv = old_argv
+
     def test_empty_argv(self):
         old_argv = sys.argv
         try:

@@ -23,9 +23,17 @@ def _is_saltare_main_entry() -> bool:
     if base_stem == "saltare" or base_stem == "saltare-script":
         return True
     # `python -m saltare` resolves argv[0] to the saltare package's
-    # __main__.py, e.g. `/.../site-packages/saltare/__main__.py`.
-    if arg0.endswith("__main__.py") and "saltare" in arg0:
-        return True
+    # __main__.py, e.g. `/.../site-packages/saltare/__main__.py`. Match on
+    # the *parent directory name* being exactly "saltare" — a naive
+    # `"saltare" in arg0` substring check misfires whenever the project or
+    # venv lives under a directory that happens to contain "saltare"
+    # (e.g. `/home/me/saltare/.venv/.../pytest/__main__.py`), which would
+    # hijack any unrelated `python -m <tool>` run from that tree and
+    # re-exec it as the saltare CLI.
+    if arg0.endswith("__main__.py"):
+        parent = os.path.basename(os.path.dirname(arg0))
+        if parent == "saltare":
+            return True
     return False
 
 
