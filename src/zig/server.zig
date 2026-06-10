@@ -3404,6 +3404,17 @@ fn h2Transcode(conn: *Connection, h1_bytes: []const u8, done: bool) bool {
     return appendWriteBuf(conn, out.items);
 }
 
+// Resume sending response body that was held behind the flow-control window,
+// after a WINDOW_UPDATE grew it. Appends any newly-unblocked frames to
+// write_buf. Returns false on error (caller tears down).
+fn h2PumpResume(conn: *Connection) bool {
+    const tc = conn.h2_resp orelse return true;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(conn.allocator);
+    tc.pumpInto(&out) catch return false;
+    return appendWriteBuf(conn, out.items);
+}
+
 fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
     const h2c = conn.h2_conn orelse {
         loop.remove(conn.fd);
@@ -3580,7 +3591,13 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
                 conn.destroy();
                 return;
             };
-            tc.* = h2_response.Transcoder.init(conn.allocator, result.stream_id, h2c.settings.max_frame_size);
+            tc.* = h2_response.Transcoder.init(
+                conn.allocator,
+                result.stream_id,
+                h2c.settings.max_frame_size,
+                h2c.peer_initial_window,
+                &h2c.send_conn_window,
+            );
             conn.h2_resp = tc;
 
             conn.write_pos = 0;
@@ -3647,6 +3664,28 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
                 conn.dispatch_active = !tick.done;
                 if (tick.done) {
                     conn.dispatch_handle = 0;
+                }
+            }
+        }
+        if (result.window_update) {
+            // The peer grew a send window. Stream-level updates apply to the
+            // active response transcoder; the connection-level update was
+            // already applied to h2c.send_conn_window. Either way, resume
+            // sending any body that was held behind flow control.
+            if (conn.h2_resp) |tc| {
+                if (result.wu_stream != 0 and result.wu_stream == tc.stream_id) {
+                    tc.addStreamWindow(result.wu_increment);
+                }
+                if (!h2PumpResume(conn)) {
+                    loop.remove(conn.fd);
+                    conn.destroy();
+                    return;
+                }
+                if (conn.write_pos < conn.write_buf.len) {
+                    loop.modify(conn.fd, @ptrCast(conn), false, true) catch {
+                        conn.destroy();
+                        return;
+                    };
                 }
             }
         }
@@ -4481,7 +4520,24 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
         // (and we move on to keep-alive / close), or stalls (no chunks, not
         // done — kept in .writing state, level-triggered EPOLLOUT will wake
         // us back into doWrite when the kernel sees the socket writable).
-        if (!conn.dispatch_active) break;
+        if (!conn.dispatch_active) {
+            // HTTP/2: the dispatcher may be done while the transcoder still
+            // holds body it couldn't send under the peer's flow-control window.
+            // Don't finish the stream yet — park on read to await a
+            // WINDOW_UPDATE, whose handler pumps the rest and re-arms write.
+            if (conn.state == .http2) {
+                if (conn.h2_resp) |tc| {
+                    if (tc.blockedOnFlowControl()) {
+                        loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+                            loop.remove(conn.fd);
+                            conn.destroy();
+                        };
+                        return;
+                    }
+                }
+            }
+            break;
+        }
 
         if (conn.write_buf.len > 0) {
             conn.allocator.free(conn.write_buf);
@@ -4518,8 +4574,15 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
             conn.dispatch_active = !tick.done;
             if (tick.done) conn.dispatch_handle = 0;
             if (conn.write_pos < conn.write_buf.len) continue; // frames to write
-            if (tick.done) break;
-            // No new frames and not done → stall (handled below).
+            // The stream is finished only when END_STREAM has gone out, NOT
+            // merely when the dispatcher is done — the transcoder may still
+            // hold body behind the peer's flow-control window.
+            if (conn.h2_resp) |tc| {
+                if (tc.isDone()) break;
+            }
+            // Otherwise fall through to park: want-read catches the peer's
+            // WINDOW_UPDATE (flow-control blocked), and linkStalled lets the
+            // global pump advance a still-streaming task.
         } else {
             if (tick.chunks.len > 0) {
                 conn.write_buf = tick.chunks;

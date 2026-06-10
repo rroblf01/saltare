@@ -22,8 +22,12 @@
 //   * De-frames chunked bodies back into a plain byte stream.
 //   * Splits the body into DATA frames no larger than the peer's
 //     SETTINGS_MAX_FRAME_SIZE.
+//   * Honours HTTP/2 flow control (RFC 7540 §6.9): never sends more DATA than
+//     the peer's stream and connection receive windows allow. Body that does
+//     not fit is held in `body_pending`; `addStreamWindow` / a connection
+//     WINDOW_UPDATE plus `pumpInto` resume sending.
 //   * Places END_STREAM on the final frame: on HEADERS for an empty body,
-//     otherwise on the last DATA frame (flushed by `finish`).
+//     otherwise on the last DATA frame.
 
 const std = @import("std");
 const h2 = @import("h2.zig");
@@ -54,22 +58,42 @@ pub const Transcoder = struct {
     content_length: ?usize = null, // null until parsed; set for Content-Length bodies
     length_remaining: usize = 0,
     no_body: bool = false, // status implies empty body (1xx/204/304) or CL 0
+    // True once the dispatcher signalled the response is complete (finish()).
+    // Until then we hold the sub-max-frame tail so END_STREAM lands on the last
+    // real DATA frame rather than a trailing empty one.
+    body_complete: bool = false,
 
     // Chunked de-framing state.
     chunk_state: ChunkState = .size_line,
     chunk_remaining: usize = 0,
     line_buf: std.ArrayList(u8) = .empty,
 
-    // Body bytes decoded but not yet framed; held so we can place END_STREAM
-    // on the final DATA frame rather than emitting a trailing empty one.
+    // Body bytes decoded but not yet framed/sent.
     body_pending: std.ArrayList(u8) = .empty,
 
-    pub fn init(allocator: std.mem.Allocator, stream_id: u31, max_frame_size: usize) Transcoder {
+    // Outbound flow control (RFC 7540 §6.9). `send_stream_window` is this
+    // stream's send window, seeded from the peer's SETTINGS_INITIAL_WINDOW_SIZE
+    // and grown by stream WINDOW_UPDATEs. `conn_window` points at the
+    // connection-level send window owned by the h2.Connection (shared across
+    // streams, grown by stream-0 WINDOW_UPDATEs). We may send DATA only up to
+    // min(both).
+    send_stream_window: i64 = 0,
+    conn_window: *i64,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        stream_id: u31,
+        max_frame_size: usize,
+        peer_initial_window: u32,
+        conn_window: *i64,
+    ) Transcoder {
         return .{
             .allocator = allocator,
             .stream_id = stream_id,
             // Defend against a degenerate advertised size; HTTP/2 floors it at 2^14.
             .max_frame_size = if (max_frame_size < 16384) 16384 else max_frame_size,
+            .send_stream_window = @intCast(peer_initial_window),
+            .conn_window = conn_window,
         };
     }
 
@@ -108,8 +132,7 @@ pub const Transcoder = struct {
                     try self.body_pending.appendSlice(self.allocator, rest[0..take]);
                     self.length_remaining -= take;
                     rest = rest[take..];
-                    try self.flushFullFrames(out);
-                    if (self.length_remaining == 0) self.phase = .done;
+                    try self.pump(out);
                 },
                 .body_chunked => {
                     rest = try self.feedChunked(rest, out);
@@ -119,25 +142,40 @@ pub const Transcoder = struct {
         }
     }
 
-    /// Signal that the dispatcher has produced the entire response. Flushes the
-    /// remaining buffered body as the final DATA frame with END_STREAM (or, for
-    /// an empty body where HEADERS already carried END_STREAM, does nothing).
+    /// Signal that the dispatcher has produced the entire response. Marks the
+    /// body complete and flushes as much as flow control allows; END_STREAM
+    /// rides the last DATA frame (or HEADERS, for an empty body). If the peer's
+    /// window is exhausted, the tail stays buffered until `pumpInto` resumes.
     pub fn finish(self: *Transcoder, out: *std.ArrayList(u8)) Error!void {
         if (!self.headers_emitted) {
             // Degenerate: finished before a full header block arrived. Nothing
             // valid to send; the caller treats this as a torn-down stream.
             return;
         }
-        if (self.end_stream_sent) return;
-        // Emit remaining body (possibly empty) as the END_STREAM-bearing frame.
-        try self.emitData(out, self.body_pending.items, true);
-        self.body_pending.clearRetainingCapacity();
-        self.end_stream_sent = true;
-        self.phase = .done;
+        self.body_complete = true;
+        try self.pump(out);
+    }
+
+    /// Resume sending buffered body after a WINDOW_UPDATE grew a window.
+    pub fn pumpInto(self: *Transcoder, out: *std.ArrayList(u8)) Error!void {
+        if (self.headers_emitted) try self.pump(out);
+    }
+
+    /// Grow this stream's send window (stream WINDOW_UPDATE from the peer).
+    pub fn addStreamWindow(self: *Transcoder, increment: u32) void {
+        self.send_stream_window += @intCast(increment);
+        if (self.send_stream_window > h2.HTTP2_MAX_WINDOW) self.send_stream_window = h2.HTTP2_MAX_WINDOW;
     }
 
     pub fn isDone(self: *const Transcoder) bool {
         return self.end_stream_sent;
+    }
+
+    /// True when the dispatcher is done but body is still buffered behind the
+    /// flow-control window — the server should wait for a WINDOW_UPDATE rather
+    /// than tear the stream down.
+    pub fn blockedOnFlowControl(self: *const Transcoder) bool {
+        return self.body_complete and !self.end_stream_sent;
     }
 
     // --- header accumulation -------------------------------------------------
@@ -289,13 +327,12 @@ pub const Transcoder = struct {
                     try self.body_pending.appendSlice(self.allocator, rest[0..take]);
                     self.chunk_remaining -= take;
                     rest = rest[take..];
-                    try self.flushFullFrames(out);
+                    try self.pump(out);
                     if (self.chunk_remaining == 0) self.chunk_state = .data_crlf;
                 },
                 .data_crlf => {
                     // Consume the CRLF that follows chunk data.
                     if (rest[0] == '\r' or rest[0] == '\n') {
-                        // Skip CR and/or LF tolerantly.
                         if (rest[0] == '\r') {
                             rest = rest[1..];
                             if (rest.len == 0) return rest;
@@ -321,7 +358,7 @@ pub const Transcoder = struct {
                     const line = std.mem.trim(u8, self.line_buf.items, "\r\n \t");
                     self.line_buf.clearRetainingCapacity();
                     if (line.len == 0) {
-                        // Blank line → end of trailers → body complete.
+                        // Blank line → end of trailers → no more body input.
                         self.phase = .done;
                         return rest;
                     }
@@ -332,16 +369,49 @@ pub const Transcoder = struct {
         return rest;
     }
 
-    // --- DATA framing --------------------------------------------------------
+    // --- DATA framing (flow-control aware) -----------------------------------
 
-    // Emit max-frame-size DATA frames while the pending buffer is large enough,
-    // keeping a remainder for the final (END_STREAM) frame.
-    fn flushFullFrames(self: *Transcoder, out: *std.ArrayList(u8)) Error!void {
-        while (self.body_pending.items.len > self.max_frame_size) {
-            try self.emitData(out, self.body_pending.items[0..self.max_frame_size], false);
-            const rem = self.body_pending.items.len - self.max_frame_size;
-            std.mem.copyForwards(u8, self.body_pending.items[0..rem], self.body_pending.items[self.max_frame_size..]);
+    // Emit DATA frames from body_pending, bounded by max_frame_size and the
+    // stream + connection send windows. While the body is still streaming
+    // (not yet complete) only full max-frame chunks are emitted, so the final
+    // sub-max tail waits to carry END_STREAM. Once complete, the tail drains
+    // and the last frame gets END_STREAM. Stops early (leaving body buffered)
+    // when a window is exhausted; the caller resumes via pumpInto after a
+    // WINDOW_UPDATE.
+    fn pump(self: *Transcoder, out: *std.ArrayList(u8)) Error!void {
+        while (self.body_pending.items.len > 0) {
+            // During streaming, hold a tail smaller than a full frame.
+            if (!self.body_complete and self.body_pending.items.len < self.max_frame_size) return;
+
+            const window = @min(self.send_stream_window, self.conn_window.*);
+            if (window <= 0) return; // flow-control blocked
+
+            var take: usize = @min(self.body_pending.items.len, self.max_frame_size);
+            if (@as(i64, @intCast(take)) > window) take = @intCast(window);
+            if (take == 0) return;
+
+            const is_last = self.body_complete and take == self.body_pending.items.len;
+            try self.emitData(out, self.body_pending.items[0..take], is_last);
+            self.send_stream_window -= @intCast(take);
+            self.conn_window.* -= @intCast(take);
+
+            const rem = self.body_pending.items.len - take;
+            std.mem.copyForwards(u8, self.body_pending.items[0..rem], self.body_pending.items[take..]);
             self.body_pending.shrinkRetainingCapacity(rem);
+
+            if (is_last) {
+                self.end_stream_sent = true;
+                self.phase = .done;
+                return;
+            }
+        }
+        // body_pending empty. If the response is complete but END_STREAM has not
+        // gone out (e.g. a zero-length body that didn't take the no_body path),
+        // emit an empty END_STREAM DATA frame.
+        if (self.body_complete and !self.end_stream_sent and self.headers_emitted and !self.no_body) {
+            try self.emitData(out, &.{}, true);
+            self.end_stream_sent = true;
+            self.phase = .done;
         }
     }
 
@@ -369,7 +439,6 @@ fn isHopByHop(name: []const u8) bool {
 
 const testing = std.testing;
 
-// Walk a buffer of concatenated frames, returning them in order.
 const ParsedFrame = struct { ftype: u8, flags: u8, stream_id: u31, payload: []const u8 };
 
 fn parseFrames(a: std.mem.Allocator, buf: []const u8, out: *std.ArrayList(ParsedFrame)) !void {
@@ -390,9 +459,16 @@ fn decodeHeaders(a: std.mem.Allocator, block: []const u8, out: *std.ArrayList(h2
     try dec.decode(block, out);
 }
 
+// A generous window so non-flow-control tests behave as before.
+fn newTc(a: std.mem.Allocator, stream_id: u31, max_frame: usize, win: *i64) Transcoder {
+    win.* = h2.HTTP2_MAX_WINDOW;
+    return Transcoder.init(a, stream_id, max_frame, h2.HTTP2_SETTINGS_INITIAL_WINDOW_SIZE, win);
+}
+
 test "single-shot Content-Length response → HEADERS + DATA(END_STREAM)" {
     const a = testing.allocator;
-    var tc = Transcoder.init(a, 1, 16384);
+    var cw: i64 = undefined;
+    var tc = newTc(a, 1, 16384, &cw);
     defer tc.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
@@ -407,7 +483,6 @@ test "single-shot Content-Length response → HEADERS + DATA(END_STREAM)" {
     try parseFrames(a, out.items, &frames);
 
     try testing.expectEqual(@as(usize, 2), frames.items.len);
-    // HEADERS, END_HEADERS set, END_STREAM NOT set (body follows).
     try testing.expectEqual(h2.HTTP2_FRAME_TYPE_HEADERS, frames.items[0].ftype);
     try testing.expect(frames.items[0].flags & h2.HTTP2_FLAG_END_HEADERS != 0);
     try testing.expect(frames.items[0].flags & h2.HTTP2_FLAG_END_STREAM == 0);
@@ -417,7 +492,6 @@ test "single-shot Content-Length response → HEADERS + DATA(END_STREAM)" {
     try decodeHeaders(a, frames.items[0].payload, &hdrs);
     try testing.expectEqualStrings(":status", hdrs.items[0].name);
     try testing.expectEqualStrings("200", hdrs.items[0].value);
-    // transfer-encoding/connection absent; content-type present, lowercased.
     var saw_ct = false;
     for (hdrs.items) |h| {
         try testing.expect(!std.mem.eql(u8, h.name, "connection"));
@@ -425,7 +499,6 @@ test "single-shot Content-Length response → HEADERS + DATA(END_STREAM)" {
     }
     try testing.expect(saw_ct);
 
-    // DATA with END_STREAM carrying the body.
     try testing.expectEqual(h2.HTTP2_FRAME_TYPE_DATA, frames.items[1].ftype);
     try testing.expect(frames.items[1].flags & h2.HTTP2_FLAG_END_STREAM != 0);
     try testing.expectEqualStrings("hello", frames.items[1].payload);
@@ -433,7 +506,8 @@ test "single-shot Content-Length response → HEADERS + DATA(END_STREAM)" {
 
 test "empty-body response → HEADERS with END_STREAM, no DATA" {
     const a = testing.allocator;
-    var tc = Transcoder.init(a, 3, 16384);
+    var cw: i64 = undefined;
+    var tc = newTc(a, 3, 16384, &cw);
     defer tc.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
@@ -452,12 +526,12 @@ test "empty-body response → HEADERS with END_STREAM, no DATA" {
 
 test "chunked streaming response is de-framed into DATA frames" {
     const a = testing.allocator;
-    var tc = Transcoder.init(a, 5, 16384);
+    var cw: i64 = undefined;
+    var tc = newTc(a, 5, 16384, &cw);
     defer tc.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
 
-    // chunks: "Wiki" (4) + "pedia" (5) + 0-terminator.
     const resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" ++
         "4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n";
     try tc.feed(resp, &out);
@@ -467,7 +541,6 @@ test "chunked streaming response is de-framed into DATA frames" {
     defer frames.deinit(a);
     try parseFrames(a, out.items, &frames);
 
-    // HEADERS then DATA frame(s); reassembled body == "Wikipedia".
     try testing.expectEqual(h2.HTTP2_FRAME_TYPE_HEADERS, frames.items[0].ftype);
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(a);
@@ -479,7 +552,6 @@ test "chunked streaming response is de-framed into DATA frames" {
     }
     try testing.expectEqualStrings("Wikipedia", body.items);
     try testing.expect(last_end);
-    // transfer-encoding must NOT appear in the emitted headers.
     var hdrs: std.ArrayList(h2.Header) = .empty;
     defer hdrs.deinit(a);
     try decodeHeaders(a, frames.items[0].payload, &hdrs);
@@ -488,12 +560,12 @@ test "chunked streaming response is de-framed into DATA frames" {
 
 test "body split across feeds and header boundary straddling feeds" {
     const a = testing.allocator;
-    var tc = Transcoder.init(a, 7, 16384);
+    var cw: i64 = undefined;
+    var tc = newTc(a, 7, 16384, &cw);
     defer tc.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
 
-    // Feed the response one byte at a time — exercises every resumption point.
     const resp = "HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nhello world";
     for (resp) |ch| {
         try tc.feed(&[_]u8{ch}, &out);
@@ -511,8 +583,8 @@ test "body split across feeds and header boundary straddling feeds" {
 
 test "body larger than max_frame_size is split into multiple DATA frames" {
     const a = testing.allocator;
-    // Floor is 16384; use that. Body = 40000 bytes → 3 frames (16384,16384,7232).
-    var tc = Transcoder.init(a, 1, 16384);
+    var cw: i64 = undefined;
+    var tc = newTc(a, 1, 16384, &cw);
     defer tc.deinit();
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);
@@ -541,5 +613,52 @@ test "body larger than max_frame_size is split into multiple DATA frames" {
     }
     try testing.expectEqual(@as(usize, 40000), total);
     try testing.expectEqual(@as(usize, 3), data_frames);
+    try testing.expect(last_end);
+}
+
+test "flow control: body beyond the window is held, then resumed by WINDOW_UPDATE" {
+    const a = testing.allocator;
+    // Tiny windows: stream initial window 10, connection window 10.
+    var cw: i64 = 10;
+    var tc = Transcoder.init(a, 1, 16384, 10, &cw);
+    defer tc.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+
+    // 25-byte body, windows only allow 10 initially.
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\n" ++ ("a" ** 25);
+    try tc.feed(resp, &out);
+    try tc.finish(&out);
+    try testing.expect(!tc.isDone()); // blocked: only 10 of 25 sent
+    try testing.expect(tc.blockedOnFlowControl());
+
+    // Grow the connection window first, then the stream window, pumping between.
+    cw += 20; // connection window now ample
+    try tc.pumpInto(&out);
+    try testing.expect(!tc.isDone()); // stream window still the limiter (10 sent)
+
+    tc.addStreamWindow(20); // stream window now ample
+    try tc.pumpInto(&out);
+    try testing.expect(tc.isDone());
+
+    var frames: std.ArrayList(ParsedFrame) = .empty;
+    defer frames.deinit(a);
+    try parseFrames(a, out.items, &frames);
+
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    var last_end = false;
+    var data_frames: usize = 0;
+    for (frames.items) |f| {
+        if (f.ftype == h2.HTTP2_FRAME_TYPE_DATA) {
+            data_frames += 1;
+            body.appendSlice(a, f.payload) catch unreachable;
+            last_end = f.flags & h2.HTTP2_FLAG_END_STREAM != 0;
+        }
+    }
+    // First send was window-limited to 10, so the body could not have gone out
+    // in a single frame — the window forced a split.
+    try testing.expect(data_frames >= 2);
+    try testing.expectEqual(@as(usize, 25), body.items.len);
     try testing.expect(last_end);
 }

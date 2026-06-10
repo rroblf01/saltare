@@ -331,6 +331,13 @@ pub const FrameResult = struct {
     rst_error: u32 = 0,
     // Bytes of DATA consumed this frame, for connection-level WINDOW_UPDATE.
     data_consumed: u32 = 0,
+    // Peer WINDOW_UPDATE: the server should grow the relevant *send* window and
+    // resume sending buffered response body. `wu_stream` 0 = connection-level
+    // (already applied to `send_conn_window`); non-zero = a stream the server
+    // applies to that stream's response transcoder.
+    window_update: bool = false,
+    wu_stream: u31 = 0,
+    wu_increment: u32 = 0,
 };
 
 pub const Connection = struct {
@@ -341,6 +348,13 @@ pub const Connection = struct {
     settings_acked: bool = false,
     active_stream_count: u32 = 0,
     connection_window: u32 = HTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+    // Outbound (send-side) flow control for response DATA. `peer_initial_window`
+    // is the peer's SETTINGS_INITIAL_WINDOW_SIZE — the initial per-stream send
+    // window seeded into each response transcoder. `send_conn_window` is the
+    // connection-level send window, shared across streams and grown by the
+    // peer's stream-0 WINDOW_UPDATEs.
+    peer_initial_window: u32 = HTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+    send_conn_window: i64 = HTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
     allocator: std.mem.Allocator,
     // CONTINUATION reassembly: while a HEADERS frame lacks END_HEADERS, its
     // (and following CONTINUATION frames') header-block fragments accumulate
@@ -420,6 +434,8 @@ pub const Connection = struct {
                 HTTP2_SETTINGS_ID_INITIAL_WINDOW_SIZE => {
                     if (value > HTTP2_MAX_WINDOW) return error.FlowControlError;
                     self.settings.initial_window_size = value;
+                    // Seeds the per-stream send window for response framing.
+                    self.peer_initial_window = value;
                 },
                 HTTP2_SETTINGS_ID_HEADER_TABLE_SIZE => self.settings.header_table_size = value,
                 HTTP2_SETTINGS_ID_MAX_FRAME_SIZE => {
@@ -554,15 +570,17 @@ pub const Connection = struct {
         if (payload.len != 4) return error.FrameSizeError;
         const increment = std.mem.readInt(u32, payload[0..4], .big) & 0x7FFFFFFF;
         if (increment == 0) return error.ProtocolError;
+        // A WINDOW_UPDATE from the peer grows OUR send window — how much response
+        // DATA we may emit — not our inbound (receive) window. Connection-level
+        // updates apply here; stream-level updates are reported to the server,
+        // which applies them to that stream's response transcoder.
         if (frame.stream_id == 0) {
-            // RFC 7540 §6.9.1: window MUST NOT exceed 2^31-1.
-            if (self.connection_window > HTTP2_MAX_WINDOW - increment) return error.FlowControlError;
-            self.connection_window += increment;
-        } else if (self.streams.getPtr(frame.stream_id)) |stream| {
-            if (stream.window_size > HTTP2_MAX_WINDOW - increment) return error.FlowControlError;
-            stream.window_size += increment;
+            // RFC 7540 §6.9.1: a flow-control window MUST NOT exceed 2^31-1.
+            if (self.send_conn_window + @as(i64, increment) > HTTP2_MAX_WINDOW) return error.FlowControlError;
+            self.send_conn_window += @as(i64, increment);
+            return FrameResult{ .window_update = true, .wu_stream = 0, .wu_increment = increment };
         }
-        return null;
+        return FrameResult{ .window_update = true, .wu_stream = frame.stream_id, .wu_increment = increment };
     }
 
     fn handlePing(_: *Connection, frame: Frame, payload: []const u8) H2Error!?FrameResult {

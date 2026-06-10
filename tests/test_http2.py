@@ -290,6 +290,7 @@ class TestHttp2Configuration:
 h2_conn_mod = pytest.importorskip("h2.connection", reason="needs the `h2` library")
 import h2.config  # noqa: E402
 import h2.events  # noqa: E402
+import h2.settings  # noqa: E402
 
 
 async def _sized_app(scope: dict, receive, send) -> None:
@@ -415,6 +416,63 @@ class TestHttp2RealClientConformance:
         status, _headers, body = _h2_tls_request(port, "POST", "/", body=payload)
         assert status == 200
         assert body == payload
+
+    def test_real_h2_flow_control_small_window(self, tmp_path: Path):
+        """Force a tiny client receive window so the server MUST honour
+        outbound flow control: it sends the first window's worth, then waits
+        for our WINDOW_UPDATEs before sending the rest. A correct server
+        delivers the full body; one that ignored flow control would overrun
+        the window and the h2 client would raise a protocol error."""
+        cert, key = _gen_cert(tmp_path)
+        port = _free_port()
+        _serve(_sized_app, port, timeout=3.0, ssl_certfile=cert, ssl_keyfile=key, http2=True)
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.set_alpn_protocols(["h2"])
+        raw = socket.create_connection(("127.0.0.1", port), timeout=5.0)
+        tls = ctx.wrap_socket(raw, server_hostname="localhost")
+        try:
+            if tls.selected_alpn_protocol() != "h2":
+                pytest.skip("ALPN did not negotiate h2")
+            # Advertise a 1 KiB initial receive window for streams.
+            cfg = h2.config.H2Configuration(client_side=True)
+            conn = h2_conn_mod.H2Connection(config=cfg)
+            conn.initiate_connection()
+            conn.update_settings({h2.settings.SettingCodes.INITIAL_WINDOW_SIZE: 1024})
+            n = 50000  # far beyond the 1 KiB window → forces many WINDOW_UPDATE rounds
+            conn.send_headers(1, [
+                (":method", "GET"), (":authority", "localhost"),
+                (":scheme", "https"), (":path", f"/{n}"),
+            ], end_stream=True)
+            tls.sendall(conn.data_to_send())
+
+            body = b""
+            ended = False
+            tls.settimeout(5.0)
+            while not ended:
+                data = tls.recv(65535)
+                if not data:
+                    break
+                for ev in conn.receive_data(data):
+                    if isinstance(ev, h2.events.DataReceived):
+                        body += ev.data
+                        # Grant more window as we consume, in small increments.
+                        if ev.flow_controlled_length:
+                            conn.acknowledge_received_data(ev.flow_controlled_length, ev.stream_id)
+                    elif isinstance(ev, (h2.events.StreamEnded, h2.events.StreamReset)):
+                        ended = True
+                out = conn.data_to_send()
+                if out:
+                    tls.sendall(out)
+            assert len(body) == n, f"got {len(body)} of {n}"
+            assert body == b"x" * n
+        finally:
+            try:
+                tls.close()
+            except OSError:
+                pass
 
     def test_real_h2_multi_frame_body(self, tmp_path: Path):
         """A 60 KiB response spans several DATA frames (max frame 16 KiB) but
