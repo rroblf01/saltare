@@ -200,7 +200,7 @@ fn malloc_trim(pad: usize) c_int {
 /// `module.zig`'s `version()` returns this, and it backs the default
 /// `Server:` header below — keeping both from drifting the way the old
 /// hardcoded "1.6.0" / "1.9.0" literals did.
-pub const VERSION = "1.11.0";
+pub const VERSION = "1.12.0";
 const SERVER_HEADER = "saltare/" ++ VERSION;
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
@@ -2654,10 +2654,14 @@ pub fn run(
     }
 
     // v1.3: optionally raise the fd soft limit to the hard limit so
-    // saltare can saturate `max_concurrent_connections` without
-    // bumping into the user's default 1024 fd cap. No-op on
-    // non-Linux.
-    if (limits.auto_raise_nofile and comptime builtin.os.tag == .linux) {
+    // saltare can saturate `max_connections` without
+    // bumping into the user's default fd cap.
+    //
+    // v1.12 (macOS): un-gated. setrlimit(RLIMIT_NOFILE) has identical
+    // semantics on Darwin and the hard limit there comes from
+    // kern.maxfiles, so the same code is correct. It was Linux-only for
+    // historical reasons, not technical ones.
+    if (limits.auto_raise_nofile) {
         var rl: c.struct_rlimit = undefined;
         if (c.getrlimit(c.RLIMIT_NOFILE, &rl) == 0) {
             if (rl.rlim_cur < rl.rlim_max) {

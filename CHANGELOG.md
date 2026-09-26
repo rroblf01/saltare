@@ -1,5 +1,250 @@
 # Changelog
 
+## 1.12.0
+
+**Theme: the server runs on macOS.** After being epoll-only since v0.4, saltare
+now has a kqueue backend and ships `macosx_11_0_arm64` wheels. The release
+also pays down a category of debt this repo had accumulated — features
+with a README section, a CLI flag, and no test that ever reached them —
+because two of the gaps turned out to be real bugs.
+
+### macOS arm64
+
+- **kqueue event loop** (`src/zig/eventloop_kqueue.zig`, new). The epoll
+  implementation moved verbatim to `eventloop_epoll.zig`; `eventloop.zig`
+  now picks a backend at comptime and re-exports the winner, which is why
+  `server.zig` is **unchanged** by the port. It imported `"eventloop.zig"`
+  and used only `Loop`, `Loop.init` and the `add`/`modify`/`remove`/
+  `wait`/`deinit` methods plus the `runtime` field, so the re-export hands
+  it literally the backend's own type: same layout, no vtable, no tag
+  check, and **not one branch on the OS in the event path**. That mattered
+  enough to rule out the obvious alternative — one `Loop` with a union and
+  a branch per method — against a project whose goal is minimum RAM and
+  maximum req/sec. 113 call sites in `server.zig` were left alone.
+
+  Three real differences the backend absorbs, none of which leak upward:
+  kqueue interest is *per-filter* rather than a bitmask, so dropping an
+  interest is an explicit `EV_DELETE` where epoll's `EPOLL_CTL_MOD` would
+  replace the whole mask in one call; hangups arrive as `EV_EOF` on a
+  filter rather than `EPOLLRDHUP`/`EPOLLHUP` bits; and the timeout is a
+  `struct timespec` or `NULL`, not milliseconds. Both are level-triggered,
+  so the connection state machine's discipline about only arming write
+  interest when a write actually blocks carries over unchanged.
+
+- **The Linux-isms**, each verified against the headers Zig bundles for
+  Darwin rather than from memory:
+  - `SOCK_NONBLOCK` and `SOCK_CLOEXEC` are Linux extensions to `socket(2)`
+    and Darwin defines neither, so this was a **compile** failure, not a
+    runtime one. New `socketNonBlock()` / `acceptOne()` helpers keep a
+    single call site and reach the same end state through `fcntl(2)`.
+  - `TCP_KEEPIDLE` is Linux's name for what Darwin calls `TCP_KEEPALIVE`.
+    `TCP_KEEPINTVL` and `TCP_KEEPCNT` keep their names on both.
+  - `TCP_USER_TIMEOUT` has no portable equivalent and is skipped off Linux.
+    The keepalive cadence above still bounds how long a dead peer is held.
+  - `pool.zig`'s `madvise` advice moves to `MADV_FREE`, the Darwin call that
+    actually returns pages. The sweep used to be a no-op off Linux, so
+    long-idle pool buffers held their pages on macOS — quietly undoing part
+    of the reason they exist.
+  - `sys/sendfile.h` is no longer cimport'd. The two `sendfile(2)`
+    signatures are incompatible and, more importantly, Linux takes a
+    **pointer** to the offset and advances it for you, while Darwin takes
+    the offset **by value** and only honours it on the first call of a
+    stream. `sendFileChunk()` normalises both into "give me the next chunk
+    from this offset", so the caller's loop is identical on either platform.
+  - `sys/prctl.h` is no longer cimport'd either; `prctl` is declared by
+    hand, the same way `accept4` already was. A top-level `@cImport` of a
+    header the other platform lacks fails the build *before any of our own
+    code runs*, which is how these two had to go.
+  - `dlopen` gained the `.dylib` names for libssl, libz, libbrotli and
+    libzstd. Each list is already "first one that loads", so this is purely
+    additive — and without it TLS and every compression codec are silent
+    no-ops on macOS: `newContext` fails, the server starts in plain-HTTP
+    mode, and the only signal is a stderr warning.
+
+- **`process_*` metrics stop being hardcoded 0 off Linux.** Resident
+  memory, open fds and CPU seconds read through
+  `proc_pidinfo(PROC_PIDTASKINFO)`, `proc_pidinfo(PROC_PIDLISTFDS)` and
+  `getrusage`. On a server whose pitch is RAM and observability, three
+  series that are permanently zero in `/metrics` is the worst failure mode
+  available: in a dashboard it is indistinguishable from a process using
+  no memory at all. `libproc.h` is deliberately *not* cimport'd — it
+  transitively includes the Mach headers, and Zig's `translate-c` dies on
+  their static assertions over descriptor types it models as `opaque`.
+  `sys/proc_info.h` declares everything needed on its own, so only
+  `proc_pidinfo` is hand-declared; it lives in libSystem, so nothing extra
+  is linked.
+
+- **Verification.** `make check-macos` cross-compile-checks the 17 Zig
+  modules that do not need a macOS `Python.h` against `aarch64-macos`, and
+  is wired into the local loop so a Darwin-only compile error surfaces in
+  seconds rather than on a Mac. `server.zig` cannot be fully checked from
+  Linux (`bridge.zig` needs a macOS `Python.h`), so it was forced through
+  by `export fn`-ing wrappers that actually *call* `run()` and
+  `bindAndListen()` — merely referencing them is not enough, Zig will not
+  generate the body and the check silently passes on a 1.8 KB stub. That
+  found and fixed **seven** compile errors before a wheel was ever built:
+  the two `SOCK_*` flags, a missing `fcntl.h`, a variadic literal needing a
+  cast, `ident` being `usize` rather than `c_int`, a nonexistent `ext` field
+  in `struct kevent`, `kevent`'s arity, and `accept(2)`'s concrete
+  `struct sockaddr *` parameter. `module.zig` is the one file still
+  unverifiable locally, so the new `test_macos` CI job — and the
+  `publish` gate that depends on it — is its real coverage.
+
+### Fixed
+
+Both of these were found by writing the tests the features never had.
+Neither would have been caught by the existing suite.
+
+- **A request arriving in the same packet as a PROXY-protocol header hung
+  until the header timeout** (`server.zig`). Present since v1.3. An L4
+  load balancer that coalesces the PROXY header and the client's request
+  into one segment produced a connection that was never answered.
+  `doProxyV1` compacted the leftover request bytes to offset 0 and then
+  called `doReadHttp`, but `doReadHttp`'s loop always attempts a read
+  *before* it parses and bails out on `EAGAIN` — so with the request head
+  already in the buffer, `connRead` returned `EAGAIN` and the function
+  returned without ever parsing it. No further read event was coming,
+  because those bytes were in userspace rather than the kernel. Fixed by
+  using `tryParsePipelined`, the codebase's existing entry point for "a
+  request is already fully buffered" (`keepAliveReset` uses it for the same
+  reason). A PROXY header split across reads still works, because
+  `tryParsePipelined` leaves the connection registered for read when the
+  head turns out to be incomplete.
+
+- **Synthesized 500 responses carried no `Server-Timing` and no
+  `X-Request-ID`** (`_dispatcher.py`). A 500 emitted because an app raised
+  is built by `_build_wire`, a different function from the one that
+  assembles normal response heads, so it skipped every optional header. The
+  request that blew up — the one whose duration and identity you want when
+  reading a trace — was the one request with neither. Both 500 paths now
+  share a single `_observability_header_lines()` helper with
+  `_emit_headers`, so the paths cannot drift apart again. The helper
+  early-returns a shared empty tuple when every optional header is off,
+  which is the default, so the common path allocates nothing beyond the
+  status line it already built.
+
+### Test debt paid
+
+61 new tests, all for features that were documented and shipped but
+untested. Each was checked for *discriminating power*, not just coverage —
+a test that passes whether or not the feature works is worse than no test,
+because it looks like coverage.
+
+- **PROXY protocol v1 + v2** (21 tests). Zero coverage for a feature that
+  rewrites the connection's peer address, which is the address the per-IP
+  rate limiter, the per-IP connection cap and the access log all key on.
+  The rate limiter is the black-box observable, since `rateLimitAllow` keys
+  on `conn.peer_key`; the discriminating case is two connections claiming
+  *different* sources, which must get independent buckets. Also covers
+  `UNKNOWN` and v2 `LOCAL` falling back to the TCP peer, one-write vs split
+  framing, malformed headers, and the documented
+  `saltare_proxy_protocol_accepted_total` counters.
+- **mTLS** (7 tests). `ssl_ca_file` + `ssl_verify_client` had none, and it
+  is the feature most likely to be misconfigured in production since it
+  decides whether a client may connect at all. Pins the full matrix,
+  including that an unreadable `ssl_ca_file` aborts startup rather than
+  leaving the server up with verification silently off. One assertion is
+  deliberately weak in shape but strict in meaning: a rejection under
+  TLS 1.3 arrives as a *successful* handshake followed by a dropped
+  connection, because the client certificate is verified after the server
+  has already sent its Finished, so the invariant is "not served" rather
+  than "raised SSLError".
+- **`Server-Timing` / `X-Request-ID`** (12 tests). Previously only the
+  setters were called. Includes the 500-path regression above and a check
+  that a custom `request_id_header` name is honoured without the default
+  leaking.
+- **WebSocket permessage-deflate over the wire** (13 tests). The existing
+  coverage drove `_pmd_deflate`/`_pmd_inflate` directly, which proves the
+  codecs round-trip but not that the server *applies* them: nothing checked
+  the extension token in the 101 head, the RSV1 bit on frames the server
+  emits, or the `ws_compression_level` / `ws_compression_server_takeover`
+  kwargs, which no test passed at all. Uses raw sockets rather than the
+  `websockets` library on purpose — the five permanently-skipped tests in
+  `tests/test_websocket.py` exist because multiple WS tests in one pytest
+  process hit a daemon-thread teardown segfault, and raw sockets avoid it.
+- **Operational knobs** (17 tests). `max_connection_lifetime` was present
+  in `test_cli_unit.py`, which proves the flag parses and nothing else.
+  Covers the lifetime cap, `access_log_path` (asserted by content, since an
+  fd opened but never written is the obvious silent failure),
+  `http_pool_max` across its range, `startup_request`, `auto_raise_nofile`,
+  `tls_session_cache_size`, `ktls` degradation, and the documented 500 for
+  `sendfile` over HTTPS without kTLS. The pure socket-tuning knobs are
+  deliberately absent — their effect is in the kernel, so a test would be
+  asserting on the kernel.
+- **Platform** (7 tests). The platform gate itself, and the documented
+  per-platform degradations, so "works everywhere" is not claimed for
+  something that quietly no-ops.
+
+Suite: **447 passing**, 7 skipped, from 368.
+
+### Build & CI
+
+- **CI was not running the HTTP/2 suite at all.** `tests/test_http2.py`
+  skips itself at module level via `importorskip("h2.connection")`, so a
+  missing `h2` cannot fail the job — it just drops the whole suite,
+  including the v1.11 flow-control coverage. Both runners (the `test_wheels`
+  job and the Dockerfile `test-env` stage) installed everything from
+  pyproject's cibuildwheel `test-requires` *except* `h2`. Added to both.
+- **The Zig unit test suite was broken and nobody was running it.** Four of
+  six files failed. `http.zig` did not even compile: the chunked-decode
+  resume test copied a 12-byte tail into a 13-byte range, which Zig 0.16
+  rejects. The WINDOW_UPDATE overflow test was asserting against
+  `connection_window` after v1.11 moved peer updates onto the *send*
+  window, so the production check correctly never fired. Worth recording
+  how that one nearly went the wrong way: "fixing" it by relaxing the
+  assertion would have locked in a real RFC 7540 §6.9.1 violation. Three
+  tests were added around the refactored path.
+- **`py.typed` now ships.** Without it type checkers ignored `_core.pyi`
+  entirely and reported `saltare._core` as an untyped missing import. The
+  stub had also drifted: `_core.serve` takes 54 positional args and the stub
+  declared 47, stopping at `runtime_config_path`.
+- **`uv sync` now produces a working dev environment.** It pruned
+  `scikit-build-core` from the venv, because `[build-system].requires` is
+  not a project dependency — so the next `uv pip install -e .` had no build
+  backend and the Zig rebuild loop was broken after any sync. It also does
+  not install extras, which is why a bare sync left you without pytest. A
+  PEP 735 `[dependency-groups] dev` now carries the build backend and the
+  test deps. It also pins `h2` and `pytest-rerunfailures`, which had only
+  ever been in cibuildwheel's `test-requires`, so a clean sync silently
+  lost the HTTP/2 suite and turned every `@pytest.mark.flaky` rerun into a
+  no-op.
+- The `openssl-devel` / `openssl-dev` installs in the Linux `before-all`
+  hooks are gone. They have been dead weight since v1.3 made TLS
+  dlopen-based; the comments claiming the build fails without them were
+  wrong.
+
+### Not built — and why (decision record)
+
+- **x86_64 macOS wheels — declined.** They would have to be a Rosetta build
+  on an arm64 runner, or a separate Intel runner for a platform with
+  negligible usage. The distribution targets are Linux servers plus
+  Apple-Silicon developer machines, and the `saltare.contrib.django`
+  integration is the local-dev case that motivated macOS support in the
+  first place — `manage.py runserver` replacing wsgiref — which is arm64 by
+  definition on any current Mac.
+- **`PR_SET_PDEATHSIG` equivalent on macOS — declined, documented instead.**
+  The substitutes are a kqueue `EVFILT_PROC` watch on the parent pid or a
+  Dispatch Source, and both require `master.zig` to own a kqueue descriptor
+  and poll it. That is a larger change than a tidiness knob justifies.
+  The consequence is real and stated plainly: a `SIGKILL`ed master can
+  leave workers behind on macOS until their own idle timeouts fire — the
+  same exposure a single-worker deployment already has when it is
+  `SIGKILL`ed. `setProcName` is likewise a no-op there; Darwin's
+  `setprogname(3)` only affects argv-adjacent reporting and is not worth a
+  dependency for a cosmetic `ps` label.
+- **kTLS on macOS — not attempted.** Kernel TLS offload is Linux-specific.
+  The flag is accepted and ignored, and the sendfile-over-HTTPS path
+  returns its documented 500, which is covered by a test.
+- **cgroup-aware `max_concurrent_connections` on macOS — not applicable.**
+  There is no cgroup; the reader returns null and the configured default is
+  used. Harmless, and now pinned by a test.
+- **Benchmarks on macOS — not run.** `benchmarks/bench.py` reads
+  `/proc/<pid>/status` and `/proc/<pid>/smaps_rollup`, which do not exist
+  on Darwin. The harness would need a Mach-based sampler to produce
+  comparable numbers, and the RAM story this project is measured on is a
+  Linux server story. The macOS wheels exist for developer machines, not
+  as a benchmark target.
+
 ## 1.11.0
 
 ### HTTP/2 response framing — now real, was a stub

@@ -8,7 +8,9 @@ Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for 
 pip install saltare
 ```
 
-Linux x86_64 / aarch64, manylinux + musllinux wheels, CPython 3.10–3.14. Zero runtime deps for plain HTTP; TLS / compression libraries (`libssl`, `libz`, `libbrotlienc`, `libzstd`) are `dlopen`'d on first use, so they only need to be present on the host when the matching feature is enabled.
+Linux x86_64 / aarch64 (manylinux + musllinux) and macOS arm64 wheels, CPython 3.10–3.14. Zero runtime deps for plain HTTP; TLS / compression libraries (`libssl`, `libz`, `libbrotlienc`, `libzstd`) are `dlopen`'d on first use, so they only need to be present on the host when the matching feature is enabled.
+
+On macOS, `brew install openssl@3` if you want TLS — the wheel resolves it by install name at runtime, and without it the server starts in plain-HTTP mode with a warning on stderr.
 
 ## Quickstart
 
@@ -99,7 +101,9 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 ## Status
 
-> **Status: 1.11.0 — real HTTP/2 responses + outbound flow control, PEP 684 sub-interpreter groundwork, 368 tests pass.** **HTTP/2 now actually speaks HTTP/2.** Through v1.10 `http2=True` over TLS silently fell back to HTTP/1.1: the TLS layer advertised ALPN with the *client*-side `SSL_CTX_set_alpn_protos` (a no-op on a server), so `h2` never negotiated, and the dispatch path it hid had a `PyObject_CallFunction` format string with one too few `y#` byte-strings that would have segfaulted on the first real request. v1.11 fixes both — server-side `SSL_CTX_set_alpn_select_cb` (gated on `http2=True`, now plumbed through `_core.serve`) and the corrected `Oiiy#y#y#y#y#Oy#iOiO` marshalling — and adds a real response path: `h2_response.zig`, an incremental HTTP/1.1→HTTP/2 transcoder that reframes the dispatcher's existing response bytes into HEADERS (HPACK-encoded `:status` first, names lowercased, hop-by-hop headers dropped per RFC 7540 §8.1.2.2) + DATA frames bounded by the peer's `SETTINGS_MAX_FRAME_SIZE`, de-frames chunked bodies, and places END_STREAM on the last frame. The previously-dead `h2_encoder.zig` now backs it. **Outbound flow control** (RFC 7540 §6.9): the server never sends more DATA than the peer's stream + connection windows allow, holding the rest until a `WINDOW_UPDATE` grows the window; a stream completes only once END_STREAM has gone out, so flow-control-blocked bodies are never dropped. The server connection preface is now its own SETTINGS frame (was a premature ACK). Verified end to end against the real `h2` sans-IO client (GET, POST-with-body, 60 KiB multi-frame, and a 50 KiB body pulled through a 1 KiB window). HTTP/2 multiplexing is still serial (one dispatch in flight per connection). **PEP 684 (per-interpreter GIL) groundwork**: `_core` uses multi-phase init, isolates the racy event-loop state into a per-serve `Runtime`, has a re-entrant `serveLoop`, and declares per-interpreter-GIL support — a full server runs in an own-GIL sub-interpreter (verified). But the measurement that motivated it refuted its premise — sub-interpreter workers cost **more** RAM than saltare's `gc.freeze()` pre-fork model (they can't share the Python object graph), so the worker spawner was **not** built; fork stays the multi-worker model. **Fixes**: a spurious `-OO` re-exec when the project lives under a `saltare`-named directory (`"saltare" in argv[0]` substring check → now matches the `__main__.py` parent dir), and the default `Server:` header version drifting from the package version (now derived from `_core.version()` / a single Zig `VERSION` constant). Test suite **368 passing**, including `h2`-client conformance (incl. flow control) and own-GIL serve. Benchmarks (v1.11.0, mimalloc preload): saltare leads on all workloads — 3.0–9.1 MiB leaner than uvicorn, 12.1–12.9 MiB leaner than granian.
+> **Status: 1.12.0 — macOS arm64 wheels. kqueue event loop. 447 tests pass.** saltare is no longer Linux-only. `src/zig/eventloop.zig` picks its backend at comptime — `eventloop_epoll.zig` or the new `eventloop_kqueue.zig` — and re-exports it, so **`server.zig` is unchanged by the port** and the event path has no branch on the OS at all. The kqueue specifics (per-filter interest instead of a bitmask, `EV_EOF` instead of `EPOLLRDHUP` bits, a `timespec` instead of milliseconds) are absorbed inside the backend; both are level-triggered, so the connection state machine's discipline is unchanged. The Linux-isms are handled per-OS: `SOCK_NONBLOCK`/`SOCK_CLOEXEC` do not exist on Darwin (now `fcntl`), `TCP_KEEPIDLE` is `TCP_KEEPALIVE` there, `TCP_USER_TIMEOUT` is skipped, the `madvise` advice is `MADV_FREE` (the sweep was a no-op off Linux, so idle pool buffers held their pages), `sendfile(2)` takes its offset by value on Darwin instead of by pointer, and `sys/prctl.h` / `sys/sendfile.h` are hand-declared because a top-level `@cImport` of a header the other platform lacks fails the build before our code runs. `dlopen` gained the `.dylib` names for libssl / libz / libbrotli / libzstd — without them TLS and compression were silent no-ops. **`process_resident_memory_bytes`, `process_open_fds` and `process_cpu_seconds_total` stop reporting a hard 0** off Linux, via `proc_pidinfo` and `getrusage`; three permanently-zero series in a RAM-focused server's `/metrics` is the worst failure mode available. **Two real bugs fixed**, both found by writing the tests the features never had: a request arriving in the same packet as a PROXY-protocol header hung until the header timeout (`doReadHttp` never parsed pre-buffered bytes, since its loop reads before it parses — now uses `tryParsePipelined`, the existing "already buffered" path), and synthesized 500s carried no `Server-Timing` / `X-Request-ID`, because they are built by a different function from normal response heads. **61 new tests** for previously untested shipped features: PROXY protocol v1+v2, mTLS, `Server-Timing`/`X-Request-ID` end to end, WebSocket permessage-deflate over the wire, and the operational knobs. **Build/CI**: CI was not running the HTTP/2 suite at all (`h2` missing from both runners while the module skips itself wholesale); the Zig unit tests were broken in 4 of 6 files and nobody ran them; `py.typed` now ships and the `_core.pyi` stub is no longer 7 args behind; `uv sync` no longer prunes the build backend. `make check-macos` cross-compile-checks 17 Zig modules against `aarch64-macos` in seconds. Full detail, including what was **not** built and why (x86_64 macOS, a `PR_SET_PDEATHSIG` equivalent, kTLS, macOS benchmarks), in [CHANGELOG.md](CHANGELOG.md).
+
+> **Status: 1.11.0 (historical entry) — real HTTP/2 responses + outbound flow control, PEP 684 sub-interpreter groundwork, 368 tests pass.** **HTTP/2 now actually speaks HTTP/2.** Through v1.10 `http2=True` over TLS silently fell back to HTTP/1.1: the TLS layer advertised ALPN with the *client*-side `SSL_CTX_set_alpn_protos` (a no-op on a server), so `h2` never negotiated, and the dispatch path it hid had a `PyObject_CallFunction` format string with one too few `y#` byte-strings that would have segfaulted on the first real request. v1.11 fixes both — server-side `SSL_CTX_set_alpn_select_cb` (gated on `http2=True`, now plumbed through `_core.serve`) and the corrected `Oiiy#y#y#y#y#Oy#iOiO` marshalling — and adds a real response path: `h2_response.zig`, an incremental HTTP/1.1→HTTP/2 transcoder that reframes the dispatcher's existing response bytes into HEADERS (HPACK-encoded `:status` first, names lowercased, hop-by-hop headers dropped per RFC 7540 §8.1.2.2) + DATA frames bounded by the peer's `SETTINGS_MAX_FRAME_SIZE`, de-frames chunked bodies, and places END_STREAM on the last frame. The previously-dead `h2_encoder.zig` now backs it. **Outbound flow control** (RFC 7540 §6.9): the server never sends more DATA than the peer's stream + connection windows allow, holding the rest until a `WINDOW_UPDATE` grows the window; a stream completes only once END_STREAM has gone out, so flow-control-blocked bodies are never dropped. The server connection preface is now its own SETTINGS frame (was a premature ACK). Verified end to end against the real `h2` sans-IO client (GET, POST-with-body, 60 KiB multi-frame, and a 50 KiB body pulled through a 1 KiB window). HTTP/2 multiplexing is still serial (one dispatch in flight per connection). **PEP 684 (per-interpreter GIL) groundwork**: `_core` uses multi-phase init, isolates the racy event-loop state into a per-serve `Runtime`, has a re-entrant `serveLoop`, and declares per-interpreter-GIL support — a full server runs in an own-GIL sub-interpreter (verified). But the measurement that motivated it refuted its premise — sub-interpreter workers cost **more** RAM than saltare's `gc.freeze()` pre-fork model (they can't share the Python object graph), so the worker spawner was **not** built; fork stays the multi-worker model. **Fixes**: a spurious `-OO` re-exec when the project lives under a `saltare`-named directory (`"saltare" in argv[0]` substring check → now matches the `__main__.py` parent dir), and the default `Server:` header version drifting from the package version (now derived from `_core.version()` / a single Zig `VERSION` constant). Test suite **368 passing**, including `h2`-client conformance (incl. flow control) and own-GIL serve. Benchmarks (v1.11.0, mimalloc preload): saltare leads on all workloads — 3.0–9.1 MiB leaner than uvicorn, 12.1–12.9 MiB leaner than granian.
 
 > **Status: 1.9.0 (historical entry) — HTTP/2 dispatch + Connection HTTP/WS union + WebSocket compression.** HTTP/2 dispatch integration (Zig ↔ Python bridge): `bridge.http2DispatchStart`, `bridge.http2DispatchPushBody`, `bridge.http2DispatchDrain` in `src/zig/bridge.zig` call Python `http2_dispatch_start/push_body/drain` in `_dispatcher.py`, which delegate to the existing HTTP/1.1 dispatch path with `http_version="2"` in the ASGI scope. Internal Zig HTTP/2 framing (`src/zig/h2.zig`) handles connection preface, SETTINGS, DATA, HEADERS, PING, RST_STREAM, GOAWAY, and WINDOW_UPDATE (request-side parsing; the response side became real in v1.11). **Connection HTTP/WS tagged union**: all 10 WebSocket-only fields moved into `WsState` inside a `union(Protocol)` — HTTP connections pay zero bytes for WS state (~52 KiB saved at 1024 idles). **WebSocket per-message-deflate configuration** via `--ws-compression-level`, `--ws-compression-server-takeover`, and `--ws-pump-interval-ms`. `--http2` flag added to CLI and `saltare.run()` signature (default `False`).
 
@@ -323,6 +327,14 @@ These exercise the v1.2.2 streaming backpressure (large-response) and the per-co
 - **HTTP/2 + ALPN** via `nghttp2`. Multiplexing many requests over one connection. Big win for high-concurrency clients but tens of KLoC of wire-format work; v1.5 candidate.
 - **Free-threaded Python (`cp314t`)** — measure RSS + rps with GIL gone. Could let dispatch run concurrently; could also inflate the floor. Decision after benchmarking.
 - **Static-link OpenSSL** build experiment — alternative wheel (`saltare-with-tls`) that links libssl/libcrypto statically for environments without manylinux's runtime libs. Plain wheel keeps the lazy `dlopen` path.
+
+### Still open after v1.12
+
+- **HTTP/2 stream multiplexing.** v1.11 made the HTTP/2 wire real but still serial: one dispatch in flight per connection. Concurrent streams are the next piece of real work there.
+- **kTLS on macOS**, and any `PR_SET_PDEATHSIG` equivalent (kqueue `EVFILT_PROC` on the parent pid). Both declined in v1.12 with reasoning in [CHANGELOG.md](CHANGELOG.md); revisit if macOS multi-worker becomes a deployment target rather than a developer-machine one.
+- **x86_64 macOS wheels** — declined; Rosetta on an arm64 runner, for negligible demand.
+- **Benchmarks on macOS** — `benchmarks/` reads `/proc`, which does not exist on Darwin. Would need a Mach-based sampler.
+- **Free-threaded Python (`cp314t`)** and **static-link OpenSSL**, as above.
 
 ## Examples
 
@@ -629,7 +641,7 @@ saltare.run(
 saltare.run(app, auto_raise_nofile=True)
 ```
 
-Raises the soft `RLIMIT_NOFILE` to the hard limit at startup so `max_concurrent_connections` isn't bottlenecked by the user's default 1024 fd cap. Linux only. Equivalent to `ulimit -n $(ulimit -Hn)` before invoking saltare.
+Raises the soft `RLIMIT_NOFILE` to the hard limit at startup so `max_concurrent_connections` isn't bottlenecked by the user's default fd cap. Equivalent to `ulimit -n $(ulimit -Hn)` before invoking saltare. Works on Linux and macOS (`kern.maxfiles` on Darwin).
 
 ### Pre-warming the user app
 
@@ -1340,9 +1352,26 @@ bash scripts/install-zig.sh
 ```bash
 brew install zig
 # Python headers come with Homebrew Python or python.org installers.
+
+uv sync
+uv pip install -e .
+.venv/bin/python -m pytest -q
 ```
 
-Note that the **server** does not run on macOS yet — see [Status](#status). The Zig core's event loop is epoll-only and `src/zig/eventloop.zig` carries a hard `@compileError` for non-Linux targets, so a macOS build of `_core` fails at compile time by design.
+The server **runs** on macOS as of v1.12 (kqueue backend, `macosx_11_0_arm64`
+wheels). TLS needs `brew install openssl@3` at runtime; the wheel finds it
+by install name.
+
+If you are on Linux and touching platform-specific Zig code, you do not need
+a Mac to catch the obvious breakage:
+
+```bash
+make check-macos   # cross-compile-checks 17 modules against aarch64-macos
+```
+
+It skips `module.zig` and `server.zig`, which need a macOS `Python.h`; the
+macOS CI runner is their gate. See [AGENTS.md](AGENTS.md) for how to force
+`server.zig` through the check anyway.
 
 Then:
 
@@ -1402,7 +1431,10 @@ git tag v0.1.0 && git push origin v0.1.0
 │   ├── zig/
 │   │   ├── module.zig        # Python C-API surface (PyInit__core)
 │   │   ├── server.zig        # epoll accept loop + per-connection state machine
-│   │   ├── eventloop.zig     # epoll wrapper (Linux; kqueue TBD)
+│   │   ├── eventloop.zig     # comptime backend selection (re-exports one)
+│   │   ├── eventloop_epoll.zig  # epoll backend (Linux)
+│   │   ├── eventloop_kqueue.zig # kqueue backend (macOS)
+│   │   ├── procstats_darwin.zig # RSS / fd / CPU readers for /metrics
 │   │   ├── http.zig          # zero-alloc HTTP/1.1 parser + chunked decoder
 │   │   ├── pool.zig          # 4 KiB / 16 KiB read-buffer free-lists + MADV_DONTNEED
 │   │   ├── timer.zig         # hashed timer wheel for idle timeouts
