@@ -3210,9 +3210,27 @@ fn doProxyV1(loop: *eventloop.Loop, conn: *Connection) void {
     } else {
         conn.state = .reading;
         // If the HTTP request arrived in the same packet as the PROXY
-        // line, kick the parser immediately — there's no edge-trigger
-        // event coming.
-        if (leftover > 0) doReadHttp(loop, conn);
+        // line, kick the parser immediately — there is no further read
+        // event coming, because those bytes are already sitting in the
+        // buffer rather than in the kernel.
+        //
+        // v1.12: this used to call doReadHttp, which is the wrong entry
+        // point for pre-buffered bytes. doReadHttp's loop always attempts
+        // a read *before* it parses, and bails out on EAGAIN — so with the
+        // request head already in the buffer, connRead returned EAGAIN,
+        // doReadHttp returned without ever parsing, and the request hung
+        // until the header timeout. Reproduced by any L4 load balancer
+        // that coalesces the PROXY header and the client's request into
+        // one segment. tryParsePipelined is the existing path for "a
+        // request is already fully buffered" (see keepAliveReset), and it
+        // leaves the connection registered for read when the head turns
+        // out to be incomplete, so a split header still works.
+        //
+        // The TLS branch above does not need the same treatment: a TLS
+        // client cannot have its request bytes in the buffer before the
+        // handshake completes, so `leftover` is always 0 there in
+        // practice.
+        if (leftover > 0) tryParsePipelined(loop, conn);
     }
 }
 
