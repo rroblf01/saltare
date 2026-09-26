@@ -134,8 +134,14 @@ One source of truth for the runtime version: `pub const VERSION` in `src/zig/ser
 - `tests/test_cli_unit.py` (the mocked `__version__`)
 - `CHANGELOG.md` and the README status block
 
-`build.zig.zon`'s `.version` is the Zig *package manifest* version, unrelated to the
-wheel. It lags on purpose — leave it alone.
+`build.zig.zon`'s `.version` is the Zig *package manifest* version and is not what
+the wheel reports — that comes from `pyproject.toml` and `server.zig`. But it
+should still be set to the same release number. It tracked `pyproject.toml`
+exactly through 0.10.0, then drifted at the 0.x→1.x transition: the wheel became
+1.10.0 while the manifest became 0.11.0, as if the project were still 0.x. That
+was a slip, and an earlier version of this file codified it as "it lags on
+purpose — leave it alone", which is why the drift survived. Bump it with the
+release; nothing reads it, so a mismatch is pure confusion.
 
 ## Conventions
 
