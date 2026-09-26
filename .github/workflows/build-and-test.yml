@@ -27,12 +27,17 @@ jobs:
     name: wheels ${{ matrix.libc }} ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     env:
-      # Job-level, not workflow-level: `runner.temp` is only in scope here.
+      # `runner` is NOT in scope for a job-level `env` — the contexts
+      # available there are github/needs/strategy/matrix/vars/secrets/inputs,
+      # so `${{ runner.temp }}` here makes the whole workflow fail to parse
+      # with zero jobs. `github.workspace` is valid, and a workspace subdir
+      # is easier to reason about than runner temp anyway.
+      #
       # CIBW_CACHE_DIR points the *container's* pip cache at this host
       # directory; PIP_CACHE_DIR does the same for macOS, which has no
-      # container. Defined once so the cache step and the build command
+      # container. Declared once so the cache step and the build command
       # cannot disagree about the path.
-      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
+      PIP_CACHE_DIR: ${{ github.workspace }}/.pip-cache
     strategy:
       fail-fast: false
       matrix:
