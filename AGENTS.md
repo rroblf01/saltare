@@ -28,9 +28,9 @@ uv pip install -e . --no-deps --no-build-isolation   # rebuild the Zig core (~6 
 - `make test` / `make build` / `make bench` run everything in Docker (no Zig on the host).
   `make valgrind` = pytest under valgrind, 10–30× slower, a manual pre-tag gate.
 - `make check-macos` cross-compile-checks every Zig module that does not need a macOS
-  `Python.h` against `aarch64-macos`. Run it after touching platform code — it is the
-  only way to catch a Darwin-only compile error without a Mac. `module.zig` and
-  `server.zig` are excluded (they import `bridge.zig`). To force `server.zig` through
+  `Python.h` against `aarch64-macos`. Run it after touching platform code: with no
+  macOS runner in the matrix it is the only Darwin check left, so it is not optional.
+  It still skips `module.zig` and `server.zig` (they import `bridge.zig`). To force `server.zig` through
   anyway, symlink `src/zig/*.zig` into a scratch dir beside a root file that
   `export fn`s a wrapper calling `server.run(...)`. Merely *referencing* the function
   is not enough: Zig will not generate the body, and the check then passes on a 1.8 KB
@@ -43,10 +43,19 @@ uv pip install -e . --no-deps --no-build-isolation   # rebuild the Zig core (~6 
   `zig fmt`** — `server.zig`, `h2.zig`, `bridge.zig` and `h2_static.zig` are already not
   `zig fmt` clean, so it would bury any real change in noise.
 
-## Platform support: Linux and macOS only
+## Platform support: Linux is the released target
 
-`src/zig/eventloop.zig` picks a backend at comptime — `eventloop_epoll.zig` or
-`eventloop_kqueue.zig` — and re-exports it, so `server.zig` is platform-agnostic and
+**macOS is not released.** The kqueue backend (`eventloop_kqueue.zig`) is in the tree
+and cross-compiles, but there is no macOS wheel, no macOS CI job, and nothing macOS
+in the release gate — a hosted `macos-14` runner builds the wheel but cannot pass the
+suite, and `test_macos` was a `needs` entry on `publish`, so the options were shipping
+red or dropping the platform. Treat macOS as **unvalidated source**: `module.zig` and
+`server.zig` are excluded from `make check-macos` (they import `bridge.zig`, which
+needs a macOS `Python.h`), so nothing in CI compiles them for Darwin at all. Anything
+touching the Darwin path needs a real Mac, which is the next release's job.
+
+`src/zig/eventloop.zig` still picks a backend at comptime — `eventloop_epoll.zig` or
+`eventloop_kqueue.zig` — and re-exports it, so `server.zig` stays platform-agnostic and
 the hot path has **no branch on the OS**. Adding a third target means adding a backend
 with the same five methods (`init`/`add`/`modify`/`remove`/`wait`), the same `Event`
 shape, the same `runtime: ?*anyopaque` field, and one `comptime` arm.
@@ -163,12 +172,13 @@ release; nothing reads it, so a mismatch is pure confusion.
   - `ci.yml` — push to `main` and pull requests. Builds wheels with cibuildwheel and
     tests them. **No publish job exists in this file.**
   - `build-and-test.yml` — the actual matrix (`build_wheels`, `test_wheels`,
-    `test_macos`, `build_sdist`), `on: workflow_call`. Called by both of the others so
+    `build_sdist`), `on: workflow_call`. Called by both of the others so
     the matrix is defined once and cannot drift.
   - `release.yml` — tag pushes only. Calls `build-and-test`, then publishes to PyPI via
     Trusted Publishing.
 
+  There is no macOS job in any of the three, and no macOS wheel.
+
   A branch push therefore cannot reach PyPI *structurally*, not just via a condition.
-  Before this split the pipeline was tag-only, so a push to `main` ran nothing at all
-  and the macOS gate could not be exercised until the release was already committed to.
+  Before this split the pipeline was tag-only, so a push to `main` ran nothing at all.
   Only publish when the whole suite is green.

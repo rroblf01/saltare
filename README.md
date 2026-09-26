@@ -8,9 +8,8 @@ Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for 
 pip install saltare
 ```
 
-Linux x86_64 / aarch64 (manylinux + musllinux) and macOS arm64 wheels, CPython 3.10–3.14. Zero runtime deps for plain HTTP; TLS / compression libraries (`libssl`, `libz`, `libbrotlienc`, `libzstd`) are `dlopen`'d on first use, so they only need to be present on the host when the matching feature is enabled.
+Linux x86_64 / aarch64 wheels (manylinux + musllinux), CPython 3.10–3.14. Zero runtime deps for plain HTTP; TLS / compression libraries (`libssl`, `libz`, `libbrotlienc`, `libzstd`) are `dlopen`'d on first use, so they only need to be present on the host when the matching feature is enabled.
 
-On macOS, `brew install openssl@3` if you want TLS — the wheel resolves it by install name at runtime, and without it the server starts in plain-HTTP mode with a warning on stderr.
 
 ## Quickstart
 
@@ -158,7 +157,7 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 ## Status
 
-> **Status: 1.12.0 — macOS arm64 wheels. kqueue event loop. 521 tests pass.** saltare is no longer Linux-only. `src/zig/eventloop.zig` picks its backend at comptime — `eventloop_epoll.zig` or the new `eventloop_kqueue.zig` — and re-exports it, so **`server.zig` is unchanged by the port** and the event path has no branch on the OS at all. The kqueue specifics (per-filter interest instead of a bitmask, `EV_EOF` instead of `EPOLLRDHUP` bits, a `timespec` instead of milliseconds) are absorbed inside the backend; both are level-triggered, so the connection state machine's discipline is unchanged. The Linux-isms are handled per-OS: `SOCK_NONBLOCK`/`SOCK_CLOEXEC` do not exist on Darwin (now `fcntl`), `TCP_KEEPIDLE` is `TCP_KEEPALIVE` there, `TCP_USER_TIMEOUT` is skipped, the `madvise` advice is `MADV_FREE` (the sweep was a no-op off Linux, so idle pool buffers held their pages), `sendfile(2)` takes its offset by value on Darwin instead of by pointer, and `sys/prctl.h` / `sys/sendfile.h` are hand-declared because a top-level `@cImport` of a header the other platform lacks fails the build before our code runs. `dlopen` gained the `.dylib` names for libssl / libz / libbrotli / libzstd — without them TLS and compression were silent no-ops. **`process_resident_memory_bytes`, `process_open_fds` and `process_cpu_seconds_total` stop reporting a hard 0** off Linux, via `proc_pidinfo` and `getrusage`; three permanently-zero series in a RAM-focused server's `/metrics` is the worst failure mode available. **Six real bugs fixed**, three found by driving raw sockets at the wire format (a client library normalises the request line before it reaches the socket, which is exactly the code under test): **absolute-form request targets 404'd** (`GET http://host/path` — RFC 7230 §5.3.2 says an origin server MUST ignore the scheme and authority and route on the path, so forward proxies, health checkers and load balancers all got a 404); **a 414/431 reached the client as a TCP reset** because the head is rejected while the peer is still sending, so closing with the tail still queued made the kernel RST and discard the response — which matters *because* saltare's head ceiling is far tighter than uvicorn's, which has no default limit at all and served both of those requests with 200; and **exceeding `max_headers` answered 400 instead of 431**, because the field-count limit shared an error with the byte ceiling and both fell into the malformed-syntax arm. Plus two in the WebSocket path, found by finally testing through FastAPI instead of a hand-written ASGI app: **every fragmented message corrupted the heap** (a double free — `wsDeliverToApp` can destroy the connection, and the caller then freed the reassembly buffer that `destroy()` had already freed; three 1 KB fragments aborted the process, and the existing fragmentation test missed it because its handler loops forever so the teardown path is never entered), and **the app was told 1006 for every close** even when saltare had just sent 1009 itself, leaving a handler unable to tell "message too big" from a dead network. **The four WebSocket stubs skipped since v0.10 are enabled again** — the multi-test teardown crash no longer reproduces under any teardown shape, and the likely culprits (the conftest drain fixture, v1.6; centralised WS teardown in `destroy()`, v1.7.1) both postdate the report. The other two, both found by writing the tests the features never had: a request arriving in the same packet as a PROXY-protocol header hung until the header timeout (`doReadHttp` never parsed pre-buffered bytes, since its loop reads before it parses — now uses `tryParsePipelined`, the existing "already buffered" path), and synthesized 500s carried no `Server-Timing` / `X-Request-ID`, because they are built by a different function from normal response heads. **61 new tests** for previously untested shipped features: PROXY protocol v1+v2, mTLS, `Server-Timing`/`X-Request-ID` end to end, WebSocket permessage-deflate over the wire, and the operational knobs — plus **19 more** for the HTTP/1.1 request-target forms a client library hides (absolute-form and its empty-path variants, asterisk-form, a path segment containing `://`, the `max_headers` boundary from both sides, and the three status codes an over-long head can produce) and **11 Zig unit tests** for the parser behind them. **Build/CI**: CI was not running the HTTP/2 suite at all (`h2` missing from both runners while the module skips itself wholesale); the Zig unit tests were broken in 4 of 6 files and nobody ran them; `py.typed` now ships and the `_core.pyi` stub is no longer 7 args behind; `uv sync` no longer prunes the build backend. `make check-macos` cross-compile-checks 17 Zig modules against `aarch64-macos` in seconds. **New: `saltare.optimize_process()`**, the explicit opt-in that re-execs an embedded script under `python -OO` — the CLI has done this for itself since v1.3, but anyone calling `saltare.run()` from their own entry point did not, which is 1.06 MiB (49.63 → 48.57, measured). The README also now breaks down where the ~50 MiB floor actually goes: 31% CPython, 59% importing FastAPI, 6% saltare. Full detail, including what was **not** built and why (x86_64 macOS, a `PR_SET_PDEATHSIG` equivalent, kTLS, macOS benchmarks), in [CHANGELOG.md](CHANGELOG.md).
+> **Status: 1.12.0 — six real bugs fixed, and a CI pipeline that had never run. 521 tests pass.** The headline is a **heap corruption that aborted the process on every fragmented WebSocket message** — a double free in the reassembly buffer, invisible to the existing tests because their raw-ASGI handler loops forever and so never enters the teardown path that frees it twice. Second: the WebSocket test suite only passed under an *editable* install, so with a real wheel the child process died importing `_core` — five tests, every platform, and the full suite had never been run against a wheel install locally to catch it. Third, and only findable by testing through FastAPI rather than a hand-written ASGI app: **the app was told 1006 for every close** even when saltare had just sent 1009 itself. Also fixed: absolute-form request targets (`GET http://host/path`) 404'd; a 414/431 reached the client as a TCP reset instead of a readable status; and exceeding `max_headers` answered 400 instead of 431. **The WebSocket stubs skipped since v0.10 are enabled** — that multi-test teardown crash no longer reproduces. **A kqueue backend for macOS is in the tree but not released**: no macOS wheel, no macOS job, nothing macOS in the release gate, because a hosted macOS runner builds the wheel but cannot pass the suite. It did earn its keep first — it caught a phantom `_sendfile_darwin` symbol that no Linux test or cross-compile could see. **CI is three files and the split is structural**: `ci.yml` (push to main, PRs) builds and tests and cannot reach PyPI; `build-and-test.yml` holds the matrix, called by both; `release.yml` is tag-only and owns the publish. Until this cycle the pipeline was tag-triggered only *and* invalid, so a push to main ran nothing at all. **New: `saltare.optimize_process()`**, the explicit opt-in that re-execs an embedded script under `python -OO` — the CLI has done this for itself since v1.3, but anyone calling `saltare.run()` from their own entry point did not, which is 1.06 MiB (49.63 → 48.57, measured). The README also now breaks down where the ~50 MiB floor actually goes: 31% CPython, 59% importing FastAPI, 6% saltare. Full detail, including what was **not** built and why, in [CHANGELOG.md](CHANGELOG.md).
 
 > Earlier release history is in [CHANGELOG.md](CHANGELOG.md), which records each
 > version's decisions — including what was deliberately *not* built and the
@@ -173,7 +172,7 @@ saltare keeps these in Zig:
 
 | Layer                | uvicorn               | saltare                     |
 | -------------------- | --------------------- | --------------------------- |
-| Event loop           | asyncio (Python)      | epoll / kqueue (Zig)        |
+| Event loop           | asyncio (Python)      | epoll (Zig)                 |
 | Socket I/O           | asyncio Transport     | direct `read`/`write` (Zig) |
 | HTTP/1.1 parser      | `httptools` (C)       | hand-rolled (Zig)           |
 | Per-connection state | Python objects (~KB)  | Zig structs (~hundreds B)   |
@@ -1344,9 +1343,11 @@ uv pip install -e .
 .venv/bin/python -m pytest -q
 ```
 
-The server **runs** on macOS as of v1.12 (kqueue backend, `macosx_11_0_arm64`
-wheels). TLS needs `brew install openssl@3` at runtime; the wheel finds it
-by install name.
+A kqueue backend for macOS exists in the source tree but is **not released**:
+there is no macOS wheel and no macOS CI job. See
+[CHANGELOG.md](CHANGELOG.md#1120) for the reasoning — a hosted macOS runner
+builds the wheel but cannot pass the suite, and `test_macos` was a gate on
+`publish`, so shipping it would have meant shipping red.
 
 If you are on Linux and touching platform-specific Zig code, you do not need
 a Mac to catch the obvious breakage:
@@ -1355,9 +1356,10 @@ a Mac to catch the obvious breakage:
 make check-macos   # cross-compile-checks 17 modules against aarch64-macos
 ```
 
-It skips `module.zig` and `server.zig`, which need a macOS `Python.h`; the
-macOS CI runner is their gate. See [AGENTS.md](AGENTS.md) for how to force
-`server.zig` through the check anyway.
+It skips `module.zig` and `server.zig`, which need a macOS `Python.h`; with
+no macOS runner in the matrix those two are unverified until someone builds
+on a Mac. See [AGENTS.md](AGENTS.md) for how to force `server.zig` through
+the check anyway.
 
 Then:
 

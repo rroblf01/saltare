@@ -123,27 +123,14 @@ musllinux-aarch64-image = "musllinux_1_2"
 select = "*-musllinux*"
 before-all = "bash {project}/scripts/install-zig.sh"
 
-# v1.12: macOS arm64, the first non-Linux target. The event loop gained a
-# kqueue backend in eventloop_kqueue.zig; everything else the port needed
-# (SOCK_NONBLOCK, TCP_KEEPIDLE, sys/sendfile.h, sys/prctl.h, the dlopen
-# sonames) is handled per-OS in the Zig sources.
-[tool.cibuildwheel.macos]
-archs = ["arm64"]
-# arm64 macOS starts at 11.0 Big Sur. Pinning it keeps the wheel usable on
-# the widest set of machines and makes the platform tag deterministic
-# (macosx_11_0_arm64) instead of tracking whatever SDK the runner ships.
-# Zig's macOS native linker honours this variable; CMake does not pass
-# -Dtarget, so the env var is how the floor is communicated.
-environment = { MACOSX_DEPLOYMENT_TARGET = "11.0", ZIG_VERSION = "0.16.0" }
-# No OpenSSL here either, for the same reason as Linux. Homebrew's
-# openssl@3 is only needed at *runtime* by users who want TLS, and it is
-# reached by dlopen of "libssl.3.dylib" / "libssl.dylib".
-before-all = "bash {project}/scripts/install-zig.sh"
-# x86_64 macOS is deliberately not built. The wheel would have to be a
-# Rosetta build on an arm64 runner, and the project's distribution targets
-# are Linux servers plus Apple-Silicon developer machines — the
-# Django `runserver` integration is the local-dev case that motivated this,
-# and that is arm64 by definition on any current Mac.
+# v1.12: macOS support exists in the source (eventloop_kqueue.zig, and the
+# per-OS fixes in the Zig sources) but is NOT built or published. The
+# [tool.cibuildwheel.macos] block and the macOS CI jobs were removed for
+# this release: no macOS wheel is produced, no macOS test job runs, and
+# nothing macOS-related is gated on publishing. The Darwin code path stays
+# in the tree and is still cross-compile-checked by `make check-macos`, so
+# a Darwin-only compile error surfaces on a Linux box in seconds. It gets
+# validated on real hardware in a later release.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

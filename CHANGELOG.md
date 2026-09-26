@@ -2,13 +2,28 @@
 
 ## 1.12.0
 
-**Theme: the server runs on macOS.** After being epoll-only since v0.4, saltare
-now has a kqueue backend and ships `macosx_11_0_arm64` wheels. The release
-also pays down a category of debt this repo had accumulated — features
-with a README section, a CLI flag, and no test that ever reached them —
-because two of the gaps turned out to be real bugs.
+**Theme: six real bugs, and a CI pipeline that had never run.** The headline
+findings are a heap corruption that aborted the process on **every fragmented
+WebSocket message**, and a WebSocket test suite that only passed under an
+editable install — so every release job had been failing for a reason nobody
+saw, because the pipeline itself was invalid. The rest is a category of debt
+this repo had accumulated: features with a README section, a CLI flag, and no
+test that ever reached them.
 
-### macOS arm64
+**macOS is not in this release.** A kqueue backend was written and is still in
+the tree, but no macOS wheel is built, no macOS test job runs, and nothing
+macOS-related gates the release. The reasoning is recorded under *Not built —
+and why*; the short version is that a hosted macOS runner could build the
+wheel but could not pass the suite, and gating a release on a platform we do
+not ship is worse than not claiming it. The Darwin code path stays
+cross-compile-checked by `make check-macos`, and gets validated on real
+hardware in a later release.
+
+### macOS — written, not shipped
+
+Kept in the tree, absent from the release. Everything below landed and
+cross-compiles; none of it is exercised by CI in this cycle.
+
 
 - **kqueue event loop** (`src/zig/eventloop_kqueue.zig`, new). The epoll
   implementation moved verbatim to `eventloop_epoll.zig`; `eventloop.zig`
@@ -477,6 +492,29 @@ Two caveats recorded so the numbers are not misread later:
   wrong.
 
 ### Not built — and why (decision record)
+
+- **macOS wheels and the macOS test job — dropped from this release.** This
+  is the decision this cycle reversed, so the reasoning is worth stating
+  plainly rather than deleting. The kqueue backend was written, compiles,
+  and is cross-compile-checked by `make check-macos` on every change. The
+  macOS wheel also built — the `delocate` platform-tag check passes — and
+  the extension then loaded, after fixing a phantom `_sendfile_darwin`
+  symbol that only a real macOS runner could ever surface.
+
+  What could not be made green was the suite on `macos-14`. It failed with
+  the usual cross-platform timing suspects and then aborted the interpreter
+  outright (SIGABRT) with several `saltare.run` threads live, which points
+  at the process-global config that `module.zig` documents as one-serve-per-
+  process — a hazard the test suite itself walks into by starting a server
+  per test. Diagnosing that properly needs either a Mac to iterate on or a
+  root-cause stack from the runner, not a guess from a Linux box.
+
+  Releasing a wheel for a platform whose test suite aborts is worse than not
+  shipping that wheel: `test_macos` was a `needs` entry on `publish`, so the
+  alternatives were shipping red or dropping the platform. Dropped. The
+  `MACOSX_DEPLOYMENT_TARGET` plumbing in `CMakeLists.txt` stays, so a Mac
+  build still produces a correctly tagged `macosx_11_0_arm64` binary when
+  someone runs it.
 
 - **x86_64 macOS wheels — declined.** They would have to be a Rosetta build
   on an arm64 runner, or a separate Intel runner for a platform with

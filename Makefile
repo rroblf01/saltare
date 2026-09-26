@@ -67,7 +67,10 @@ check-macos:
 	if [ $$fail -ne 0 ]; then exit 1; fi; \
 	echo; \
 	echo "note: module.zig and server.zig are not covered here (bridge.zig"; \
-	echo "needs a macOS Python.h). The macOS CI runner is their gate."
+	echo "needs a macOS Python.h). macOS is not a released platform and there"; \
+	echo "is no macOS runner in CI, so those two are unverified until someone"; \
+	echo "builds on a Mac. See AGENTS.md for the symlink trick to force"; \
+	echo "server.zig through anyway."
 
 # Build the macOS arm64 wheel with cibuildwheel. Must be run on macOS with
 # Zig on PATH; cibuildwheel's macOS support has no container backend, so

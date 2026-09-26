@@ -15,9 +15,9 @@ name: Release wheels
 #   push to main / pull request  ->  ci.yml      -> build + test, no publish
 #   push tag vX.Y.Z              ->  release.yml -> build + test + publish
 #
-# Production target is Linux x86_64 + aarch64 (manylinux + musllinux) plus
-# macOS arm64. x86_64 macOS is deliberately not built — see
-# [tool.cibuildwheel.macos] in pyproject.toml for why.
+# Production target is Linux x86_64 + aarch64, manylinux and musllinux.
+# macOS is not built or published: no macOS wheel, no macOS test job, and
+# nothing macOS-related in the release gate. See the note in pyproject.toml.
 #
 # manylinux_2_28 + musllinux_1_2 are PyPI compatibility tags, not just
 # container choices — PyPI rejects wheels tagged `linux_x86_64` (the
@@ -39,8 +39,11 @@ jobs:
     uses: ./.github/workflows/build-and-test.yml
 
   # PyPI publish. Gated on tag pushes AND on the whole build-and-test
-  # matrix passing — test_wheels (manylinux x86_64) and test_macos (macOS
-  # arm64) included. A release is not published with a red platform.
+  # matrix passing. A release is not published with a red platform.
+  #
+  # v1.12: `test_macos` was a `needs` entry here and no longer is. No macOS
+  # wheel is built or published, so gating the release on a macOS test run
+  # would mean gating it on a platform we do not ship.
   #
   # The `if:` is redundant with this file's tag-only trigger. It is kept
   # anyway: it is the one line standing between a build and an upload, and
