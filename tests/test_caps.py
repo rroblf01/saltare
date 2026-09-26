@@ -215,13 +215,61 @@ def test_max_keepalive_requests_forces_close_at_limit() -> None:
         assert sock.recv(4096) == b""
 
 
+def _dispatch_open_conns(sock: socket.socket, port: int) -> int:
+    """Ask the server how many connections it has open, over a connection
+    that is already admitted.
+
+    v1.12: this test used to `time.sleep()` and hope the accept loop had
+    registered the held connections. That is a race with the event loop:
+    on a busy host the third connection arrived before the cap was
+    reached, got served normally, and the `recv` sat until its timeout —
+    which is how a test marked `flaky(reruns=3)` still failed a third of
+    the time once the suite grew.
+
+    The query deliberately goes out on one of the *held* sockets. Polling
+    `/debug/dispatch` over a fresh connection would itself consume a slot
+    against `max_concurrent_connections=2`, so the probe would evict the
+    very connections it is trying to observe. Reusing an admitted
+    connection costs no capacity and makes the precondition an observed
+    fact instead of a hope.
+
+    The probe is keep-alive: with `Connection: close` saltare would answer
+    and then drop the very socket the poll loop is using, so the second
+    iteration would be writing to a closed connection.
+    """
+    import json
+
+    deadline = time.monotonic() + 5.0
+    last = -1
+    while time.monotonic() < deadline:
+        try:
+            sock.sendall(
+                f"GET /__dispatch HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
+                f"\r\n".encode()
+            )
+            _status, _headers, body = _read_full_response(sock, deadline=2.0)
+            last = int(json.loads(body)["open_conns"])
+            if last >= 2:
+                return last
+        except Exception:  # noqa: BLE001 - retry until the deadline
+            pass
+        time.sleep(0.02)
+    pytest.fail(f"server never reported 2 open connections (last={last})")
+
+
 @pytest.mark.flaky(reruns=3, reruns_delay=1)
 def test_max_concurrent_connections_drops_extras() -> None:
     """Once the active-connection cap is hit, the server still accepts new
     sockets (to drain the kernel backlog) but immediately closes them — the
     client sees a clean EOF on its first read."""
     port = _free_port()
-    _serve_in_background(echo_app, port, max_concurrent_connections=2)
+    # dispatch_path is a Zig-side intercept used only to observe
+    # open_conns; the request never reaches the app.
+    _serve_in_background(
+        echo_app, port,
+        max_concurrent_connections=2,
+        dispatch_path="/__dispatch",
+    )
 
     held: list[socket.socket] = []
     try:
@@ -230,8 +278,9 @@ def test_max_concurrent_connections_drops_extras() -> None:
         for _ in range(2):
             held.append(socket.create_connection(("127.0.0.1", port), timeout=2.0))
 
-        # Give the server a moment to register them.
-        time.sleep(0.1 * _TIMING_FACTOR)
+        # Wait until the server reports both as open, rather than assuming
+        # a fixed sleep was long enough.
+        _dispatch_open_conns(held[0], port)
 
         # The third connect succeeds at the TCP level (kernel queues it
         # then accept() returns) but saltare immediately closes it.
