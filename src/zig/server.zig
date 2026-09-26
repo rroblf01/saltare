@@ -4832,7 +4832,9 @@ fn h2StreamReset(loop: *eventloop.Loop, conn: *Connection) void {
 // response frames are queued on `write_buf` for doWrite to drain.
 
 fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
-    const data = conn.read_buf.?.data;
+    // `var`, not `const`: growing the read buffer reallocates, so the slice
+    // has to be re-read after an upgrade. Same pattern as doReadHttp.
+    var data = conn.read_buf.?.data;
 
     while (true) {
         // Try to parse a frame from what's already buffered.
@@ -4860,10 +4862,37 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                 }
                 const total = hdr.header_len + hdr.payload_len;
                 if (total > data.len) {
-                    // Frame bigger than our buffer. Will retry as
-                    // fragmentation handler if it's the start of a
-                    // legit fragmented message.
-                    wsTeardown(loop, conn);
+                    // The declared frame does not fit the read buffer.
+                    //
+                    // v1.12: this branch used to call wsTeardown()
+                    // unconditionally, with a comment saying it "will
+                    // retry as fragmentation handler if it's the start of a
+                    // legit fragmented message" — but it never checked
+                    // FIN, so a single unfragmented frame larger than the
+                    // 4 KiB small pool buffer was killed mid-flight and
+                    // the client saw a TCP reset. Measured threshold:
+                    // anything up to ~3000 bytes worked and 4096 failed,
+                    // which is SMALL_DATA_SIZE exactly. A 5 KB text frame
+                    // is unremarkable in a real application.
+                    //
+                    // Grow to the large buffer instead, the same way
+                    // doReadHttp does when a request head does not fit.
+                    // Beyond the large buffer the frame genuinely cannot be
+                    // buffered, and we answer 1009 (message too big)
+                    // rather than dropping the socket silently. Clients
+                    // that need more should fragment, which reassembles
+                    // into a heap buffer up to WS_FRAG_MAX (1 MiB).
+                    if (data.len < pool_mod.LARGE_DATA_SIZE) {
+                        conn.upgradeBuffer() catch {
+                            wsTeardown(loop, conn);
+                            return;
+                        };
+                        data = conn.read_buf.?.data;
+                        continue;
+                    }
+                    sendCloseFrame(conn, 1009) catch {};
+                    conn.keep_alive = false;
+                    flushOutbound(loop, conn);
                     return;
                 }
                 if (conn.read_total >= total) {
@@ -4947,8 +4976,33 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
 
         const remaining = data[conn.read_total..];
         if (remaining.len == 0) {
-            // No room left and still no complete frame.
-            wsTeardown(loop, conn);
+            // Buffer full and the frame is still incomplete.
+            //
+            // v1.12: this used to tear the connection down immediately,
+            // which meant no single unfragmented WebSocket message could
+            // exceed the 4 KiB small pool buffer — a 5 KB text frame was
+            // killed mid-flight, and the client saw a TCP reset. The HTTP
+            // path has always handled the identical situation by growing
+            // to the large buffer (see doReadHttp), so this now does the
+            // same. A client that needs more than the large buffer can
+            // fragment, which reassembles into a heap buffer up to the
+            // 1 MiB WS_FRAG_MAX.
+            if (data.len < pool_mod.LARGE_DATA_SIZE) {
+                conn.upgradeBuffer() catch {
+                    wsTeardown(loop, conn);
+                    return;
+                };
+                // Re-read: upgradeBuffer reallocates, so `data` still
+                // points into the released small buffer.
+                data = conn.read_buf.?.data;
+                continue;
+            }
+            // Already at the large buffer and still not enough. Tell the
+            // peer *why* rather than dropping the socket: 1009 is
+            // "message too big" and is the code a client can act on.
+            sendCloseFrame(conn, 1009) catch {};
+            conn.keep_alive = false;
+            flushOutbound(loop, conn);
             return;
         }
         const r = connRead(conn, remaining);
