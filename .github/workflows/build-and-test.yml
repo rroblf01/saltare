@@ -67,6 +67,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # cibuildwheel was invoked as `pipx run cibuildwheel==3.4.1`, which
+      # builds a throwaway venv on every job — GitHub runners are ephemeral,
+      # so that venv is paid for on all four jobs every run. Installing it
+      # into the runner's Python is one pip resolve instead. The saving is
+      # real but modest (single-digit seconds), unlike the other changes
+      # here; pip's download cache is already warm from the step below.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install cibuildwheel
+        run: pip install cibuildwheel==3.4.1
+
       # Pre-install Zig on the runner (with caching) and mount it into
       # the cibuildwheel container. Avoids `ziglang.org` reachability
       # problems from inside the manylinux image — those caused
@@ -90,13 +102,23 @@ jobs:
           ZIG_SKIP_SYMLINK: "1"
         run: bash scripts/install-zig.sh
 
+      # v1.12: the key ended in `${{ github.sha }}`, so the primary key
+      # could never hit — every run fell through to restore-keys and then
+      # uploaded a fresh copy of a few hundred MB. Pointless churn, because
+      # Zig's global cache is *content-addressed*: entries are keyed by the
+      # hash of the source and the build options, not by commit. Reusing one
+      # cache across commits is therefore correct by construction, and a
+      # stale entry is never returned — an unchanged file hits, a changed
+      # one misses. So the key is deliberately stable: saved once per
+      # (arch, libc, Zig version) and restored forever after.
+      #
+      # The wheelhouse cache below is a different case and keeps the sha —
+      # see the comment there for why a *wheel* must never cross commits.
       - name: Cache Zig build artifacts
         uses: actions/cache@v4
         with:
           path: ${{ env.ZIG_CACHE_DIR }}
-          key: zig-build-${{ matrix.arch }}-${{ matrix.libc }}-${{ github.sha }}
-          restore-keys: |
-            zig-build-${{ matrix.arch }}-${{ matrix.libc }}-
+          key: zig-build-${{ matrix.arch }}-${{ matrix.libc }}-${{ env.ZIG_VERSION }}
 
       # Tier-5: cache pip's download/wheel cache across runs so the
       # build-time dependency install (`scikit-build-core`, `cmake`,
@@ -131,36 +153,39 @@ jobs:
 
       # Tier-3: skip cibuildwheel's per-wheel test pass entirely. Tests
       # run once in the separate `test_wheels` job below.
+      # v1.12: was wrapped in nick-fields/retry@v3 (timeout_minutes=30,
+      # max_attempts=3). Two costs, both observed. A *deterministic*
+      # failure was rediscovered three times — the docker mount bug spent
+      # three attempts learning the same thing — and a genuine hang held the
+      # runner for up to 90 minutes. A plain step with an explicit bound
+      # beats both: failures surface in seconds, and timeout-minutes still
+      # caps a hang, once instead of three times. Measured builds are
+      # 2.7-3.3 min, so 45 is generous headroom for aarch64/musllinux.
       - name: Build wheels
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 30
-          max_attempts: 3
-          retry_wait_seconds: 30
-          retry_on: error
-          command: |
-            # v1.12: the macOS branch of this script is gone along with the
-            # macos-14 matrix entry — nothing selects `libc = macos` any
-            # more, so the if/else had one arm. CIBW_CACHE_DIR points the
-            # container's pip cache at this host directory; it used to be
-            # unset, and the "Cache pip downloads" step was caching
-            # ~/.cache/pip, which the container never reads, so the saving
-            # that step's comment promised was not actually happening.
-            export CIBW_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
-            export PIP_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
-            mkdir -p "$CIBW_CACHE_DIR" "${{ env.ZIG_CACHE_DIR }}"
-            chmod -R 777 "${{ env.ZIG_CACHE_DIR }}"
+        timeout-minutes: 45
+        run: |
+          # v1.12: the macOS branch of this script is gone along with the
+          # macos-14 matrix entry — nothing selects `libc = macos` any
+          # more, so the if/else had one arm. CIBW_CACHE_DIR points the
+          # container's pip cache at this host directory; it used to be
+          # unset, and the "Cache pip downloads" step was caching
+          # ~/.cache/pip, which the container never reads, so the saving
+          # that step's comment promised was not actually happening.
+          export CIBW_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
+          export PIP_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
+          mkdir -p "$CIBW_CACHE_DIR" "${{ env.ZIG_CACHE_DIR }}"
+          chmod -R 777 "${{ env.ZIG_CACHE_DIR }}"
 
-            export CIBW_ARCHS="${{ matrix.arch }}"
-            export CIBW_BUILD="cp31?-${{ matrix.libc }}_*"
-            export CIBW_TEST_SKIP="*"
+          export CIBW_ARCHS="${{ matrix.arch }}"
+          export CIBW_BUILD="cp31?-${{ matrix.libc }}_*"
+          export CIBW_TEST_SKIP="*"
 
-            export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
+          export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
 
-            export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw --volume $CIBW_CACHE_DIR:/pip-cache:rw"
-            export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_CACHE_DIR=/pip-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+          export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw --volume $CIBW_CACHE_DIR:/pip-cache:rw"
+          export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_CACHE_DIR=/pip-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
 
-            pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
+          cibuildwheel --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.arch }}-${{ matrix.libc }}
