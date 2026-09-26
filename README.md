@@ -55,9 +55,12 @@ saltare main:app \
 ```python
 # server.py
 import saltare
-from main import app
 
 if __name__ == "__main__":
+    saltare.optimize_process()     # first statement — see below
+
+    from main import app
+
     saltare.run(
         app,
         host="0.0.0.0",
@@ -74,6 +77,60 @@ if __name__ == "__main__":
 ```bash
 python server.py
 ```
+
+#### `optimize_process()` — 1 MiB of RAM, free
+
+Running via the CLI already gets you the production RAM posture: the
+`python -OO -m saltare` entry re-execs itself with `-OO` and
+`MALLOC_ARENA_MAX=1` on startup. **A script that calls `saltare.run()`
+yourself did not**, because that re-exec is deliberately gated on saltare
+being the real main entry — the gate exists because a naive argv check
+once hijacked `pytest` and other tools launched from a directory whose
+name contained "saltare`.
+
+`saltare.optimize_process()` is the explicit opt-in for that case. It
+re-execs *your* script under `python -OO`, which makes CPython discard
+every docstring and `assert` in your dependency tree. Measured on the
+FastAPI benchmark app, three samples each with no overlap:
+
+| | RSS |
+|---|---:|
+| `python server.py` | 49.63 MiB |
+| with `optimize_process()` | **48.57 MiB** |
+
+Two rules. It must be the **first statement**, because the re-exec
+replays the script from the top — anything done before it happens twice.
+And it needs a real file in `argv[0]`, so it declines under `python -c`,
+`python -` and the REPL rather than dropping your session.
+
+It declines harmlessly when the process is already optimized, when
+`SALTARE_REEXECED=1` is set (so a second call cannot loop), or when
+`SALTARE_NO_OPTIMIZE=1` is set — for apps that read `__doc__` at runtime
+or rely on their own asserts surviving. `MALLOC_ARENA_MAX` and
+`PYTHONFAULTHANDLER` are set with `setdefault`, so an operator who
+deliberately set them keeps their values.
+
+For Django, set `PYTHONOPTIMIZE=2` in the environment instead: by the
+time `manage.py runserver` reaches saltare, the process is already deep
+in Django's own bootstrap and a re-exec would discard the configured
+settings.
+
+#### Where the 50 MiB actually goes
+
+Worth knowing before you spend effort on the wrong thing. Measured on
+this host, a running server with the FastAPI benchmark app:
+
+| component | RSS | share |
+|---|---:|---:|
+| CPython 3.14 interpreter | 15.20 MiB | 31% |
+| `import fastapi` (starlette + pydantic + pydantic-core) | 29.38 MiB | 59% |
+| building the app (routes, validators) | 2.25 MiB | 5% |
+| **saltare running** | **2.78 MiB** | **6%** |
+
+saltare's own cost is 2.78 MiB, of which the Zig core's zero-initialised
+globals (`.bss` + `.tbss`) are 385 KiB. If you are RAM-bound, the lever
+is the framework's import, not the server — and a 64 MiB container budget
+is mostly spent on CPython plus FastAPI before saltare starts.
 
 ### 3. HTTPS
 
@@ -101,7 +158,7 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 ## Status
 
-> **Status: 1.12.0 — macOS arm64 wheels. kqueue event loop. 447 tests pass.** saltare is no longer Linux-only. `src/zig/eventloop.zig` picks its backend at comptime — `eventloop_epoll.zig` or the new `eventloop_kqueue.zig` — and re-exports it, so **`server.zig` is unchanged by the port** and the event path has no branch on the OS at all. The kqueue specifics (per-filter interest instead of a bitmask, `EV_EOF` instead of `EPOLLRDHUP` bits, a `timespec` instead of milliseconds) are absorbed inside the backend; both are level-triggered, so the connection state machine's discipline is unchanged. The Linux-isms are handled per-OS: `SOCK_NONBLOCK`/`SOCK_CLOEXEC` do not exist on Darwin (now `fcntl`), `TCP_KEEPIDLE` is `TCP_KEEPALIVE` there, `TCP_USER_TIMEOUT` is skipped, the `madvise` advice is `MADV_FREE` (the sweep was a no-op off Linux, so idle pool buffers held their pages), `sendfile(2)` takes its offset by value on Darwin instead of by pointer, and `sys/prctl.h` / `sys/sendfile.h` are hand-declared because a top-level `@cImport` of a header the other platform lacks fails the build before our code runs. `dlopen` gained the `.dylib` names for libssl / libz / libbrotli / libzstd — without them TLS and compression were silent no-ops. **`process_resident_memory_bytes`, `process_open_fds` and `process_cpu_seconds_total` stop reporting a hard 0** off Linux, via `proc_pidinfo` and `getrusage`; three permanently-zero series in a RAM-focused server's `/metrics` is the worst failure mode available. **Two real bugs fixed**, both found by writing the tests the features never had: a request arriving in the same packet as a PROXY-protocol header hung until the header timeout (`doReadHttp` never parsed pre-buffered bytes, since its loop reads before it parses — now uses `tryParsePipelined`, the existing "already buffered" path), and synthesized 500s carried no `Server-Timing` / `X-Request-ID`, because they are built by a different function from normal response heads. **61 new tests** for previously untested shipped features: PROXY protocol v1+v2, mTLS, `Server-Timing`/`X-Request-ID` end to end, WebSocket permessage-deflate over the wire, and the operational knobs. **Build/CI**: CI was not running the HTTP/2 suite at all (`h2` missing from both runners while the module skips itself wholesale); the Zig unit tests were broken in 4 of 6 files and nobody ran them; `py.typed` now ships and the `_core.pyi` stub is no longer 7 args behind; `uv sync` no longer prunes the build backend. `make check-macos` cross-compile-checks 17 Zig modules against `aarch64-macos` in seconds. Full detail, including what was **not** built and why (x86_64 macOS, a `PR_SET_PDEATHSIG` equivalent, kTLS, macOS benchmarks), in [CHANGELOG.md](CHANGELOG.md).
+> **Status: 1.12.0 — macOS arm64 wheels. kqueue event loop. 467 tests pass.** saltare is no longer Linux-only. `src/zig/eventloop.zig` picks its backend at comptime — `eventloop_epoll.zig` or the new `eventloop_kqueue.zig` — and re-exports it, so **`server.zig` is unchanged by the port** and the event path has no branch on the OS at all. The kqueue specifics (per-filter interest instead of a bitmask, `EV_EOF` instead of `EPOLLRDHUP` bits, a `timespec` instead of milliseconds) are absorbed inside the backend; both are level-triggered, so the connection state machine's discipline is unchanged. The Linux-isms are handled per-OS: `SOCK_NONBLOCK`/`SOCK_CLOEXEC` do not exist on Darwin (now `fcntl`), `TCP_KEEPIDLE` is `TCP_KEEPALIVE` there, `TCP_USER_TIMEOUT` is skipped, the `madvise` advice is `MADV_FREE` (the sweep was a no-op off Linux, so idle pool buffers held their pages), `sendfile(2)` takes its offset by value on Darwin instead of by pointer, and `sys/prctl.h` / `sys/sendfile.h` are hand-declared because a top-level `@cImport` of a header the other platform lacks fails the build before our code runs. `dlopen` gained the `.dylib` names for libssl / libz / libbrotli / libzstd — without them TLS and compression were silent no-ops. **`process_resident_memory_bytes`, `process_open_fds` and `process_cpu_seconds_total` stop reporting a hard 0** off Linux, via `proc_pidinfo` and `getrusage`; three permanently-zero series in a RAM-focused server's `/metrics` is the worst failure mode available. **Two real bugs fixed**, both found by writing the tests the features never had: a request arriving in the same packet as a PROXY-protocol header hung until the header timeout (`doReadHttp` never parsed pre-buffered bytes, since its loop reads before it parses — now uses `tryParsePipelined`, the existing "already buffered" path), and synthesized 500s carried no `Server-Timing` / `X-Request-ID`, because they are built by a different function from normal response heads. **61 new tests** for previously untested shipped features: PROXY protocol v1+v2, mTLS, `Server-Timing`/`X-Request-ID` end to end, WebSocket permessage-deflate over the wire, and the operational knobs. **Build/CI**: CI was not running the HTTP/2 suite at all (`h2` missing from both runners while the module skips itself wholesale); the Zig unit tests were broken in 4 of 6 files and nobody ran them; `py.typed` now ships and the `_core.pyi` stub is no longer 7 args behind; `uv sync` no longer prunes the build backend. `make check-macos` cross-compile-checks 17 Zig modules against `aarch64-macos` in seconds. **New: `saltare.optimize_process()`**, the explicit opt-in that re-execs an embedded script under `python -OO` — the CLI has done this for itself since v1.3, but anyone calling `saltare.run()` from their own entry point did not, which is 1.06 MiB (49.63 → 48.57, measured). The README also now breaks down where the ~50 MiB floor actually goes: 31% CPython, 59% importing FastAPI, 6% saltare. Full detail, including what was **not** built and why (x86_64 macOS, a `PR_SET_PDEATHSIG` equivalent, kTLS, macOS benchmarks), in [CHANGELOG.md](CHANGELOG.md).
 
 > **Status: 1.11.0 (historical entry) — real HTTP/2 responses + outbound flow control, PEP 684 sub-interpreter groundwork, 368 tests pass.** **HTTP/2 now actually speaks HTTP/2.** Through v1.10 `http2=True` over TLS silently fell back to HTTP/1.1: the TLS layer advertised ALPN with the *client*-side `SSL_CTX_set_alpn_protos` (a no-op on a server), so `h2` never negotiated, and the dispatch path it hid had a `PyObject_CallFunction` format string with one too few `y#` byte-strings that would have segfaulted on the first real request. v1.11 fixes both — server-side `SSL_CTX_set_alpn_select_cb` (gated on `http2=True`, now plumbed through `_core.serve`) and the corrected `Oiiy#y#y#y#y#Oy#iOiO` marshalling — and adds a real response path: `h2_response.zig`, an incremental HTTP/1.1→HTTP/2 transcoder that reframes the dispatcher's existing response bytes into HEADERS (HPACK-encoded `:status` first, names lowercased, hop-by-hop headers dropped per RFC 7540 §8.1.2.2) + DATA frames bounded by the peer's `SETTINGS_MAX_FRAME_SIZE`, de-frames chunked bodies, and places END_STREAM on the last frame. The previously-dead `h2_encoder.zig` now backs it. **Outbound flow control** (RFC 7540 §6.9): the server never sends more DATA than the peer's stream + connection windows allow, holding the rest until a `WINDOW_UPDATE` grows the window; a stream completes only once END_STREAM has gone out, so flow-control-blocked bodies are never dropped. The server connection preface is now its own SETTINGS frame (was a premature ACK). Verified end to end against the real `h2` sans-IO client (GET, POST-with-body, 60 KiB multi-frame, and a 50 KiB body pulled through a 1 KiB window). HTTP/2 multiplexing is still serial (one dispatch in flight per connection). **PEP 684 (per-interpreter GIL) groundwork**: `_core` uses multi-phase init, isolates the racy event-loop state into a per-serve `Runtime`, has a re-entrant `serveLoop`, and declares per-interpreter-GIL support — a full server runs in an own-GIL sub-interpreter (verified). But the measurement that motivated it refuted its premise — sub-interpreter workers cost **more** RAM than saltare's `gc.freeze()` pre-fork model (they can't share the Python object graph), so the worker spawner was **not** built; fork stays the multi-worker model. **Fixes**: a spurious `-OO` re-exec when the project lives under a `saltare`-named directory (`"saltare" in argv[0]` substring check → now matches the `__main__.py` parent dir), and the default `Server:` header version drifting from the package version (now derived from `_core.version()` / a single Zig `VERSION` constant). Test suite **368 passing**, including `h2`-client conformance (incl. flow control) and own-GIL serve. Benchmarks (v1.11.0, mimalloc preload): saltare leads on all workloads — 3.0–9.1 MiB leaner than uvicorn, 12.1–12.9 MiB leaner than granian.
 
@@ -1181,6 +1238,13 @@ The recommended production image is the v1.5 Alpine variant — see
 It uses `python:3.14-alpine`, installs the saltare musllinux wheel,
 preloads mimalloc, and runs under `tini` for clean signal forwarding.
 Image size lands around 60 MiB total.
+
+In a container you get `-OO` for free, because the entry point is the
+saltare CLI and it re-execs itself. If you instead bake your own
+application image around `saltare.run()`, add
+[`optimize_process()`](#optimize_process----1-mib-of-ram-free) to the
+entry point, or set `PYTHONOPTIMIZE=2` in the `ENV` — the docstring
+saving is ~1.4 MiB and costs nothing.
 
 If you need to run saltare on a glibc base instead (CentOS / RHEL /
 manylinux-style), the pre-Alpine knobs still apply:

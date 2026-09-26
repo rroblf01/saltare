@@ -28,6 +28,14 @@ if os.path.exists(_SRC):
     # Load from source (no _core dependency needed)
     _mock_saltare = _types.ModuleType("saltare")
     _mock_saltare.__version__ = "1.12.0"
+    # v1.12: point the mock at the real package directory. `cli.py` does
+    # `from saltare import _optimize`, and resolving a *submodule* needs
+    # `__path__` — without it the import raises "unknown location" and the
+    # mock is not restored, which then breaks every test module collected
+    # after this one. Setting `__path__` lets real submodules load while
+    # `_core` stays mocked out, and it keeps working as cli.py grows more
+    # imports instead of needing a new mock attribute each time.
+    _mock_saltare.__path__ = [os.path.dirname(_SRC)]
 
     def _mock_run(**kwargs):
         pass

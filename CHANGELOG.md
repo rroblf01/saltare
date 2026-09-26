@@ -175,7 +175,73 @@ because it looks like coverage.
   per-platform degradations, so "works everywhere" is not claimed for
   something that quietly no-ops.
 
-Suite: **447 passing**, 7 skipped, from 368.
+Suite: **467 passing**, 7 skipped, from 368.
+
+### Where the RAM actually goes — and the one lever left
+
+Before optimising anything it is worth knowing what the floor is made of.
+Measured on this host, a running server with the FastAPI benchmark app:
+
+| component | RSS | share |
+|---|---:|---:|
+| CPython 3.14 interpreter | 15.20 MiB | 31% |
+| `import fastapi` (starlette, pydantic, pydantic-core) | 29.38 MiB | 59% |
+| building the app (routes, validators) | 2.25 MiB | 5% |
+| **saltare running** | **2.78 MiB** | **6%** |
+
+So the answer to "is there RAM left to save" is mostly *not in the
+server*. saltare's own cost is 2.78 MiB, of which the Zig core's
+zero-initialised globals (`.bss` 129 KiB + `.tbss` 256 KiB) are 385 KiB —
+there is no large static allocation left to attack. Per-connection cost is
+~1 KiB: 500 idle keep-alive connections add 0.5 MiB in total. The
+remaining 94% is CPython plus the framework's import, and the only lever a
+server has over that is not mapping libraries it does not need — which is
+why OpenSSL and the codecs are `dlopen`'d rather than linked.
+
+### Added: `saltare.optimize_process()` — 1.06 MiB, free
+
+The one measurable win left, and it was a gap rather than an optimisation.
+v1.3 made the CLI re-exec itself under `python -OO` with
+`MALLOC_ARENA_MAX=1`, worth ~1.4 MiB once FastAPI's docstrings are
+resident. But that re-exec is deliberately gated on saltare being the
+genuine main entry — the gate exists because a naive argv check once
+hijacked `pytest` and other tools launched from a directory whose name
+contained "saltare" — so **anybody embedding the server in their own
+script got none of it**. That is exactly the `saltare.contrib.django`
+audience and the programmatic case the macOS work was partly for.
+
+`optimize_process()` is the explicit opt-in: it re-execs *your* script
+under `-OO` instead. Measured end to end with a real entry-point script
+serving the FastAPI benchmark app, three samples each with no overlap in
+the distributions:
+
+| | RSS | optimize level |
+|---|---:|---:|
+| without | 49.63 MiB | 0 |
+| with | **48.57 MiB** | 2 |
+
+The mechanics moved to `saltare/_optimize.py`, which has no import-time
+side effects, so the CLI and the new public function share one
+implementation rather than two that can drift. It declines under
+`python -c` / `python -` / the REPL (no script to re-run), when already
+optimized, when `SALTARE_REEXECED=1` (so a second call cannot loop), and
+when `SALTARE_NO_OPTIMIZE=1`. `MALLOC_ARENA_MAX` and `PYTHONFAULTHANDLER`
+are applied with `setdefault` so an operator's deliberate values survive;
+`PYTHONOPTIMIZE` is forced, since that is the entire point.
+
+It returns `None` in every case, deliberately: `os.execvpe` does not
+return when it succeeds, so a "did it happen" return value would be
+unobservable in the only case that matters. (The first draft returned
+`bool` and was wrong — it reported `False` on the stubbed-exec path, which
+is what surfaced the issue.)
+
+`tests/test_cli_unit.py` needed one line. It loads `cli.py` by path with a
+mocked `saltare` module in `sys.modules`, and resolving the new
+`from saltare import _optimize` needs `__path__` on that mock. Without it
+the import raised, the mock was never restored, and every test module
+collected after it failed. Pointing the mock at the real package
+directory fixes it and keeps it working as `cli.py` grows further imports
+instead of needing a new mock attribute each time.
 
 ### Performance verified, not assumed
 

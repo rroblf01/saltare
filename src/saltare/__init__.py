@@ -2,13 +2,70 @@
 
 from __future__ import annotations
 
+import sys
 from typing import Any
 
-from saltare import _core
+from saltare import _core, _optimize
 
-__all__ = ["__version__", "run"]
+__all__ = ["__version__", "optimize_process", "run"]
 
 __version__: str = _core.version()
+
+
+def optimize_process() -> None:
+    """Re-exec this process under `python -OO` to cut its RAM floor.
+
+    Call it as the **first statement** of your entry-point script, before
+    importing your application:
+
+        from saltare import optimize_process, run
+        optimize_process()
+
+        from myapp import app          # imported after, on purpose
+        run(app)
+
+    Returns `None` in every case, deliberately. `os.execvpe` does not
+    come back when it succeeds — the process is gone — so a "did it
+    happen" return value would be unobservable in the only case that
+    matters. The function returns solely when it *declined*, and in that
+    case your script carries on unchanged.
+
+    Why it exists. The `saltare` CLI already re-execs itself this way on
+    startup, but only when it is genuinely the main entry — that gate
+    exists because a naive check once hijacked `pytest` and other tools
+    launched from a directory whose name contained "saltare". An embedded
+    server, where the user's own script is the entry point, therefore got
+    none of the benefit. Measured on a FastAPI app, a running server sits
+    at 49.63 MiB RSS; under `-OO` with `MALLOC_ARENA_MAX=1`, 48.57 MiB
+    (three samples each, no overlap). CPython discards every docstring and
+    `assert` under `-OO`, and FastAPI, Starlette and pydantic carry a
+    great many.
+
+    Caveats, all deliberate:
+
+      - It restarts the process, so anything your script did before the
+        call happens twice. That is why it belongs on line 1.
+      - It declines under `python -c`, `python -` and the REPL, where
+        there is no script to re-run, rather than dropping your session.
+      - It declines if the process is already optimized, if
+        `SALTARE_REEXECED=1` is set (so a second call cannot loop), or if
+        `SALTARE_NO_OPTIMIZE=1` is set — for applications that read
+        `__doc__` at runtime or depend on their own asserts surviving.
+      - `MALLOC_ARENA_MAX` and `PYTHONFAULTHANDLER` are set with
+        `setdefault`, so an operator who set them deliberately keeps their
+        values. `PYTHONOPTIMIZE` is forced, since that is the point.
+
+    The Django integration (`saltare.contrib.django`) does not need this
+    and does not call it: by the time Django's `runserver` command runs,
+    the process is already deep into its own bootstrap and a re-exec would
+    discard the configured settings. Set `PYTHONOPTIMIZE=2` in the
+    environment instead if you want the docstrings gone there.
+    """
+    if _optimize.already_optimized():
+        return
+    if not _optimize.can_reexec_interactive():
+        return
+    _optimize._reexec_if_wanted(list(sys.argv))
 
 
 def run(

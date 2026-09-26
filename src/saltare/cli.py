@@ -8,6 +8,8 @@ import os
 import sys
 from typing import Any
 
+from saltare import _optimize
+
 
 def _is_saltare_main_entry() -> bool:
     """True iff this process was started as a saltare CLI invocation
@@ -56,30 +58,21 @@ def _ensure_optimized() -> None:
     Finally, skip when this module is imported by code that isn't a
     saltare CLI invocation — re-execing somebody else's script would be
     rude.
+
+    The mechanics live in `saltare._optimize` so that
+    `saltare.optimize_process()` — the explicit opt-in for embedded use —
+    shares one implementation. That module has no import-time side
+    effects, which is what lets `saltare/__init__.py` re-export the
+    public function without dragging this file (and its re-exec) in.
     """
-    if sys.flags.optimize >= 2:
-        return
-    if os.environ.get("SALTARE_NO_OPTIMIZE", "").lower() in {"1", "true", "yes"}:
-        return
-    if os.environ.get("SALTARE_REEXECED") == "1":
+    if _optimize.already_optimized():
         return
     if not _is_saltare_main_entry():
         return
-    new_env = os.environ.copy()
-    new_env["SALTARE_REEXECED"] = "1"
-    new_env["PYTHONOPTIMIZE"] = "2"
-    # Bound glibc's per-thread arenas before CPython runs any malloc.
-    # Setting it here, before exec, beats calling mallopt() mid-process
-    # because the bootstrap allocations themselves stay in one arena.
-    new_env.setdefault("MALLOC_ARENA_MAX", "1")
-    # CPython faulthandler dumps a stack on segfault / SIGABRT to
-    # stderr — invaluable for diagnosing native-extension crashes
-    # in production. Free; no measurable cost when nothing crashes.
-    new_env.setdefault("PYTHONFAULTHANDLER", "1")
     os.execvpe(
         sys.executable,
         [sys.executable, "-OO", "-m", "saltare"] + sys.argv[1:],
-        new_env,
+        _optimize.optimized_env(),
     )
 
 
