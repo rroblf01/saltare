@@ -107,39 +107,38 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 30
           retry_on: error
+          command: |
+            if [ "${{ matrix.libc }}" = "macos" ]; then
+              # No container on macOS: prepend the toolchain to PATH and point
+              # Zig's global cache at the runner dir we cached above.
+              export PATH="${{ env.ZIG_DIR }}:$PATH"
+              export ZIG_GLOBAL_CACHE_DIR="${{ env.ZIG_CACHE_DIR }}"
+              export CIBW_ARCHS="arm64"
+              export CIBW_BUILD="cp31?-macosx_*"
+              export CIBW_TEST_SKIP="*"
+              # Nothing is link-time linked (OpenSSL and the codecs are
+              # dlopen'd at runtime), so delocate has nothing to vendor. Left
+              # at the cibuildwheel default, which is correct here.
+              export CIBW_ENVIRONMENT_MACOS="ZIG_VERSION=${{ env.ZIG_VERSION }} MACOSX_DEPLOYMENT_TARGET=11.0 ZIG_GLOBAL_CACHE_DIR=${{ env.ZIG_CACHE_DIR }} PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_BUILD_ISOLATION=0"
+              pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
+            else
+              mkdir -p "${{ env.ZIG_CACHE_DIR }}"
+              chmod -R 777 "${{ env.ZIG_CACHE_DIR }}"
+
+              export CIBW_ARCHS="${{ matrix.arch }}"
+              export CIBW_BUILD="cp31?-${{ matrix.libc }}_*"
+              export CIBW_TEST_SKIP="*"
+
+              export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
+
+              export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw"
+              export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+
+              pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
+            fi
         env:
           ZIG_DIR: ${{ runner.temp }}/zig
           ZIG_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
-        command: |
-          if [ "${{ matrix.libc }}" = "macos" ]; then
-            # No container on macOS: prepend the toolchain to PATH and point
-            # Zig's global cache at the runner dir we cached above.
-            export PATH="$ZIG_DIR:$PATH"
-            export ZIG_GLOBAL_CACHE_DIR="$ZIG_CACHE_DIR"
-            export CIBW_ARCHS="arm64"
-            export CIBW_BUILD="cp31?-macosx_*"
-            export CIBW_TEST_SKIP="*"
-            # Nothing is link-time linked (OpenSSL and the codecs are
-            # dlopen'd at runtime), so delocate has nothing to vendor. Left
-            # at the cibuildwheel default, which is correct here.
-            export CIBW_ENVIRONMENT_MACOS="ZIG_VERSION=$ZIG_VERSION MACOSX_DEPLOYMENT_TARGET=11.0 ZIG_GLOBAL_CACHE_DIR=$ZIG_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_BUILD_ISOLATION=0"
-            pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
-          else
-            mkdir -p "$ZIG_CACHE_DIR"
-            chmod -R 777 "$ZIG_CACHE_DIR"
-
-            export CIBW_ARCHS="${{ matrix.arch }}"
-            export CIBW_BUILD="cp31?-${{ matrix.libc }}_*"
-            export CIBW_TEST_SKIP="*"
-
-            export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
-
-            export CIBW_CONTAINER_ENGINE="docker; create_args: --volume $ZIG_DIR:/host-zig:ro --volume $ZIG_CACHE_DIR:/zig-cache:rw"
-            export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=$ZIG_VERSION ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
-
-            pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
-          fi
-
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.arch }}-${{ matrix.libc }}
