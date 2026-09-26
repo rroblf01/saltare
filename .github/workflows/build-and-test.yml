@@ -26,6 +26,13 @@ jobs:
   build_wheels:
     name: wheels ${{ matrix.libc }} ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Job-level, not workflow-level: `runner.temp` is only in scope here.
+      # CIBW_CACHE_DIR points the *container's* pip cache at this host
+      # directory; PIP_CACHE_DIR does the same for macOS, which has no
+      # container. Defined once so the cache step and the build command
+      # cannot disagree about the path.
+      PIP_CACHE_DIR: ${{ runner.temp }}/pip-cache
     strategy:
       fail-fast: false
       matrix:
@@ -72,16 +79,35 @@ jobs:
             zig-build-${{ matrix.arch }}-${{ matrix.libc }}-
 
       # Tier-5: cache pip's download/wheel cache across runs so the
-      # build-time dependency install (`scikit-build-core`, `ninja`) skips
-      # the PyPI round-trip on cache hits. Keyed by pyproject.toml so
-      # cache invalidates only when build-deps change.
+      # build-time dependency install (`scikit-build-core`, `cmake`,
+      # `ninja`) skips the PyPI round-trip on cache hits.
+      #
+      # v1.12: this used to point at ~/.cache/pip, the *runner's* pip cache.
+      # cibuildwheel builds Linux wheels inside a container, so nothing ever
+      # read it. The path is now the runner-temp dir that CIBW_CACHE_DIR (and
+      # PIP_CACHE_DIR on macOS, which has no container) actually points at, so
+      # the saving the comment claims is finally real.
       - name: Cache pip downloads
         uses: actions/cache@v4
         with:
-          path: ~/.cache/pip
+          path: ${{ env.PIP_CACHE_DIR }}
           key: pip-${{ matrix.arch }}-${{ matrix.libc }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: |
             pip-${{ matrix.arch }}-${{ matrix.libc }}-
+
+      # Re-running a failed workflow rebuilt all 25 wheels from scratch. The
+      # wheelhouse is keyed on the exact commit, so a re-run of the *same*
+      # commit restores whatever already built and cibuildwheel skips those,
+      # leaving only the ones that failed. Keyed on sha, not a branch prefix,
+      # so a wheel is never reused across different source. The path is the
+      # workspace-relative `wheelhouse` that `--output-dir` writes, not
+      # runner.temp.
+      - name: Cache built wheels
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/wheelhouse
+          key: wheelhouse-${{ matrix.arch }}-${{ matrix.libc }}-${{ github.sha }}
+
 
       # Tier-3: skip cibuildwheel's per-wheel test pass entirely. Tests
       # run once in the separate `test_wheels` / `test_macos` jobs below.
@@ -93,6 +119,18 @@ jobs:
           retry_wait_seconds: 30
           retry_on: error
           command: |
+            # v1.12: the pip cache lived at ~/.cache/pip, which is the
+            # *runner's* cache. cibuildwheel builds Linux wheels inside a
+            # container with its own pip cache, so that step was caching a
+            # directory nothing read — the comment above it promised to
+            # "skip the PyPI round-trip on cache hits" and was not. CIBW_CACHE_DIR
+            # is the documented way to give the container a host-backed
+            # cache; PIP_CACHE_DIR covers macOS, which has no container and
+            # installs into a venv on the runner.
+            export CIBW_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
+            export PIP_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
+            mkdir -p "$CIBW_CACHE_DIR"
+
             if [ "${{ matrix.libc }}" = "macos" ]; then
               # No container on macOS: prepend the toolchain to PATH and point
               # Zig's global cache at the runner dir we cached above.
@@ -104,7 +142,7 @@ jobs:
               # Nothing is link-time linked (OpenSSL and the codecs are
               # dlopen'd at runtime), so delocate has nothing to vendor. Left
               # at the cibuildwheel default, which is correct here.
-              export CIBW_ENVIRONMENT_MACOS="ZIG_VERSION=${{ env.ZIG_VERSION }} MACOSX_DEPLOYMENT_TARGET=11.0 ZIG_GLOBAL_CACHE_DIR=${{ env.ZIG_CACHE_DIR }} PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_BUILD_ISOLATION=0"
+              export CIBW_ENVIRONMENT_MACOS="ZIG_VERSION=${{ env.ZIG_VERSION }} MACOSX_DEPLOYMENT_TARGET=11.0 ZIG_GLOBAL_CACHE_DIR=${{ env.ZIG_CACHE_DIR }} PIP_CACHE_DIR=$PIP_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_BUILD_ISOLATION=0"
               pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
             else
               mkdir -p "${{ env.ZIG_CACHE_DIR }}"
@@ -116,8 +154,8 @@ jobs:
 
               export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
 
-              export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw"
-              export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+              export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw --volume $CIBW_CACHE_DIR:/pip-cache:rw"
+              export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_CACHE_DIR=/pip-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
 
               pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
             fi
