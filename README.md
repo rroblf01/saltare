@@ -160,33 +160,10 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 > **Status: 1.12.0 — macOS arm64 wheels. kqueue event loop. 521 tests pass.** saltare is no longer Linux-only. `src/zig/eventloop.zig` picks its backend at comptime — `eventloop_epoll.zig` or the new `eventloop_kqueue.zig` — and re-exports it, so **`server.zig` is unchanged by the port** and the event path has no branch on the OS at all. The kqueue specifics (per-filter interest instead of a bitmask, `EV_EOF` instead of `EPOLLRDHUP` bits, a `timespec` instead of milliseconds) are absorbed inside the backend; both are level-triggered, so the connection state machine's discipline is unchanged. The Linux-isms are handled per-OS: `SOCK_NONBLOCK`/`SOCK_CLOEXEC` do not exist on Darwin (now `fcntl`), `TCP_KEEPIDLE` is `TCP_KEEPALIVE` there, `TCP_USER_TIMEOUT` is skipped, the `madvise` advice is `MADV_FREE` (the sweep was a no-op off Linux, so idle pool buffers held their pages), `sendfile(2)` takes its offset by value on Darwin instead of by pointer, and `sys/prctl.h` / `sys/sendfile.h` are hand-declared because a top-level `@cImport` of a header the other platform lacks fails the build before our code runs. `dlopen` gained the `.dylib` names for libssl / libz / libbrotli / libzstd — without them TLS and compression were silent no-ops. **`process_resident_memory_bytes`, `process_open_fds` and `process_cpu_seconds_total` stop reporting a hard 0** off Linux, via `proc_pidinfo` and `getrusage`; three permanently-zero series in a RAM-focused server's `/metrics` is the worst failure mode available. **Six real bugs fixed**, three found by driving raw sockets at the wire format (a client library normalises the request line before it reaches the socket, which is exactly the code under test): **absolute-form request targets 404'd** (`GET http://host/path` — RFC 7230 §5.3.2 says an origin server MUST ignore the scheme and authority and route on the path, so forward proxies, health checkers and load balancers all got a 404); **a 414/431 reached the client as a TCP reset** because the head is rejected while the peer is still sending, so closing with the tail still queued made the kernel RST and discard the response — which matters *because* saltare's head ceiling is far tighter than uvicorn's, which has no default limit at all and served both of those requests with 200; and **exceeding `max_headers` answered 400 instead of 431**, because the field-count limit shared an error with the byte ceiling and both fell into the malformed-syntax arm. Plus two in the WebSocket path, found by finally testing through FastAPI instead of a hand-written ASGI app: **every fragmented message corrupted the heap** (a double free — `wsDeliverToApp` can destroy the connection, and the caller then freed the reassembly buffer that `destroy()` had already freed; three 1 KB fragments aborted the process, and the existing fragmentation test missed it because its handler loops forever so the teardown path is never entered), and **the app was told 1006 for every close** even when saltare had just sent 1009 itself, leaving a handler unable to tell "message too big" from a dead network. **The four WebSocket stubs skipped since v0.10 are enabled again** — the multi-test teardown crash no longer reproduces under any teardown shape, and the likely culprits (the conftest drain fixture, v1.6; centralised WS teardown in `destroy()`, v1.7.1) both postdate the report. The other two, both found by writing the tests the features never had: a request arriving in the same packet as a PROXY-protocol header hung until the header timeout (`doReadHttp` never parsed pre-buffered bytes, since its loop reads before it parses — now uses `tryParsePipelined`, the existing "already buffered" path), and synthesized 500s carried no `Server-Timing` / `X-Request-ID`, because they are built by a different function from normal response heads. **61 new tests** for previously untested shipped features: PROXY protocol v1+v2, mTLS, `Server-Timing`/`X-Request-ID` end to end, WebSocket permessage-deflate over the wire, and the operational knobs — plus **19 more** for the HTTP/1.1 request-target forms a client library hides (absolute-form and its empty-path variants, asterisk-form, a path segment containing `://`, the `max_headers` boundary from both sides, and the three status codes an over-long head can produce) and **11 Zig unit tests** for the parser behind them. **Build/CI**: CI was not running the HTTP/2 suite at all (`h2` missing from both runners while the module skips itself wholesale); the Zig unit tests were broken in 4 of 6 files and nobody ran them; `py.typed` now ships and the `_core.pyi` stub is no longer 7 args behind; `uv sync` no longer prunes the build backend. `make check-macos` cross-compile-checks 17 Zig modules against `aarch64-macos` in seconds. **New: `saltare.optimize_process()`**, the explicit opt-in that re-execs an embedded script under `python -OO` — the CLI has done this for itself since v1.3, but anyone calling `saltare.run()` from their own entry point did not, which is 1.06 MiB (49.63 → 48.57, measured). The README also now breaks down where the ~50 MiB floor actually goes: 31% CPython, 59% importing FastAPI, 6% saltare. Full detail, including what was **not** built and why (x86_64 macOS, a `PR_SET_PDEATHSIG` equivalent, kTLS, macOS benchmarks), in [CHANGELOG.md](CHANGELOG.md).
 
-> **Status: 1.11.0 (historical entry) — real HTTP/2 responses + outbound flow control, PEP 684 sub-interpreter groundwork, 368 tests pass.** **HTTP/2 now actually speaks HTTP/2.** Through v1.10 `http2=True` over TLS silently fell back to HTTP/1.1: the TLS layer advertised ALPN with the *client*-side `SSL_CTX_set_alpn_protos` (a no-op on a server), so `h2` never negotiated, and the dispatch path it hid had a `PyObject_CallFunction` format string with one too few `y#` byte-strings that would have segfaulted on the first real request. v1.11 fixes both — server-side `SSL_CTX_set_alpn_select_cb` (gated on `http2=True`, now plumbed through `_core.serve`) and the corrected `Oiiy#y#y#y#y#Oy#iOiO` marshalling — and adds a real response path: `h2_response.zig`, an incremental HTTP/1.1→HTTP/2 transcoder that reframes the dispatcher's existing response bytes into HEADERS (HPACK-encoded `:status` first, names lowercased, hop-by-hop headers dropped per RFC 7540 §8.1.2.2) + DATA frames bounded by the peer's `SETTINGS_MAX_FRAME_SIZE`, de-frames chunked bodies, and places END_STREAM on the last frame. The previously-dead `h2_encoder.zig` now backs it. **Outbound flow control** (RFC 7540 §6.9): the server never sends more DATA than the peer's stream + connection windows allow, holding the rest until a `WINDOW_UPDATE` grows the window; a stream completes only once END_STREAM has gone out, so flow-control-blocked bodies are never dropped. The server connection preface is now its own SETTINGS frame (was a premature ACK). Verified end to end against the real `h2` sans-IO client (GET, POST-with-body, 60 KiB multi-frame, and a 50 KiB body pulled through a 1 KiB window). HTTP/2 multiplexing is still serial (one dispatch in flight per connection). **PEP 684 (per-interpreter GIL) groundwork**: `_core` uses multi-phase init, isolates the racy event-loop state into a per-serve `Runtime`, has a re-entrant `serveLoop`, and declares per-interpreter-GIL support — a full server runs in an own-GIL sub-interpreter (verified). But the measurement that motivated it refuted its premise — sub-interpreter workers cost **more** RAM than saltare's `gc.freeze()` pre-fork model (they can't share the Python object graph), so the worker spawner was **not** built; fork stays the multi-worker model. **Fixes**: a spurious `-OO` re-exec when the project lives under a `saltare`-named directory (`"saltare" in argv[0]` substring check → now matches the `__main__.py` parent dir), and the default `Server:` header version drifting from the package version (now derived from `_core.version()` / a single Zig `VERSION` constant). Test suite **368 passing**, including `h2`-client conformance (incl. flow control) and own-GIL serve. Benchmarks (v1.11.0, mimalloc preload): saltare leads on all workloads — 3.0–9.1 MiB leaner than uvicorn, 12.1–12.9 MiB leaner than granian.
-
-> **Status: 1.9.0 (historical entry) — HTTP/2 dispatch + Connection HTTP/WS union + WebSocket compression.** HTTP/2 dispatch integration (Zig ↔ Python bridge): `bridge.http2DispatchStart`, `bridge.http2DispatchPushBody`, `bridge.http2DispatchDrain` in `src/zig/bridge.zig` call Python `http2_dispatch_start/push_body/drain` in `_dispatcher.py`, which delegate to the existing HTTP/1.1 dispatch path with `http_version="2"` in the ASGI scope. Internal Zig HTTP/2 framing (`src/zig/h2.zig`) handles connection preface, SETTINGS, DATA, HEADERS, PING, RST_STREAM, GOAWAY, and WINDOW_UPDATE (request-side parsing; the response side became real in v1.11). **Connection HTTP/WS tagged union**: all 10 WebSocket-only fields moved into `WsState` inside a `union(Protocol)` — HTTP connections pay zero bytes for WS state (~52 KiB saved at 1024 idles). **WebSocket per-message-deflate configuration** via `--ws-compression-level`, `--ws-compression-server-takeover`, and `--ws-pump-interval-ms`. `--http2` flag added to CLI and `saltare.run()` signature (default `False`).
-
-> **Status: 1.8.0 (historical entry) — header memory compression + edge-case coverage.** Replaces `http.Header`'s two `[]const u8` slices (32 B per header) with four `u16` offsets into the request buffer (8 B per header). Pool buffer's `[max_headers=32]Header` array drops from 1 KiB → 256 B; at default `max_concurrent_connections=1024` that's **~770 KiB peak RAM reclaimed**. `Request` gains accessor methods (`method()`, `target()`, `header.nameSlice(data)`) so the API stays readable. Test suite grows by 17 → 139 total (`tests/test_v18_edge.py`): header compression edges (long values, near-max count, empty values), pipelined HTTP, WebSocket binary echo at varied sizes, HSTS combinations, drain endpoint verb matrix, method case-sensitivity, header injection guard.
->
-> **Status: 1.7.2 (historical entry) — WebSocket lifecycle correctness + test suite.** v1.7.1 wired the multi-tick + periodic-pump runtime that made Channels apps work end-to-end; v1.7.2 centralises WS teardown into `Connection.destroy()` so the leak window on socket-level errors (peer RST mid-write, abrupt TCP FIN) closes — every destroy callsite now emits `WS-CLOSE`, cancels the Python consumer task via `bridge.wsDisconnect`, decrements `g_ws_conns`, and unlinks from `g_ws_head`. Caches `Connection.ws_log_path` so the post-upgrade `WS-CLOSE` line still knows the path after `wsAfterWrite` cleared `conn.parsed`. Adds 13 lifecycle tests (`tests/test_ws_lifecycle.py`) covering close-code → HTTP status mapping, post-accept initial-state push, handshake-timeout cancellation, abrupt-disconnect resilience, access-log symmetry, `--ws-reject-log` content, and N sequential connect/close cycles. **122 tests pass.**
->
-> **Status: 1.7.1 (historical entry) — Django Channels WebSocket runtime.** v1.7.0 fixed the WS scope shape (state, extensions, drop method, proxy_headers for WS); v1.7.1 fixes the WS runtime so Channels apps that work under daphne also work under saltare. Multi-tick pump during the upgrade (Phase 1 lets `AuthMiddlewareStack` async session lookup settle; Phase 2 lets `connect()` finish its `group_add` + initial state push before returning), periodic 50 ms asyncio pump for live WS conns + `bridge.wsDrain` so `channel_layer.group_send` actually reaches the wire (was: queued forever because saltare was idle between socket events), WS-task exception traceback surfaced to stderr + injected into `--ws-reject-log` reason, close-code → HTTP status forwarding (`4001 → 401`, `4003 → 403`, `4004 → 404`, `4008 → 408`, `4029 → 429`). Bench-stage Dockerfile now preloads mimalloc so the comparison vs uvicorn / granian runs under the same allocator. Release CI: 2-job → 4-job matrix (libc × arch) + tests split out → ~7 min wall (was 11–20 min).
->
-> **Status: 1.7.0 (historical entry) — Django Channels / ASGI 3.0 compliance.** v1.6 served WebSocket upgrades but the user-side `ProtocolTypeRouter` + `AuthMiddlewareStack` of a Channels app rejected the connect because saltare's scope missed `state` / `extensions` (ASGI 3.0), populated `client=None` on every WS regardless of `--proxy-headers`, and shipped a non-spec `method` key. v1.7 closes those: shared lifespan `state` dict surfaced as `scope["state"]` on every HTTP + WS scope, empty `scope["extensions"]` marker, WS path now runs the same `_apply_proxy_headers` helper as HTTP (so `scope["client"]` reflects the real peer behind nginx / traefik / k8s ingress, and `scope["scheme"]` flips to `wss` when X-Forwarded-Proto says so), `method` dropped from WS scope.
->
-> **Status: 1.6.1 (historical entry) — access-log polish + ops affordances.** Carries v1.6.0 baseline and adds: `--access-log-exclude PATH` (repeatable; exact-match request-target filter), new plain-text access-log line format `DD/MM/YYYY:HH:MM:SS [METHOD] [URL] [STATUS] [BYTES]` (replaces the v0.15 JSON shape — easier to grep / awk), test-isolation fix (`_core.request_shutdown()` + autouse pytest fixture) closing the cp313-musllinux cibuildwheel segfault race, `server.run()` resets `g_draining=false` on entry so stale drain flags don't sink the next worker. 108 tests pass.
->
-> **Status: 1.6.0 (historical entry) — full compression matrix + WebSocket extensions + operational hardening.** Carries v1.5 baseline (musllinux wheels, `/debug/dispatch` + token, SIGHUP hot reload, `process_*` metrics, kTLS, runbook) and adds: **streaming brotli** + **streaming zstd** (per-codec encoder state across `_send` via Zig lazy-dlopen handle API — closes the gap where v1.5 only streamed gzip), **WebSocket per-message-deflate** (RFC 7692; `permessage-deflate; client_no_context_takeover; server_no_context_takeover` negotiated; RSV1 + raw-deflate framing on outbound text/binary; zip-bomb-capped inflate on inbound), and the **v1.6 operational set**: `--hsts-max-age` / `--hsts-include-subdomains` / `--hsts-preload` (RFC 6797 `Strict-Transport-Security` line, opt-in, zero per-response cost when off), `--drain-path PATH` (Zig-side intercept that flips the worker into the same graceful-drain mode SIGTERM triggers — POST/PUT to begin, GET for an idempotent state probe; pair with `--health-path` for k8s rolling deploys), TLS observability counters on `/metrics` (`saltare_tls_handshakes_total`, `saltare_tls_session_reuse_total` via lazy `dlsym("SSL_session_reused")`), PROXY-protocol acceptance counters on `/metrics` (`saltare_proxy_protocol_accepted_total{version="v1|v2"}`), and the OpenMetrics 1.0 `# EOF` marker at the end of every `/metrics` body. 108 tests pass. Streaming br/zstd + WS p-m-d are zero-RAM-cost when off — `if not self.pmd_active` / `if not self._brotli_handle` early-outs keep v1.5 hot path byte-identical; HSTS is a cold module-level bytes object until set, drain endpoint is one optional `[]const u8` field.
-
-> **Status: 1.5.0 (historical entry) — operational depth + distribution reach.** Carries the v1.4 baseline (body streaming, cgroup awareness, mimalloc default, `sendfile(2)`, full compression suite gzip/brotli/zstd, 414/431 caps, W3C `traceparent`, Prometheus latency histogram, `--reload`, Django integration) and adds: **musllinux wheels** (Alpine), **`/debug/dispatch`** JSON introspection endpoint (no GIL) with **Bearer-token gate** (`--dispatch-token`), **`SIGHUP` hot config reload** (`rate_limit_*`, `max_connections_per_ip`, `access_log` swap from a `key=value` file without restart), **compression counters on `/metrics`** (`saltare_response_compression_total{encoding}` + `_bytes_in_total` + `_bytes_out_total` + `_skipped_total{reason}`), **`process_*` Prometheus metrics** (`process_open_fds`, `process_cpu_seconds_total`, `process_start_time_seconds` — Grafana / Prom-client conventions), **pytest-rerunfailures** for the previously-flaky `test_streaming` (3 reruns instead of skip), **production runbook + day-2 ops table** in README, **`make smoke-alpine`** (real Alpine container smoke test against the freshly-built musllinux wheel), **`make soak`** (sustained-load RSS-drift gate, defaults 1800 s @ 200 rps), **`--ktls`** (kernel TLS offload via OpenSSL ≥ 3.0 — closes the v1.4 sendfile-over-HTTPS gap; off by default). v1.4-cycle bug fixes (sendfile HEAD strip, supervisor SIGTERM forwarding, `_pending_sendfiles` cleanup, encoder-param warnings, codec probe safe defaults, sendfile/head-write EINTR retry) all rolled forward.
-
-> **Status: 1.4.0 (historical entry) — body streaming + cgroup awareness + mimalloc default + `sendfile(2)` + `.pyc` embed + tracemalloc cache + full compression suite (gzip single-shot + streaming, brotli, zstd) + 414 / 431 caps + W3C `traceparent` propagation + Prometheus latency histogram.** Production target is **Linux x86_64**. v1.4 lifts the long-standing 16 KiB body cap: when an incoming request's `Content-Length` exceeds the read buffer, the dispatcher engages an ASGI-streaming path — the user app sees `http.request {body=chunk, more_body=True}` events and saltare reads + pushes more chunks as the kernel hands them over. **Per-task RAM stays bounded by the dispatcher's 64 KiB backpressure threshold regardless of declared body length** (was: 413 above 16 KiB). Plus: cgroup-v2 memory awareness auto-tunes `max_concurrent_connections` from `/sys/fs/cgroup/memory.max` when running under k8s `resources.limits.memory`, mimalloc is the default `LD_PRELOAD` in `Dockerfile.production`, `saltare.sendfile` ASGI extension for zero-copy static-asset paths (`sendfile(2)` syscall, plain-HTTP only), 5-second `tracemalloc` snapshot cache, `.pyc` precompile in `Dockerfile` builder stage, **full compression matrix**: lazy `dlopen("libz.so.1")` at [src/zig/zlib.zig](src/zig/zlib.zig) wired into `--response-gzip` (single-shot **and** chunked-streaming via `Z_SYNC_FLUSH`) + `--request-decompression`, lazy `dlopen("libbrotlienc.so.1")` at [src/zig/brotli.zig](src/zig/brotli.zig) wired into `--response-brotli`, lazy `dlopen("libzstd.so.1")` at [src/zig/zstd.zig](src/zig/zstd.zig) wired into `--response-zstd`. Server-preference ordering (br > zstd > gzip) negotiates per-request from `Accept-Encoding` honouring `q=0` and `*` per RFC 7231 §5.3.4. **Hardening**: `--max-request-uri` returns 414 URI Too Long (default 8192 B), `--max-request-head-bytes` returns 431 Request Header Fields Too Large. **Observability**: `--latency-histogram` emits `saltare_request_duration_seconds_bucket` with 14 fixed buckets (1 ms..60 s) on `/metrics`, `--traceparent-propagation` surfaces W3C Trace Context on `scope` and echoes back. **Framework integrations**: `pip install saltare[django]` adds [src/saltare/contrib/django/](src/saltare/contrib/django/) — drop `"saltare.contrib.django"` into `INSTALLED_APPS` and `manage.py runserver` runs your project under saltare (ASGI) instead of wsgiref, with autoreload + staticfiles preserved. **Dev autoreload**: `--reload` watches code and `SIGTERM`s + respawns the child on change (poll-based, no `inotify` dep — works inside containers / overlayfs / NFS). Saltare is the leanest of the three benchmarked ASGI servers — **46.52 / 45.24 / 45.29 MiB**, vs uvicorn 48.91 / 49.86 / 54.55 MiB and Granian 52.90 / 50.26 / 49.78 MiB on the same host. Tests **66 core + 10 v1.3 + 8 v1.4 zlib + 11 v1.4 extras + 4 v1.4 sendfile** (`tests/test_v14_*`); 99 total. Build is clean on Zig 0.16.0.
-
-### v1.9.x candidates (still pending)
-
-- **Free-threaded Python (`cp314t`)** evaluation, **static-link OpenSSL build**.
-
-> **Status: 1.3.0 — lazy TLS + ~40 operational knobs, leanest of three (historical entry).** Production target is **Linux x86_64**. v1.3 lands ~30 orthogonal features. **RAM-floor cuts (default-on)**: lazy OpenSSL via `dlopen`, `mallopt(M_ARENA_MAX=1, M_TRIM_THRESHOLD=64K, M_TOP_PAD=64K, M_MMAP_THRESHOLD=64K)`, `MALLOC_ARENA_MAX=1` in the CLI re-exec env, gated `PYTHONOPTIMIZE=2` auto re-exec, URL decode moved to Zig (drops `urllib.parse` import), `traceback` lazy-imported (drops ~150 KiB), `TCP_NODELAY` + `SO_KEEPALIVE` on every accepted socket, periodic `gc.collect(2)` + `malloc_trim(0)` after 3 s of idle, `gc.freeze()` re-trigger inside the idle-maintenance pass. **Operational knobs (opt-in, zero RAM when off)**: `health_path`, `cors_preflight_allow_all`, IPv6 listen (auto-detect from `host`), per-IP rate limiter, `max_connections_per_ip`, `max_connection_lifetime`, `tracemalloc_path`, `favicon_204`, `access_log_path`, `request_id_header`, `server_timing`, `listen_backlog`, `tcp_keepidle`/`tcp_keepintvl`/`tcp_keepcnt`, `tcp_user_timeout_ms`, `auto_raise_nofile`, `tls_session_cache_size`, `startup_request` (warm app), `server_header` (white-label / hide identity), `proxy_protocol` (v1 + v2 binary auto-detect — required behind L4 LBs), systemd socket activation (`LISTEN_FDS=1`), `SIGUSR1` JSON stats dump, `workers=0` auto-detects `cpu_count()`. **Bug fixes / RFC compliance**: WebSocket subprotocol (`Sec-WebSocket-Protocol` was always being dropped), HTTP trailers (`http.response.trailers` was silently ignored), HTTP/1.1 mandatory `Host` validation, header-name `tchar` validation (RFC 7230 §3.2.6 — defends against `\0`/CRLF smuggling), HEAD method body strip (RFC 7230 §3.3.3 — same headers as GET, no body). Combined: saltare is the leanest of the three benchmarked ASGI servers — **46.4 / 45.4 / 45.4 MiB**, vs uvicorn 49.30 / 49.51 / 54.68 MiB and Granian 57.18–57.71 MiB on the same host. Tests **66 passing** core + 10 new in `tests/test_v13.py`. Most v1.3 features are opt-in: defaults match v1.2.2 behaviour at zero RAM cost.
-
----
+> Earlier release history is in [CHANGELOG.md](CHANGELOG.md), which records each
+> version's decisions — including what was deliberately *not* built and the
+> measurements behind the decision. It is a decision record, not a summary, so it is
+> kept out of this file rather than mirrored here.
 
 ## Why
 
@@ -524,16 +501,26 @@ async def upload_endpoint(scope, receive, send):
 
 The streaming path engages automatically when the declared `Content-Length` exceeds the read buffer (4 KiB / 16 KiB depending on pool tier). For smaller bodies saltare keeps the full-buffer fast path. **`max_request_body` is enforced incrementally** — adversarial clients announcing a small `Content-Length` then streaming more bytes get a 413 mid-stream and the connection is closed.
 
-### cgroup memory awareness (v1.4)
+### Tuning knobs
 
-When saltare runs inside a memory-limited cgroup (typical k8s `resources.limits.memory`) and the operator hasn't explicitly set `max_concurrent_connections`, saltare reads `/sys/fs/cgroup/memory.max` (cgroup v2) or `memory.limit_in_bytes` (v1), reserves a 64 MiB floor for Python heap + libs, and budgets the rest at ~50 KiB per concurrent request. The auto-cap is logged at startup:
+Single-kwarg options that tune the socket, the allocator and the process.
+Defaults are the `saltare.run()` defaults; the CLI flag equivalent is in the
+[CLI reference](#cli-reference).
 
-```
-saltare: cgroup memory.max=128 MiB → max_concurrent_connections=1310
-```
-
-Setting `max_concurrent_connections=N` explicitly disables the auto-cap.
-
+| kwarg | default | effect |
+|---|---|---|
+| `listen_backlog` | `256` | `listen(2)` backlog, silently truncated by the kernel to `net.core.somaxconn`. A higher value only helps absorb SYN bursts. |
+| `tcp_keepidle` | `0` | Seconds idle before the first keepalive probe. `0` (or negative) takes the kernel default, typically 7200 s — far too long for mobile clients. |
+| `tcp_keepintvl` | `0` | Seconds between probes. `0` = kernel default. |
+| `tcp_keepcnt` | `0` | Unanswered probes before the connection is dropped. `0` = kernel default. |
+| `tcp_user_timeout_ms` | `0` | Linux `TCP_USER_TIMEOUT`: how long a stuck write may stay unacked. More aggressive than keepalive, which only fires on *idle* conns. `0` = disabled. Not available on macOS. |
+| `tcp_fastopen_qlen` | `0` | `TCP_FASTOPEN` on the listen socket (Linux), letting repeat clients carry payload in the SYN. Only pays off under high connection churn. |
+| `auto_raise_nofile` | `False` | Raise the soft `RLIMIT_NOFILE` to the hard limit at startup, so `max_concurrent_connections` is not capped by the user's fd limit. |
+| `startup_request` | `False` | Issue an internal `GET /` once `lifespan.startup` completes, warming route compilation, validators and JIT caches before real traffic. |
+| `gc_collect_every_n_requests` | `0` | Run a gen-0 `gc.collect(0)` (tens of µs) every N completed dispatches. For apps that allocate many short-lived cyclic objects per request. `0` = never. |
+| `tls_session_cache_size` | `0` | OpenSSL server-side session cache, so repeat clients skip the handshake (~3 RTT → 1). Requires `ssl_certfile`/`ssl_keyfile`. `0` = disabled. |
+| `server_header` | `None` | Override the `Server:` line; `""` omits it entirely. The default is derived from `_core.version()` at runtime, so it never drifts from the package version. |
+| `max_concurrent_connections` | `1024` | Accepted sockets held open. While it is left at the default, a cgroup v2 `memory.max` limit (k8s `resources.limits.memory`) lowers it automatically — budget after a 64 MiB floor at ~50 KiB per concurrent, never below 16. Any value other than 1024 disables the auto-cap; setting it *to* 1024 explicitly does not, since 1024 is the sentinel. |
 ### Zero-copy file responses (`saltare.sendfile`, v1.4)
 
 Static-asset endpoints can avoid copying file bytes through Python heap by emitting a `saltare.sendfile` ASGI extension event instead of `http.response.start` + `http.response.body`. saltare's Zig core opens the file, builds the response head, and uses the `sendfile(2)` syscall directly to the socket — never reads file bytes into userspace.
@@ -682,69 +669,9 @@ saltare.run(
 
 `max_connections_per_ip` shares the per-IP table with the rate limiter (4096-entry LRU); over-cap peers get a TCP-level RST at accept time before any HTTP work happens. `max_connection_lifetime` (seconds) is a wall-clock cap — stricter than `max_keepalive_requests` for clients that keep a connection open for hours. Both default to 0 (disabled). When `proxy_headers=True`, the rate limiter uses `X-Real-IP` / `X-Forwarded-For` instead of the TCP peer; when `proxy_protocol=True`, it uses the source from the PROXY header.
 
-### TCP tuning
-
-```python
-saltare.run(
-    app,
-    listen_backlog=1024,         # listen(2) backlog (default 256)
-    tcp_keepidle=60,             # seconds idle before first probe
-    tcp_keepintvl=10,            # seconds between probes
-    tcp_keepcnt=4,               # unanswered probes = drop
-    tcp_user_timeout_ms=30000,   # max in-flight unacked write window
-)
-```
-
-`listen_backlog` is capped by `/proc/sys/net/core/somaxconn`. The keepalive trio tightens dead-connection detection past the kernel default (~2 hours idle); typical mobile-friendly setting is `60 / 10 / 4`. `tcp_user_timeout_ms` (Linux only) is more aggressive than keepalive — it caps stuck WRITE windows too, useful on flaky network paths.
-
-### File descriptor limit
-
-```python
-saltare.run(app, auto_raise_nofile=True)
-```
-
-Raises the soft `RLIMIT_NOFILE` to the hard limit at startup so `max_concurrent_connections` isn't bottlenecked by the user's default fd cap. Equivalent to `ulimit -n $(ulimit -Hn)` before invoking saltare. Works on Linux and macOS (`kern.maxfiles` on Darwin).
-
-### Pre-warming the user app
-
-```python
-saltare.run(app, startup_request=True)
-```
-
-After `lifespan.startup` finishes, saltare issues an internal `GET /` against the app to warm route compilation, pydantic validators, and JIT caches. The first real client request then doesn't pay the cold-start cliff (typically 50-200 ms drop to 1-5 ms). Skipped if your app's `/` route does work that's expensive or has side effects — design `startup_request` accordingly. Best-effort: any exception during warmup is swallowed.
-
-### TLS session cache
-
-```python
-saltare.run(
-    app,
-    ssl_certfile="...", ssl_keyfile="...",
-    tls_session_cache_size=1024,   # OpenSSL server-side cache (0 = disabled)
-)
-```
-
-When set, OpenSSL caches up to N completed TLS sessions; repeat clients negotiating a session resumption skip the full handshake (~3 RTTs → 1 RTT). Cost: ~20 KiB resident per cached session at peak. `1024` ≈ 20 MiB ceiling, fine for production. `0` (default) keeps the floor low; flip on once your TLS workload warrants it.
-
-### Customising / hiding the `Server:` header
-
-```python
-saltare.run(app, server_header="my-api/2.1")  # white-label
-saltare.run(app, server_header="")            # omit the line entirely
-```
-
-The default is `Server: saltare/1.3.0`. Setting an explicit value overrides it (built once at start; per-response cost is one `{s}` substitution). Empty string omits the header. Useful behind a reverse proxy that already advertises a server line, or for hiding the saltare identity for security-by-obscurity.
-
 ### HEAD requests
 
 `HEAD /path` returns the same headers as `GET /path` but no response body, per RFC 7230 §3.3.3. saltare detects HEAD in the dispatcher and suppresses body bytes the app emits (the app itself doesn't have to special-case HEAD). `Transfer-Encoding: chunked` is forced off for HEAD (no body to chunk). Working as expected — no flag.
-
-### Auto worker count
-
-```python
-saltare.run(app, workers=0)   # min(cpu_count, 4)
-```
-
-`workers=0` (and `--workers 0`) reads `os.cpu_count()` and caps at 4 — past 4 the GIL-locked dispatch sees diminishing returns under saltare's architecture. Set explicitly when you know better.
 
 ### Autoreload (`--reload`, v1.4)
 
@@ -780,22 +707,6 @@ saltare.run(
 ```
 
 `ssl_ca_file` loads the CA bundle clients must present a cert from; `ssl_verify_client=True` flips OpenSSL into `SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT` — connections without a valid client cert are rejected at handshake. Useful for zero-trust deployments and service-to-service auth.
-
-### TCP Fast Open
-
-```python
-saltare.run(app, tcp_fastopen_qlen=256)
-```
-
-Enables `TCP_FASTOPEN` (Linux ≥ 3.7) on the listen socket. Repeat clients can include payload in the SYN, saving 1 RTT. Wins are visible only when clients themselves opt into TFO and the kernel has `net.ipv4.tcp_fastopen` set to a value that includes server-side support (typically `3`). 256 (matching the default `listen_backlog`) is a safe value.
-
-### Generational GC tuning
-
-```python
-saltare.run(app, gc_collect_every_n_requests=1000)
-```
-
-Triggers a `gc.collect(0)` (gen-0 only — cheap, ~tens of µs) every N completed dispatches. Useful for apps that allocate many cyclic small objects per request (heavy pydantic / dataclass construction): keeps the gen-1 set small so the eventual full-gen sweep stays cheap. The idle-window full GC still runs on top.
 
 ### `Forwarded:` header (RFC 7239) + `X-Forwarded-Host`
 
@@ -1086,6 +997,7 @@ Timeouts (seconds)
   --body-timeout SECS           headers → body fully received (default 30)
   --write-timeout SECS          maximum time in writing state (default 30)
   --shutdown-timeout SECS       graceful drain ceiling on SIGTERM (default 30)
+  --drain-wait-seconds SECS    wait for in-flight requests during drain (default 5)
   --ws-keepalive-timeout SECS   WebSocket ping interval (default 20)
   --ws-pump-interval-ms MS      asyncio pump cadence for live WS connections (default 50)
 
@@ -1104,6 +1016,7 @@ Resource caps
   --max-concurrent-connections N    accepted sockets held open (default 1024)
   --max-keepalive-requests N        requests per connection before close (default 1000)
   --max-request-body BYTES          oversize body → 413 (default 1 MiB)
+  --http-pool-max N                 pooled HTTP state objects per worker (0 = no pool, default 128)
   --max-connections-per-ip N        per-IP open connection cap (0 = disabled)
   --max-connection-lifetime SECS    wall-clock connection age cap (0 = disabled)
   --rate-limit-per-sec N            per-IP token-bucket rate (0 = disabled)
@@ -1125,9 +1038,13 @@ Request / response shaping
   --request-id-header NAME          auto-generate request ID + scope key + response header
   --server-timing                   emit `Server-Timing: total;dur=<ms>` per response
   --server-header VALUE             override `Server:` (empty string omits the header)
+  --hsts-max-age SECS                 emit Strict-Transport-Security max-age (0 = off)
+  --hsts-include-subdomains           add includeSubDomains to the HSTS line
+  --hsts-preload                      add preload to the HSTS line
 
 Operational
   --startup-request                 issue an internal GET / after lifespan startup (warm app)
+  --drain-path PATH                   POST/PUT flips the worker into graceful drain, GET probes it
   --gc-collect-every-n-requests N   periodic gc.collect(0) cadence (0 = disabled)
   --version                         print saltare version
 
