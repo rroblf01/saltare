@@ -61,9 +61,9 @@ jobs:
         include:
           # 2+2+1 per platform: each job builds at most two wheels, so the
           # critical path is bounded by two sequential Zig builds instead
-          # of five. `pys` is a space-separated list because CIBW_BUILD is
-          # a regex over the whole identifier — the build step joins it
-          # into an alternation there.
+          # of five. `pys` is a space-separated list because CIBW_BUILD
+          # takes space-separated selectors — the build step joins it
+          # there.
           - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 1, pys: "cp310 cp311" }
           - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 2, pys: "cp312 cp313" }
           - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 3, pys: "cp314" }
@@ -201,14 +201,14 @@ jobs:
           # amortisation: one container, two venvs.
           export CIBW_ARCHS="${{ matrix.arch }}"
           # `matrix.pys` is a space-separated list ("cp310 cp311"); join it
-          # into a CIBW_BUILD alternation ("cp310-manylinux_*|cp311-...").
-          # CIBW_BUILD is a regex over the whole build identifier, which is
-          # exactly why the old pattern could use `?` — and why `|` needs
-          # no escaping here.
+          # into a space-separated CIBW_BUILD ("cp310-manylinux_*
+          # cp311-manylinux_*"). Per the cibuildwheel docs, selectors are
+          # fnmatch globs and multiple selectors are separated by a space
+          # — which is also why the old `cp31?-*` pattern worked (`?` is
+          # fnmatch for one char), and why `|` is invalid there.
           export CIBW_BUILD=""
           for p in ${{ matrix.pys }}; do
-            [ -n "$CIBW_BUILD" ] && CIBW_BUILD="$CIBW_BUILD|"
-            CIBW_BUILD="${CIBW_BUILD}${p}-${{ matrix.libc }}_*"
+            CIBW_BUILD="${CIBW_BUILD:+$CIBW_BUILD }${p}-${{ matrix.libc }}_*"
           done
           export CIBW_TEST_SKIP="*"
 
