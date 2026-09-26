@@ -15,6 +15,18 @@ name: Build & release wheels
 
 on:
   push:
+    # v1.12: `push` previously listed only `tags`, so a push to main ran
+    # nothing at all — the whole pipeline was reachable only by tagging, and
+    # that made "validate before you tag" impossible. The macOS gate exists
+    # precisely to catch things a Linux runner cannot compile, so it has to
+    # be reachable before the tag exists. `branches` and `tags` are OR'd, so
+    # this adds main without disturbing the tag trigger that publishes.
+    #
+    # Safe to run on every push: `publish` stays gated on
+    # `startsWith(github.ref, 'refs/tags/v')`, so a main push builds and
+    # tests the full matrix and never reaches PyPI.
+    branches:
+      - "main"
     tags:
       - "v*.*.*"
   workflow_dispatch:
