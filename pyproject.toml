@@ -30,12 +30,48 @@ classifiers = [
 [project.scripts]
 saltare = "saltare.cli:main"
 
+# Contributor environment (PEP 735). Distinct from the `dev` *extra* above,
+# which exists for consumers running `pip install saltare[dev]`. This group
+# is what plain `uv sync` installs, and it has to carry two things the extra
+# deliberately does not:
+#
+#   - the build backend. `[build-system].requires` is NOT a project
+#     dependency, so `uv sync` prunes scikit-build-core from the venv and
+#     the next `uv pip install -e . --no-build-isolation` dies. Keep it here
+#     or the Zig rebuild loop breaks after any sync.
+#   - the test dependencies, so `uv sync && pytest` works. `uv sync` does
+#     not install extras, so without this group a bare sync yields a venv
+#     with no pytest at all.
+[dependency-groups]
+dev = [
+    "scikit-build-core>=0.11",
+    "ninja>=1.11",
+    "pytest>=7",
+    "httpx>=0.27",
+    "fastapi>=0.115",
+    "websockets>=13",
+    # The HTTP/2 wire-conformance tests need the real `h2` client. Without
+    # it `tests/test_http2.py` skips wholesale at module level, silently
+    # dropping the whole HTTP/2 suite.
+    "h2>=4.1",
+    # Backs the `@pytest.mark.flaky(reruns=N)` markers. Without it the
+    # markers are unknown and the reruns silently become no-ops.
+    "pytest-rerunfailures>=14",
+]
+
 [project.optional-dependencies]
 dev = [
     "pytest>=7",
     "httpx>=0.27",
     "fastapi>=0.115",
     "websockets>=13",
+    # v1.12: the HTTP/2 wire-conformance tests need the real `h2` client.
+    # Without it `tests/test_http2.py` skips wholesale at module level, so
+    # a plain `uv sync` silently loses the entire HTTP/2 suite.
+    "h2>=4.1",
+    # Backs the `@pytest.mark.flaky(reruns=N)` markers. Without it the
+    # markers are unknown and the reruns silently become no-ops.
+    "pytest-rerunfailures>=14",
 ]
 # `pip install saltare[django]` pulls Django alongside saltare and
 # unlocks the `saltare.contrib.django` integration: add

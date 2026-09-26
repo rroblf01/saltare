@@ -49,6 +49,13 @@ def serve(
     latency_histogram: int = ...,
     dispatch_path: str | None = ...,
     runtime_config_path: str | None = ...,
+    dispatch_token: str | None = ...,
+    ktls: int = ...,
+    drain_path: str | None = ...,
+    access_log_exclude: str | None = ...,
+    ws_reject_log: int = ...,
+    ws_pump_interval_ms: int = ...,
+    http2: int = ...,
 ) -> None: ...
 
 # v1.5 compression metric counters. Atomic state lives in Zig; the
