@@ -1315,20 +1315,21 @@ Pair with `--proxy-headers` so saltare reads `X-Forwarded-For` / `X-Forwarded-Pr
 
 ### Local development with Zig
 
-Easiest dev loop. saltare's build pipeline (scikit-build-core → CMake → Zig) needs three things on your machine:
+Easiest dev loop. saltare's build pipeline (scikit-build-core → CMake → Zig) needs two things on your machine:
 
 1. **Zig 0.16+**
 2. **Python development headers** (`Python.h`)
-3. **OpenSSL development headers** (`<openssl/ssl.h>`, used by [src/zig/tls.zig](src/zig/tls.zig))
+
+OpenSSL development headers are **not** required. [src/zig/tls.zig](src/zig/tls.zig) declares OpenSSL as `opaque {}` and resolves every entry point through a lazy `dlopen` + `dlsym` table at first `serve(ssl_certfile=...)` call, hard-coding the ABI constants it needs instead of including `<openssl/ssl.h>`. A machine without OpenSSL headers builds the wheel fine; it just cannot serve TLS at runtime until `libssl` is installed.
 
 #### Linux (x86_64 or aarch64)
 
 ```bash
 # Debian/Ubuntu
-sudo apt install python3-dev libssl-dev cmake build-essential
+sudo apt install python3-dev cmake build-essential
 
 # Fedora/RHEL/Rocky
-sudo dnf install python3-devel openssl-devel cmake gcc
+sudo dnf install python3-devel cmake gcc
 
 # Zig: pinned 0.16.0 tarball, both archs handled
 bash scripts/install-zig.sh
@@ -1337,19 +1338,23 @@ bash scripts/install-zig.sh
 #### macOS
 
 ```bash
-brew install zig openssl@3
+brew install zig
 # Python headers come with Homebrew Python or python.org installers.
 ```
+
+Note that the **server** does not run on macOS yet — see [Status](#status). The Zig core's event loop is epoll-only and `src/zig/eventloop.zig` carries a hard `@compileError` for non-Linux targets, so a macOS build of `_core` fails at compile time by design.
 
 Then:
 
 ```bash
-uv sync                # or: pip install -e ".[dev]"
-pip install -e .       # builds the extension in place
-pytest -q
+uv sync                # installs the build backend + the test deps
+uv pip install -e .    # builds the extension in place (~6 s)
+.venv/bin/python -m pytest -q
 ```
 
-If `pip install -e .` errors with `zig was not found on PATH`, your Zig install didn't end up in PATH — `bash scripts/install-zig.sh` symlinks `/usr/local/bin/zig` for you. If it errors with `openssl/ssl.h: No such file or directory`, the OpenSSL dev headers are missing (see the OS commands above). Both errors apply equally on x86_64 and aarch64; the Docker pipeline (`make build`) sidesteps them entirely by running everything inside the manylinux container.
+`uv sync` is enough on its own: the `[dependency-groups] dev` group carries `scikit-build-core` and `ninja` alongside the test dependencies. That is deliberate — `[build-system].requires` is not a project dependency, so without the group a sync prunes the build backend and the next `uv pip install -e .` has nothing to build with. `uv sync` does not install extras, which is why the test deps live in the group and not only in the `dev` extra.
+
+If `uv pip install -e .` errors with `zig was not found on PATH`, your Zig install didn't end up in PATH — `bash scripts/install-zig.sh` symlinks `/usr/local/bin/zig` for you. The Docker pipeline (`make build`) sidesteps the host toolchain entirely by running everything inside the manylinux container.
 
 ### Docker (no Zig on host)
 
@@ -1377,7 +1382,7 @@ Tag a version and push:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-`.github/workflows/release.yml` runs cibuildwheel on Linux (x86_64 + aarch64) and macOS (x86_64 + arm64), builds the sdist, and publishes to PyPI via Trusted Publishing.
+`.github/workflows/release.yml` runs cibuildwheel on Linux (x86_64 + aarch64, manylinux + musllinux), builds the sdist, and publishes to PyPI via Trusted Publishing.
 
 ## Project layout
 

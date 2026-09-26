@@ -11,10 +11,14 @@ Why persistent loop and not ``asyncio.run`` per request:
     A persistent loop costs ~a few KB once; ``asyncio.run`` would create
     and tear down a fresh ``EventLoop`` (~tens of KB) every request.
 
-Limitations (intentional, scheduled for later milestones):
-    - No lifespan protocol (FastAPI startup/shutdown hooks don't fire).
-    - No keep-alive, no chunked Transfer-Encoding, no streaming bodies.
-    - No WebSockets.
+Scope: this module owns the *ASGI* half of a request. HTTP/1.1 and
+HTTP/2 parsing, TLS, WebSocket framing and the I/O loop all live in the
+Zig core, which calls in here once per request (and, for streaming
+responses, repeatedly). Everything an ASGI app can observe is built
+here: scope, ``receive``/``send``, the lifespan protocol, keep-alive
+recycling, chunked and streaming bodies, and WebSocket message
+pumping. See the module-level comments further down for the per-feature
+contracts.
 """
 
 from __future__ import annotations

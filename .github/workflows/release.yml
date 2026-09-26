@@ -158,7 +158,14 @@ jobs:
           pip install --upgrade pip
           # Match the test-requires baked into pyproject.toml's
           # [tool.cibuildwheel]; keeps both runs honest.
-          pip install pytest httpx fastapi websockets pytest-rerunfailures
+          # v1.12: `h2` was missing here while being present in
+          # cibuildwheel's test-requires. `tests/test_http2.py` skips
+          # itself at module level via importorskip("h2.connection"), so
+          # the omission did not fail the job — it just quietly dropped
+          # the entire HTTP/2 wire-conformance suite, including the
+          # flow-control tests. If you change this list, change
+          # pyproject.toml's test-requires in the same commit.
+          pip install pytest httpx fastapi websockets pytest-rerunfailures h2
           # Pick the wheel matching this runner's CPython tag.
           pip install --no-deps wheelhouse/saltare-*-cp${{ matrix.py_short }}-cp${{ matrix.py_short }}*-manylinux_2_28_x86_64.whl
 

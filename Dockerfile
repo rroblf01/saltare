@@ -46,7 +46,11 @@ RUN pip install --upgrade pip build
 # Stage 3: Test environment. Adds pytest+httpx once; the wheel install gets a
 # separate layer below so it can invalidate independently.
 FROM build-env AS test-env
-RUN pip install pytest httpx fastapi websockets pytest-rerunfailures
+# v1.12: `h2` added. tests/test_http2.py skips itself wholesale at module
+# level when it is absent, so leaving it out made `make test` report green
+# while running zero HTTP/2 tests. Keep in sync with pyproject.toml's
+# [tool.cibuildwheel] test-requires and the release.yml test_wheels job.
+RUN pip install pytest httpx fastapi websockets pytest-rerunfailures h2
 
 # ---------------------------------------------------------------------------
 # Stage 4: Build the wheel. Re-runs only when build inputs change. We copy
