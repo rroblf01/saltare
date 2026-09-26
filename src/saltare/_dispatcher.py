@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
-from typing import Any
+from typing import Any, Sequence
 
 # v1.3: `traceback` is imported lazily inside the exception-handling
 # paths below. The module is ~150 KiB resident once imported (it pulls
@@ -138,6 +138,11 @@ def set_traceparent_propagation(enabled: bool) -> None:
 # at a proxy and saltare sees scheme="http" via X-Forwarded-Proto: https.
 # Pre-rendered byte string saves a bytes-build per response.
 _hsts_header_line: bytes = b""
+
+# v1.12: returned by `_observability_header_lines` when every optional
+# header is off, which is the default. A shared singleton so the
+# no-headers case costs no allocation on the response path.
+_NO_OPTIONAL_HEADERS: "tuple[()]" = ()
 
 
 def set_hsts(max_age: int, include_subdomains: bool, preload: bool) -> None:
@@ -2235,21 +2240,14 @@ class _HttpState:
             _SERVER_LINE,
             _CONNECTION_KEEPALIVE_LINE if self.ka else _CONNECTION_CLOSE_LINE,
         ]
-        # v1.3: optional X-Request-ID + Server-Timing. Both gates are
-        # module-level and read once per response — when off, two
-        # `is None`/`if not` checks per request.
-        if self._request_id and _request_id_header is not None:
-            parts.append(_request_id_header + b": " + self._request_id + b"\r\n")
-        if self._traceparent_echo:
-            parts.append(b"traceparent: " + self._traceparent_echo + b"\r\n")
-        if _hsts_header_line:
-            parts.append(_hsts_header_line)
-        if _server_timing_enabled and self._start_ns:
-            import time
-            elapsed_ms = (time.monotonic_ns() - self._start_ns) / 1_000_000.0
-            parts.append(
-                f"server-timing: total;dur={elapsed_ms:.2f}\r\n".encode("ascii")
-            )
+        # v1.3: optional X-Request-ID + Server-Timing, plus the traceparent
+        # echo and HSTS. Shared with the synthesized-500 path so an app
+        # exception does not lose them. Both gates are module-level and
+        # read once per response — when off, one call returning a shared
+        # empty tuple.
+        optional = _observability_header_lines(self)
+        if optional:
+            parts.extend(optional)
 
         if streaming:
             if self.explicit_cl:
@@ -2307,6 +2305,48 @@ class _HttpState:
         return out
 
 
+def _observability_header_lines(s: "_HttpState") -> "list[bytes] | tuple[()]":
+    """The optional per-request response headers: X-Request-ID, the
+    traceparent echo, HSTS and Server-Timing.
+
+    Shared by the normal head-assembly path (`_HttpState._emit_headers`)
+    and the synthesized-500 path. v1.12: the 500 emitted when an app
+    raises was built by `_build_wire` directly and therefore carried
+    none of these — so the request that blew up, the one whose duration
+    and identity you actually want when reading a trace, was the one
+    request with neither.
+
+    Every gate is a module-level flag that defaults to off, and the
+    common case (all off) returns a shared empty tuple so the default
+    path allocates nothing beyond the status line it already builds.
+    """
+    if not (
+        (s._request_id and _request_id_header is not None)
+        or s._traceparent_echo
+        or _hsts_header_line
+        or (_server_timing_enabled and s._start_ns)
+    ):
+        return _NO_OPTIONAL_HEADERS
+
+    # v1.3 kept `time` out of the module imports: it is only needed on
+    # this path, and the import machinery is not free at the floor.
+    import time
+
+    parts: list[bytes] = []
+    if s._request_id and _request_id_header is not None:
+        parts.append(_request_id_header + b": " + s._request_id + b"\r\n")
+    if s._traceparent_echo:
+        parts.append(b"traceparent: " + s._traceparent_echo + b"\r\n")
+    if _hsts_header_line:
+        parts.append(_hsts_header_line)
+    if _server_timing_enabled and s._start_ns:
+        elapsed_ms = (time.monotonic_ns() - s._start_ns) / 1_000_000.0
+        parts.append(
+            f"server-timing: total;dur={elapsed_ms:.2f}\r\n".encode("ascii")
+        )
+    return parts
+
+
 def _finalize_if_needed(handle: int, s: _HttpState) -> bytes:
     """If the app finished without ever emitting headers/body, synthesize
     a 500 so the wire is a valid HTTP response. Otherwise, if it sent
@@ -2320,6 +2360,7 @@ def _finalize_if_needed(handle: int, s: _HttpState) -> bytes:
             [(b"content-type", b"text/plain; charset=utf-8")],
             b"Internal Server Error\n",
             keep_alive=False,
+            extra_headers=_observability_header_lines(s),
         )
     elif s.chunked and not s.body_done:
         # App finished but didn't close the chunked stream cleanly.
@@ -2524,6 +2565,7 @@ def http_dispatch_start(
                         [(b"content-type", b"text/plain; charset=utf-8")],
                         b"Internal Server Error\n",
                         keep_alive=False,
+                        extra_headers=_observability_header_lines(s),
                     )
                     state_obj.http_states.pop(handle, None)
                     _release_http_state(s)
@@ -2664,15 +2706,26 @@ def _build_wire(
     body: bytes,
     *,
     keep_alive: bool,
+    extra_headers: "Sequence[bytes]" = (),
 ) -> bytes:
     """Build a single-shot HTTP/1.1 response. Used for synthesized error
     responses (saltare-emitted 4xx/5xx); the streaming dispatcher emits
-    its own wire bytes incrementally."""
+    its own wire bytes incrementally.
+
+    `extra_headers` carries already-formatted `name: value\r\n` lines.
+    v1.12: synthesized 500s pass the request's observability headers here
+    so an app exception does not strip Server-Timing and X-Request-ID
+    from the response. Defaults to empty for the pre-dispatch rejections
+    (400 on an undecodable path, 413 on an over-cap body), which have no
+    per-request state to draw on.
+    """
     parts: list[bytes] = [
         _status_line(status),
         _SERVER_LINE,
         _CONNECTION_KEEPALIVE_LINE if keep_alive else _CONNECTION_CLOSE_LINE,
     ]
+    if extra_headers:
+        parts.extend(extra_headers)
 
     has_content_length = False
     for name, value in headers:
