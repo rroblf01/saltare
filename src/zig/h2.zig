@@ -743,15 +743,61 @@ test "SETTINGS with payload not a multiple of 6 is a FrameSizeError" {
     try std.testing.expectError(error.FrameSizeError, conn.processFrame(f));
 }
 
-test "WINDOW_UPDATE that overflows the window is a FlowControlError" {
+test "WINDOW_UPDATE that overflows the send window is a FlowControlError" {
     var conn = Connection.init(std.testing.allocator);
     defer conn.deinit();
-    conn.connection_window = HTTP2_MAX_WINDOW; // already at the ceiling
+    // v1.11: a peer WINDOW_UPDATE grows our *send* window, so the overflow
+    // check is against `send_conn_window` (the receive window is topped up
+    // separately, and only once a DATA frame is actually consumed).
+    conn.send_conn_window = HTTP2_MAX_WINDOW; // already at the ceiling
     var buf: [32]u8 = undefined;
     var inc: [4]u8 = undefined;
     std.mem.writeInt(u32, &inc, 1, .big);
     const f = buildFrame(&buf, HTTP2_FRAME_TYPE_WINDOW_UPDATE, 0, 0, &inc);
     try std.testing.expectError(error.FlowControlError, conn.processFrame(f));
+}
+
+test "WINDOW_UPDATE below the ceiling grows the send window" {
+    var conn = Connection.init(std.testing.allocator);
+    defer conn.deinit();
+    const before = conn.send_conn_window;
+    var buf: [32]u8 = undefined;
+    var inc: [4]u8 = undefined;
+    std.mem.writeInt(u32, &inc, 1024, .big);
+    const f = buildFrame(&buf, HTTP2_FRAME_TYPE_WINDOW_UPDATE, 0, 0, &inc);
+    const result = (try conn.processFrame(f)).?;
+    try std.testing.expect(result.window_update);
+    try std.testing.expectEqual(@as(u32, 0), result.wu_stream);
+    try std.testing.expectEqual(@as(u32, 1024), result.wu_increment);
+    try std.testing.expectEqual(before + 1024, conn.send_conn_window);
+    // A rejected/invalid update must not have moved the receive window.
+    try std.testing.expectEqual(HTTP2_SETTINGS_INITIAL_WINDOW_SIZE, conn.connection_window);
+}
+
+test "WINDOW_UPDATE with a zero increment is a ProtocolError" {
+    var conn = Connection.init(std.testing.allocator);
+    defer conn.deinit();
+    var buf: [32]u8 = undefined;
+    var inc = [_]u8{0} ** 4;
+    const f = buildFrame(&buf, HTTP2_FRAME_TYPE_WINDOW_UPDATE, 0, 0, &inc);
+    try std.testing.expectError(error.ProtocolError, conn.processFrame(f));
+}
+
+test "stream-level WINDOW_UPDATE is reported, not applied to the connection window" {
+    var conn = Connection.init(std.testing.allocator);
+    defer conn.deinit();
+    const before = conn.send_conn_window;
+    var buf: [32]u8 = undefined;
+    var inc: [4]u8 = undefined;
+    std.mem.writeInt(u32, &inc, 512, .big);
+    // The server applies stream-level updates to that stream's response
+    // transcoder (server.zig), so h2.zig must only report it.
+    const f = buildFrame(&buf, HTTP2_FRAME_TYPE_WINDOW_UPDATE, 0, 3, &inc);
+    const result = (try conn.processFrame(f)).?;
+    try std.testing.expect(result.window_update);
+    try std.testing.expectEqual(@as(u32, 3), result.wu_stream);
+    try std.testing.expectEqual(@as(u32, 512), result.wu_increment);
+    try std.testing.expectEqual(before, conn.send_conn_window);
 }
 
 test "MAX_CONCURRENT_STREAMS is enforced with RST_STREAM REFUSED_STREAM" {

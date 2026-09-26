@@ -561,19 +561,26 @@ test "decodeChunkedInPlace: empty body (just 0-chunk)" {
 }
 
 test "decodeChunkedInPlace: resumable across reads" {
+    // Wire bytes, split mid-body so the decoder has to resume:
+    //   "5\r\nhello\r\n"  = 11   (first chunk complete)
+    //   "6\r\n "          =  3   -> 14 available on the first read
+    //   "world\r\n"       =  7
+    //   "0\r\n\r\n"       =  5   -> 26 available on the second read
+    const first_read = 14;
+    const total = 26;
     var buf: [64]u8 = undefined;
-    @memcpy(buf[0..14], "5\r\nhello\r\n6\r\n ");
+    @memcpy(buf[0..first_read], "5\r\nhello\r\n6\r\n ");
     var state = ChunkState.init();
     var consumed: usize = 0;
     var decoded: usize = 0;
 
     // Only the first 14 bytes are available; we should be told to wait.
-    var result = decodeChunkedInPlace(&buf, 14, &state, &consumed, &decoded);
+    var result = decodeChunkedInPlace(&buf, first_read, &state, &consumed, &decoded);
     try testing.expectEqual(ChunkResult.needs_more, result);
 
     // Append the rest and resume.
-    @memcpy(buf[14..27], "world\r\n0\r\n\r\n");
-    result = decodeChunkedInPlace(&buf, 26, &state, &consumed, &decoded);
+    @memcpy(buf[first_read..total], "world\r\n0\r\n\r\n");
+    result = decodeChunkedInPlace(&buf, total, &state, &consumed, &decoded);
     try testing.expectEqual(ChunkResult.done, result);
     try testing.expectEqualStrings("hello world", buf[0..decoded]);
 }
