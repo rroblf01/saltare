@@ -257,3 +257,41 @@ def test_header_count_over_the_limit_is_431() -> None:
     """
     port = _serve()
     assert _raw_with_headers(port, 31) == 431
+
+
+def test_oversized_header_returns_431_not_a_reset() -> None:
+    """A head larger than the 16 KiB read buffer must produce a readable
+    431, not a TCP reset.
+
+    The server rejects the head while the client is still sending, so the
+    socket receive queue still holds the tail. Closing immediately made
+    the kernel emit RST, which discarded the response we had just
+    written — the client saw "connection reset" and learned nothing.
+    This matters more here than in most servers because saltare's head
+    ceiling is far tighter than uvicorn's (which has none by default), so
+    a request uvicorn serves happily can land on this path.
+    """
+    port = _serve()
+    extra = f"X-Big: {'v' * 40000}\r\n"
+    status, _ = _raw(port, "/", extra=extra)
+    assert status == 431
+
+
+def test_oversized_uri_returns_431_not_a_reset() -> None:
+    """Same for a request line too long to buffer.
+
+    414 is the code for an over-long *target*, but it is only reachable
+    once the head parses — and a target that does not fit the buffer
+    never gets that far, so 431 is the honest answer.
+    """
+    port = _serve()
+    status, _ = _raw(port, "/" + "a" * 70000)
+    assert status == 431
+
+
+def test_body_too_large_still_returns_413() -> None:
+    """Guard against the drain swallowing the neighbouring status codes:
+    a declared body over the cap is 413 and must not become 431."""
+    port = _serve()
+    status, _ = _raw(port, "/", extra="Content-Length: 999999999\r\n")
+    assert status == 413

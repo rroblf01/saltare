@@ -2128,7 +2128,19 @@ const ConnState = enum {
     /// Active HTTP/2 connection with multiplexed streams.
     http2,
     writing,
+    /// v1.12: the request head was rejected before it was fully read
+    /// (414 / 431), so the peer may still be writing. Read and throw away
+    /// what is left before closing — see `doDiscard`.
+    discarding,
 };
+
+/// v1.12: cap on bytes discarded by `doDiscard` after a 414/431, and the
+/// wall-clock cap on the whole phase. Both are needed: the byte budget
+/// bounds a fast flood, the timer bounds a slow trickle that never
+/// reaches it. A fixed 4 KiB of stack scratch, so the drain allocates
+/// nothing.
+const discard_budget: u32 = 64 * 1024;
+const discard_secs: u32 = 1;
 
 const Protocol = enum { http, websocket };
 
@@ -2232,6 +2244,11 @@ const Connection = struct {
     /// `destroy()` and the link/unlink helpers reach the lists without a
     /// `loop` param, and keeps that state per-interpreter rather than global.
     runtime: *Runtime,
+
+    /// v1.12: bytes `doDiscard` may still throw away. Zero outside the
+    /// `.discarding` state, so the drain costs one already-padded word per
+    /// connection and nothing at all per request.
+    discard_left: u32 = 0,
 
     /// Opaque handle into Python's `_dispatcher.http_states` for the
     /// in-flight request. Zero between requests.
@@ -3182,7 +3199,62 @@ fn handleConnEvent(loop: *eventloop.Loop, conn: *Connection, ev: eventloop.Event
             }
         },
         .writing => if (ev.readable or ev.writable) doWrite(loop, conn),
+        // v1.12: drain-and-throw-away phase after a 414/431. Only a
+        // readable event matters; writability is not registered.
+        .discarding => if (ev.readable) doDiscard(loop, conn),
     }
+}
+
+/// v1.12: the request head was rejected (414 URI Too Long, 431 Request
+/// Header Fields Too Large) while the client was still sending it, so the
+/// socket's receive queue still holds the tail of the request. Closing at
+/// that point makes the kernel emit RST rather than FIN, and the RST
+/// discards the response we just wrote — the client reports "connection
+/// reset" instead of the status code that would have told it exactly what
+/// to fix. That is a bad trade for a server whose head ceiling is far
+/// tighter than the competition's: a request uvicorn serves happily can
+/// land here.
+///
+/// So drain a bounded amount first, then close cleanly. Anything still
+/// queued when `discard_budget` runs out is dropped and the close RSTs,
+/// which is the correct outcome for a peer that will not stop sending.
+/// `fireExpired` closes the connection if the timer is what fires.
+fn doDiscard(loop: *eventloop.Loop, conn: *Connection) void {
+    var scratch: [4096]u8 = undefined;
+    var left: usize = conn.discard_left;
+    while (left > 0) {
+        const want = @min(left, scratch.len);
+        const n = c.read(conn.fd, @ptrCast(scratch[0..want].ptr), want);
+        // Peer closed: the receive queue is empty, so close() is clean.
+        if (n == 0) break;
+        if (n < 0) return; // EAGAIN — wait for the next readable event.
+        left -= @intCast(n);
+    }
+    conn.discard_left = @intCast(left);
+    loop.remove(conn.fd);
+    conn.destroy();
+}
+
+/// Enter `.discarding` once the error response is fully flushed. Callers
+/// must have already written it — we only re-arm the read side here.
+fn startDiscard(loop: *eventloop.Loop, conn: *Connection) void {
+    conn.state = .discarding;
+    conn.discard_left = discard_budget;
+    // Wall-clock bound, independent of the byte budget, so a peer that
+    // trickles a byte at a time cannot hold the connection open.
+    conn.armTimer(discard_secs);
+    loop.modify(conn.fd, @ptrCast(conn), true, false) catch {
+        loop.remove(conn.fd);
+        conn.destroy();
+    };
+}
+
+/// True for the two statuses that mean "your head was too big for us to
+/// finish reading", i.e. the ones where the peer is likely mid-send.
+/// Keyed off `response_status` rather than a new field so the drain
+/// costs no memory on the paths that never use it.
+fn headRejected(status: u16) bool {
+    return status == 414 or status == 431;
 }
 
 /// PROXY-protocol v2 binary signature: 12 bytes the LB sends before
@@ -4058,9 +4130,9 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
             } else |err| switch (err) {
                 error.Incomplete => continue,
                 // v1.12: a field-count overflow is 431, not 400 — it is
-                // the same condition as the byte ceiling, just tripped
-                // inside the parser, and RFC 6585 §5 covers both.
-                // Everything else here is genuinely malformed.
+                // the same condition as the byte ceiling at line 3942,
+                // just tripped inside the parser, and RFC 6585 §5 covers
+                // both. Everything else here is genuinely malformed.
                 error.TooManyHeaders => {
                     sendStatus(loop, conn, 431, "Request Header Fields Too Large");
                     return;
@@ -4807,6 +4879,8 @@ fn doWrite(loop: *eventloop.Loop, conn: *Connection) void {
         h2StreamReset(loop, conn);
     } else if (conn.keep_alive) {
         keepAliveReset(loop, conn);
+    } else if (headRejected(conn.response_status)) {
+        startDiscard(loop, conn);
     } else {
         loop.remove(conn.fd);
         conn.destroy();
