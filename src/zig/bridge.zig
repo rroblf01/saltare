@@ -288,7 +288,17 @@ pub fn httpDispatchStart(
 
     const q_idx = std.mem.indexOfScalar(u8, req.target(), '?');
     const raw_path = if (q_idx) |i| req.target()[0..i] else req.target();
-    const query = if (q_idx) |i| req.target()[i + 1 ..] else "";
+    var query = if (q_idx) |i| req.target()[i + 1 ..] else "";
+
+    // v1.12: absolute-form with an empty path (`GET http://host?a=1`).
+    // `target()` already reports the path as "/", so the '?' that carried
+    // the query is no longer in the slice split above — recover it from
+    // the pre-substitution remainder, or the query is silently lost and
+    // the route sees "/" with no parameters.
+    if (req.target_is_root) {
+        const rem = req.targetRemainder();
+        query = if (std.mem.indexOfScalar(u8, rem, '?')) |i| rem[i + 1 ..] else "";
+    }
 
     const headers_obj = buildHeadersList(req) orelse return null;
     defer py.Py_DecRef(headers_obj);
@@ -784,7 +794,17 @@ pub fn wsOpen(req: http.Request, allocator: std.mem.Allocator) ?WsOpen {
 
     const q_idx = std.mem.indexOfScalar(u8, req.target(), '?');
     const raw_path = if (q_idx) |i| req.target()[0..i] else req.target();
-    const query = if (q_idx) |i| req.target()[i + 1 ..] else "";
+    var query = if (q_idx) |i| req.target()[i + 1 ..] else "";
+
+    // v1.12: absolute-form with an empty path (`GET http://host?a=1`).
+    // `target()` already reports the path as "/", so the '?' that carried
+    // the query is no longer in the slice split above — recover it from
+    // the pre-substitution remainder, or the query is silently lost and
+    // the route sees "/" with no parameters.
+    if (req.target_is_root) {
+        const rem = req.targetRemainder();
+        query = if (std.mem.indexOfScalar(u8, rem, '?')) |i| rem[i + 1 ..] else "";
+    }
 
     const headers_obj = buildHeadersList(req) orelse return null;
     defer py.Py_DecRef(headers_obj);

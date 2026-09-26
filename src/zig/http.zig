@@ -72,11 +72,29 @@ pub const Request = struct {
     /// True when Transfer-Encoding includes "chunked" (case-insensitive,
     /// any token in a comma-separated list).
     is_chunked: bool,
+    /// v1.12: the request-target was absolute-form with an empty path
+    /// (`GET http://host?x=1`). RFC 3986 §6.2.3 says an empty path is
+    /// equivalent to "/", but the parser addresses its slices by
+    /// offset+len into `data` and there is no "/" to point at, so the
+    /// substitution is recorded here instead. Set only on that path;
+    /// origin-form targets never set it.
+    target_is_root: bool,
 
     pub inline fn method(self: Request) []const u8 {
         return self.data[self.method_off..][0..self.method_len];
     }
+    /// Path + optional query. For the absolute-form empty-path case this
+    /// is "/", the form an origin server must route on.
     pub inline fn target(self: Request) []const u8 {
+        if (self.target_is_root) return "/";
+        return self.data[self.target_off..][0..self.target_len];
+    }
+    /// The bytes that followed the authority in an absolute-form target,
+    /// before the "/" substitution — so `http://host?a=1` yields `?a=1`
+    /// here. Only meaningful when `target_is_root`; it exists so the
+    /// query string survives the substitution, which `target()` alone
+    /// cannot carry.
+    pub inline fn targetRemainder(self: Request) []const u8 {
         return self.data[self.target_off..][0..self.target_len];
     }
 
@@ -227,10 +245,30 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
     if (std.mem.indexOfScalarPos(u8, request_line, sp2 + 1, ' ') != null) return error.BadRequestLine;
     const method_off: u16 = 0;
     const method_len: u16 = @intCast(sp1);
-    const target_off: u16 = @intCast(sp1 + 1);
-    const target_len: u16 = @intCast(sp2 - (sp1 + 1));
+    var target_off: u16 = @intCast(sp1 + 1);
+    var target_len: u16 = @intCast(sp2 - (sp1 + 1));
+    var target_is_root = false;
+
+    // RFC 7230 §5.3.2 — absolute-form. A client may send
+    // `GET http://example.com/path?q=1`, and "an origin server MUST
+    // ignore the scheme and authority" and route on what remains.
+    //
+    // v1.12: this was not handled, so an absolute-form target was handed
+    // to the router verbatim and every such request 404'd. It is rare
+    // from browsers but not exotic: forward proxies use it towards the
+    // next hop, and some health checkers and load balancers address
+    // origin servers this way.
+    if (absoluteFormPath(request_line[sp1 + 1 .. sp2])) |abs| {
+        target_off = @intCast(sp1 + 1 + abs.off);
+        target_len = @intCast(abs.len);
+        target_is_root = abs.path_empty;
+    }
     const version = request_line[sp2 + 1 ..];
-    if (method_len == 0 or target_len == 0) return error.BadRequestLine;
+    // `target_is_root` means the target was absolute-form with an empty
+    // path, whose effective value is "/" — not an empty target.
+    if (method_len == 0 or (target_len == 0 and !target_is_root)) {
+        return error.BadRequestLine;
+    }
 
     if (version.len != 8 or !std.mem.startsWith(u8, version, "HTTP/1.")) {
         return error.UnsupportedVersion;
@@ -311,6 +349,39 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
         // present, Transfer-Encoding wins; we surface that by clearing CL.
         .content_length = if (is_chunked) null else content_length,
         .is_chunked = is_chunked,
+        .target_is_root = target_is_root,
+    };
+}
+
+/// RFC 7230 §5.3.2 absolute-form: locate the path+query inside
+/// `scheme://authority/path?query`.
+///
+/// Returns null when the target is already origin-form (`/path`, `*`) or
+/// when it merely *contains* "://" somewhere that is not a scheme — a
+/// path segment is allowed to hold a colon, and a slash before the "://"
+/// means it is a real path, not a scheme separator.
+///
+/// `off`/`len` index into `target` and cover the path *and* the query, so
+/// the query survives even when `path_empty` is set. `path_empty` reports
+/// the RFC 3986 §6.2.3 case (`http://host`, `http://host?a=1`), where the
+/// effective path is "/" and the parser has to substitute it.
+fn absoluteFormPath(target: []const u8) ?struct { off: usize, len: usize, path_empty: bool } {
+    const sep = std.mem.indexOf(u8, target, "://") orelse return null;
+    if (sep == 0) return null;
+    const scheme = target[0..sep];
+    if (std.mem.indexOfScalar(u8, scheme, '/') != null) return null;
+    for (scheme) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '+' and ch != '-' and ch != '.') {
+            return null;
+        }
+    }
+    // Skip the authority: it ends at the first '/', '?' or the end.
+    var i = sep + 3;
+    while (i < target.len and target[i] != '/' and target[i] != '?') : (i += 1) {}
+    return .{
+        .off = i,
+        .len = target.len - i,
+        .path_empty = i >= target.len or target[i] == '?',
     };
 }
 
@@ -592,4 +663,88 @@ test "decodeChunkedInPlace: rejects invalid hex" {
     var decoded: usize = 0;
     const result = decodeChunkedInPlace(&buf, buf.len, &state, &consumed, &decoded);
     try testing.expectEqual(ChunkResult.invalid, result);
+}
+
+// ---------------------------------------------------------------------------
+// RFC 7230 §5.3.2 absolute-form
+// ---------------------------------------------------------------------------
+
+test "parse: origin-form target is untouched" {
+    var buf: [64]Header = undefined;
+    const r = try parse("GET /path?q=1 HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/path?q=1", r.target());
+    try testing.expect(!r.target_is_root);
+}
+
+test "parse: absolute-form strips scheme and authority" {
+    var buf: [64]Header = undefined;
+    const r = try parse("GET http://example.com/path?q=1 HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/path?q=1", r.target());
+    try testing.expect(!r.target_is_root);
+}
+
+test "parse: absolute-form with a port in the authority" {
+    var buf: [64]Header = undefined;
+    const r = try parse("GET http://127.0.0.1:8000/x HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/x", r.target());
+}
+
+test "parse: absolute-form with an https scheme" {
+    var buf: [64]Header = undefined;
+    const r = try parse("GET https://example.com/secure HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/secure", r.target());
+}
+
+test "parse: absolute-form with an empty path yields root" {
+    var buf: [64]Header = undefined;
+    const r = try parse("GET http://example.com HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/", r.target());
+    try testing.expect(r.target_is_root);
+}
+
+test "parse: absolute-form with an empty path and a query" {
+    // RFC 3986 §6.2.3: an empty path is "/", so the query still routes.
+    var buf: [64]Header = undefined;
+    const r = try parse("GET http://example.com?a=1 HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/", r.target());
+    try testing.expectEqualStrings("?a=1", r.targetRemainder());
+    try testing.expect(r.target_is_root);
+}
+
+test "parse: absolute-form trailing slash is preserved" {
+    var buf: [64]Header = undefined;
+    const r = try parse("GET http://example.com/ HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/", r.target());
+}
+
+test "parse: asterisk-form is left alone" {
+    // `OPTIONS *` is its own form (RFC 7230 §5.3.4), not absolute-form.
+    var buf: [64]Header = undefined;
+    const r = try parse("OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("*", r.target());
+    try testing.expect(!r.target_is_root);
+}
+
+test "parse: a path containing '://' is not mistaken for absolute-form" {
+    // A colon in a path segment is legal, so a slash before the "://"
+    // means the target is origin-form and must survive intact.
+    var buf: [64]Header = undefined;
+    const r = try parse("GET /redirect/http://example.com HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("/redirect/http://example.com", r.target());
+}
+
+test "parse: a bare '://' with an empty scheme is not absolute-form" {
+    var buf: [64]Header = undefined;
+    const r = try parse("GET ://example.com/x HTTP/1.1\r\nHost: h\r\n\r\n", &buf);
+    try testing.expectEqualStrings("://example.com/x", r.target());
+}
+
+test "parse: absolute-form method and body offsets are unaffected" {
+    var buf: [64]Header = undefined;
+    const r = try parse("POST http://example.com/p HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhello", &buf);
+    try testing.expectEqualStrings("POST", r.method());
+    try testing.expectEqualStrings("/p", r.target());
+    try testing.expectEqual(@as(?usize, 5), r.content_length);
+    try testing.expectEqualStrings("hello", r.data[r.body_offset..][0..5]);
+    try testing.expectEqual(r.data.len, r.body_offset + 5);
 }
