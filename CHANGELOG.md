@@ -177,6 +177,46 @@ because it looks like coverage.
 
 Suite: **447 passing**, 7 skipped, from 368.
 
+### Performance verified, not assumed
+
+The v1.12 changes touch the response hot path — `_emit_headers` now shares
+one helper with the 500 path — so throughput and RSS were measured rather
+than assumed. Method: alternating A/B against v1.11.0 (`0f77a05`) with a
+full Zig rebuild between every switch, so machine drift cancels instead of
+accumulating, five samples per version, FastAPI via `benchmarks/bench.py`.
+
+| metric | 1.11.0 | 1.12.0 | verdict |
+|---|---:|---:|---|
+| idle RSS | 50.86 MiB | 50.81 MiB | unchanged (−0.05) |
+| sequential rps (median) | 1056 | 1147 | +8.6 %, inside noise |
+| uvicorn sequential rps (control) | 1163 | 1159 | −0.3 %, host was stable |
+
+The rps delta is **not** a result: the pooled standard deviation across both
+versions is ~8 %, and 4 of 5 HEAD runs beat the BASE median while only 1 of 5
+BASE runs beat the HEAD median. The honest reading is that the port and the
+dispatcher refactor are performance-neutral, with RAM flat to within 0.05 MiB
+and throughput flat within the measurement band.
+
+Two caveats recorded so the numbers are not misread later:
+
+- These were taken with **glibc's default allocator**. The published tables
+  in the README are taken with mimalloc preloaded (the `bench` stage of the
+  Dockerfile sets `LD_PRELOAD=libmimalloc.so.2`), which is worth roughly
+  4–5 MiB of floor. That is why this host reads ~50.6 MiB idle where the
+  README's v1.11.0 row reads 46.5 MiB — an allocator and host difference, not
+  a regression, and the A/B above confirms it since 1.11.0 measures the same
+  50.86 MiB here.
+- On **this** host saltare's throughput advantage over uvicorn does **not**
+  reproduce: it is roughly level on concurrent load and behind on sequential
+  (+3 % / −24 % against uvicorn 0.54, versus the README's published lead).
+  The RAM advantage reproduces clearly and at the published magnitude:
+  3.1 MiB leaner at peak under sequential load, 3.9 MiB under concurrent
+  load, and 8.2 MiB on the idle-keepalive workload where uvicorn's per-
+  connection allocations dominate. The published rps numbers were measured on
+  a different host with mimalloc in place; whether the throughput gap can be
+  closed on a clean allocator is worth its own investigation and is not
+  something this release claims to have solved.
+
 ### Build & CI
 
 - **CI was not running the HTTP/2 suite at all.** `tests/test_http2.py`
