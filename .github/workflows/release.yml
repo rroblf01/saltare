@@ -1,9 +1,11 @@
 name: Build & release wheels
 
-# Production target is Linux x86_64 + aarch64. macOS builds are intentionally
-# excluded because saltare's event loop is Linux-only (see eventloop.zig's
-# `@compileError` on non-Linux targets); a kqueue port is not on the
-# roadmap. PRs run the same Linux matrix as the release workflow.
+# Production target is Linux x86_64 + aarch64 (manylinux + musllinux).
+# v1.12 added macOS arm64: saltare's event loop gained a kqueue backend
+# (src/zig/eventloop_kqueue.zig) after being epoll-only since v0.4, which
+# is what made a macOS wheel possible at all. x86_64 macOS is
+# deliberately not built — see [tool.cibuildwheel.macos] in pyproject.toml
+# for why. PRs run the same matrix as the release workflow.
 #
 # manylinux_2_28 + musllinux_1_2 are PyPI compatibility tags, not just
 # container choices — PyPI rejects wheels tagged `linux_x86_64` (the
@@ -31,9 +33,10 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Wheels — 4-job fan-out: libc × arch. Each job builds the 5 supported
-  # Python versions (cp310 .. cp314) for its one (libc, arch) combo.
-  # GitHub free-tier concurrency caps at ~20 parallel jobs; 4 is safely
+  # Wheels — 5-job fan-out: 4 Linux (libc × arch) + 1 macOS arm64.
+  # Each job builds the 5 supported Python versions (cp310 .. cp314) for
+  # its one (libc, arch) combo.
+  # GitHub free-tier concurrency caps at ~20 parallel jobs; 5 is safely
   # under that and runs in parallel with build_sdist + test_wheels.
   build_wheels:
     name: wheels ${{ matrix.libc }} ${{ matrix.arch }}
@@ -42,10 +45,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,    arch: x86_64,  libc: manylinux }
-          - { os: ubuntu-latest,    arch: x86_64,  libc: musllinux }
-          - { os: ubuntu-24.04-arm, arch: aarch64, libc: manylinux }
-          - { os: ubuntu-24.04-arm, arch: aarch64, libc: musllinux }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: musllinux }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: manylinux }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux }
+          # macos-14 is the first Apple Silicon runner. x86_64 macOS is not
+          # built (see pyproject.toml's [tool.cibuildwheel.macos]).
+          - { os: macos-14,          arch: arm64,   libc: macos    }
     steps:
       - uses: actions/checkout@v4
 
@@ -53,12 +59,17 @@ jobs:
       # the cibuildwheel container. Avoids `ziglang.org` reachability
       # problems from inside the manylinux image — those caused
       # 4–10 min hangs in `before_all` previously.
+      #
+      # On macOS there is no container: cibuildwheel runs in a virtualenv on
+      # the runner itself, so Zig has to be on the runner's PATH rather than
+      # mounted. The same install script and the same cache key shape are
+      # reused, with `libc` in the key so the two platforms never collide.
       - name: Cache Zig toolchain
         id: zig-cache
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/zig
-          key: zig-${{ env.ZIG_VERSION }}-${{ runner.os }}-${{ matrix.arch }}
+          key: zig-${{ env.ZIG_VERSION }}-${{ matrix.libc }}-${{ matrix.arch }}-${{ runner.os }}
 
       - name: Install Zig on runner
         if: steps.zig-cache.outputs.cache-hit != 'true'
@@ -88,7 +99,7 @@ jobs:
             pip-${{ matrix.arch }}-${{ matrix.libc }}-
 
       # Tier-3: skip cibuildwheel's per-wheel test pass entirely. Tests
-      # run once in the separate `test_wheels` job below.
+      # run once in the separate `test_wheels` / `test_macos` jobs below.
       - name: Build wheels
         uses: nick-fields/retry@v3
         with:
@@ -96,20 +107,38 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 30
           retry_on: error
-          command: |
-            mkdir -p ${{ runner.temp }}/zig-global-cache
-            chmod -R 777 ${{ runner.temp }}/zig-global-cache
-            
+        env:
+          ZIG_DIR: ${{ runner.temp }}/zig
+          ZIG_CACHE_DIR: ${{ runner.temp }}/zig-global-cache
+        command: |
+          if [ "${{ matrix.libc }}" = "macos" ]; then
+            # No container on macOS: prepend the toolchain to PATH and point
+            # Zig's global cache at the runner dir we cached above.
+            export PATH="$ZIG_DIR:$PATH"
+            export ZIG_GLOBAL_CACHE_DIR="$ZIG_CACHE_DIR"
+            export CIBW_ARCHS="arm64"
+            export CIBW_BUILD="cp31?-macosx_*"
+            export CIBW_TEST_SKIP="*"
+            # Nothing is link-time linked (OpenSSL and the codecs are
+            # dlopen'd at runtime), so delocate has nothing to vendor. Left
+            # at the cibuildwheel default, which is correct here.
+            export CIBW_ENVIRONMENT_MACOS="ZIG_VERSION=$ZIG_VERSION MACOSX_DEPLOYMENT_TARGET=11.0 ZIG_GLOBAL_CACHE_DIR=$ZIG_CACHE_DIR PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_BUILD_ISOLATION=0"
+            pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
+          else
+            mkdir -p "$ZIG_CACHE_DIR"
+            chmod -R 777 "$ZIG_CACHE_DIR"
+
             export CIBW_ARCHS="${{ matrix.arch }}"
             export CIBW_BUILD="cp31?-${{ matrix.libc }}_*"
             export CIBW_TEST_SKIP="*"
-            
+
             export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
-            
-            export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ runner.temp }}/zig:/host-zig:ro --volume ${{ runner.temp }}/zig-global-cache:/zig-cache:rw"
-            export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
-            
+
+            export CIBW_CONTAINER_ENGINE="docker; create_args: --volume $ZIG_DIR:/host-zig:ro --volume $ZIG_CACHE_DIR:/zig-cache:rw"
+            export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=$ZIG_VERSION ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+
             pipx run cibuildwheel==3.4.1 --output-dir wheelhouse
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -173,6 +202,60 @@ jobs:
         run: pytest -q tests
 
   # ---------------------------------------------------------------------------
+  # macOS test stage. The gate for the v1.12 kqueue port.
+  #
+  # This is not redundant with `test_wheels`. Everything platform-specific
+  # in the port is invisible to a Linux runner: the kqueue backend, the
+  # fcntl-based replacement for SOCK_NONBLOCK/SOCK_CLOEXEC, the Darwin
+  # sendfile(2) offset convention, MADV_FREE, and the proc_pidinfo /
+  # getrusage metrics readers. Those were compile-checked for
+  # aarch64-macos locally, but `module.zig` could not be (bridge.zig needs
+  # a macOS Python.h), and nothing short of running the wheel exercises the
+  # behaviour. Two Python versions rather than three: the macOS-specific
+  # risk is the event loop, not version skew, and macOS runners are the
+  # slowest and most expensive in the matrix.
+  test_macos:
+    name: test macOS arm64 cp${{ matrix.py_short }}
+    needs: build_wheels
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python-version: "3.12", py_short: "312" }
+          - { python-version: "3.14", py_short: "314" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-arm64-macos
+          path: wheelhouse
+
+      - name: Install wheel + test deps
+        run: |
+          pip install --upgrade pip
+          # Same list as the Linux test job and as pyproject.toml's
+          # test-requires. Keep all three in sync.
+          pip install pytest httpx fastapi websockets pytest-rerunfailures h2
+          pip install --no-deps wheelhouse/saltare-*-cp${{ matrix.py_short }}-cp${{ matrix.py_short }}-macosx_*_arm64.whl
+
+      # Fails loudly rather than skipping, if the extension came out with
+      # the wrong architecture. An import error here would otherwise show up
+      # as a wall of test failures that reads like a code problem.
+      - name: Verify the extension loaded natively
+        run: |
+          python -c "import saltare._core as c, platform, sys; \
+            print('core', c.version(), 'on', platform.machine(), platform.system()); \
+            sys.exit(0 if platform.system() == 'Darwin' and platform.machine() == 'arm64' else 1)"
+
+      - name: Run pytest
+        run: pytest -q tests
+
+  # ---------------------------------------------------------------------------
   # Source distribution. Independent of the wheel matrix — runs once on
   # ubuntu-latest, no manylinux needed (sdists are platform-agnostic).
   build_sdist:
@@ -191,11 +274,13 @@ jobs:
           path: ./dist/*.tar.gz
 
   # ---------------------------------------------------------------------------
-  # PyPI publish. Gated on tag pushes AND on test_wheels passing.
+  # PyPI publish. Gated on tag pushes AND on both test jobs passing —
+  # test_wheels (manylinux x86_64) and test_macos (macOS arm64). A release
+  # is not published with a red platform.
   publish:
     name: Publish to PyPI
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build_wheels, test_wheels, build_sdist]
+    needs: [build_wheels, test_wheels, test_macos, build_sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi

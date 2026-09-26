@@ -27,6 +27,14 @@ uv pip install -e . --no-deps --no-build-isolation   # rebuild the Zig core (~6 
   out to `zig`, passing `-Dpython-include` and `-Dext-suffix`; there is no pure-Python path.
 - `make test` / `make build` / `make bench` run everything in Docker (no Zig on the host).
   `make valgrind` = pytest under valgrind, 10–30× slower, a manual pre-tag gate.
+- `make check-macos` cross-compile-checks every Zig module that does not need a macOS
+  `Python.h` against `aarch64-macos`. Run it after touching platform code — it is the
+  only way to catch a Darwin-only compile error without a Mac. `module.zig` and
+  `server.zig` are excluded (they import `bridge.zig`). To force `server.zig` through
+  anyway, symlink `src/zig/*.zig` into a scratch dir beside a root file that
+  `export fn`s a wrapper calling `server.run(...)`. Merely *referencing* the function
+  is not enough: Zig will not generate the body, and the check then passes on a 1.8 KB
+  stub object while proving nothing.
 - **Zig unit tests are run per file**, not via make or CI:
   `zig test --cache-dir /tmp/zc --global-cache-dir /tmp/zg src/zig/h2.zig`
   The repo-root `.zig-cache/` is root-owned, so a bare `zig test` dies with
@@ -34,6 +42,22 @@ uv pip install -e . --no-deps --no-build-isolation   # rebuild the Zig core (~6 
 - No linter, formatter or typechecker is configured. **Do not add one, and do not run
   `zig fmt`** — `server.zig`, `h2.zig`, `bridge.zig` and `h2_static.zig` are already not
   `zig fmt` clean, so it would bury any real change in noise.
+
+## Platform support: Linux and macOS only
+
+`src/zig/eventloop.zig` picks a backend at comptime — `eventloop_epoll.zig` or
+`eventloop_kqueue.zig` — and re-exports it, so `server.zig` is platform-agnostic and
+the hot path has **no branch on the OS**. Adding a third target means adding a backend
+with the same five methods (`init`/`add`/`modify`/`remove`/`wait`), the same `Event`
+shape, the same `runtime: ?*anyopaque` field, and one `comptime` arm.
+
+When touching platform code, the recurring macOS differences are: no
+`SOCK_NONBLOCK`/`SOCK_CLOEXEC` (use `socketNonBlock`/`acceptOne`), no `TCP_KEEPIDLE`
+(it is `TCP_KEEPALIVE`), no `TCP_USER_TIMEOUT`, `madvise` wants `MADV_FREE` rather
+than `MADV_DONTNEED`, `sendfile(2)` takes the offset by value and only honours it on
+the first call, and there is no `prctl` or `/proc`. A top-level `@cImport` of a header
+that does not exist on the other platform breaks the build *before any of our own code
+runs* — that is how `sys/prctl.h` and `sys/sendfile.h` had to go.
 
 ## Adding or changing a server option — 4 coupled places
 

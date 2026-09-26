@@ -99,11 +99,13 @@ test-requires = ["pytest", "httpx", "fastapi", "websockets", "pytest-rerunfailur
 test-command = "pytest -q {project}/tests"
 
 [tool.cibuildwheel.linux]
-# openssl-devel: tls.zig @cIncludes openssl/ssl.h + openssl/err.h. Manylinux
-# images ship the runtime libs but not the headers; without -devel the zig
-# build fails before it can produce _core.so. auditwheel repair vendors the
-# runtime libs into the final wheel so end users don't need them installed.
-before-all = "bash {project}/scripts/install-zig.sh && dnf install -y --disablerepo=epel openssl-devel"
+# NOTE: no OpenSSL package is needed here. tls.zig does not cimport
+# <openssl/ssl.h> — it declares the types `opaque {}`, hard-codes the ABI
+# constants it needs and resolves every entry point through a lazy
+# dlopen+dlsym table — so the extension builds with no OpenSSL headers at
+# all. TLS at *runtime* still needs libssl present on the host, but that
+# is the user's system, not our build.
+before-all = "bash {project}/scripts/install-zig.sh"
 environment = { PATH = "/usr/local/bin:$PATH", ZIG_VERSION = "0.16.0" }
 archs = ["x86_64", "aarch64"]
 # Match the local Docker pipeline (scripts/build-wheel.sh + Dockerfile use
@@ -115,12 +117,33 @@ musllinux-x86_64-image = "musllinux_1_2"
 musllinux-aarch64-image = "musllinux_1_2"
 
 # v1.5: musllinux wheels for Alpine-based images (k8s sidecars,
-# distroless containers). Alpine uses apk + openssl-dev (not -devel),
-# so override the before-all on that selector. Tests still run against
-# the same source tree.
+# distroless containers). Alpine uses apk, so override the before-all on
+# that selector. Tests still run against the same source tree.
 [[tool.cibuildwheel.overrides]]
 select = "*-musllinux*"
-before-all = "bash {project}/scripts/install-zig.sh && apk add --no-cache openssl-dev"
+before-all = "bash {project}/scripts/install-zig.sh"
+
+# v1.12: macOS arm64, the first non-Linux target. The event loop gained a
+# kqueue backend in eventloop_kqueue.zig; everything else the port needed
+# (SOCK_NONBLOCK, TCP_KEEPIDLE, sys/sendfile.h, sys/prctl.h, the dlopen
+# sonames) is handled per-OS in the Zig sources.
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+# arm64 macOS starts at 11.0 Big Sur. Pinning it keeps the wheel usable on
+# the widest set of machines and makes the platform tag deterministic
+# (macosx_11_0_arm64) instead of tracking whatever SDK the runner ships.
+# Zig's macOS native linker honours this variable; CMake does not pass
+# -Dtarget, so the env var is how the floor is communicated.
+environment = { MACOSX_DEPLOYMENT_TARGET = "11.0", ZIG_VERSION = "0.16.0" }
+# No OpenSSL here either, for the same reason as Linux. Homebrew's
+# openssl@3 is only needed at *runtime* by users who want TLS, and it is
+# reached by dlopen of "libssl.3.dylib" / "libssl.dylib".
+before-all = "bash {project}/scripts/install-zig.sh"
+# x86_64 macOS is deliberately not built. The wheel would have to be a
+# Rosetta build on an arm64 runner, and the project's distribution targets
+# are Linux servers plus Apple-Silicon developer machines — the
+# Django `runserver` integration is the local-dev case that motivated this,
+# and that is arm64 by definition on any current Mac.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -26,7 +26,55 @@ DOCKER_BUILD_ARGS = \
     --build-arg MANYLINUX_TAG=$(MANYLINUX_TAG) \
     --build-arg ZIG_VERSION=$(ZIG_VERSION)
 
-.PHONY: help build test bench benchmark valgrind production-image install-zig clean smoke-alpine soak
+.PHONY: help build test bench benchmark valgrind production-image install-zig clean smoke-alpine soak check-macos test-macos
+
+# ---------------------------------------------------------------------------
+# macOS: v1.12 added a kqueue backend, so macOS arm64 is a real target now.
+# The `make` targets above all drive Docker and are Linux-only. These two
+# are the local/CI-facing macOS entry points.
+# ---------------------------------------------------------------------------
+
+# Compile-check every Zig module that does not need a macOS Python.h
+# against aarch64-macos. Catches the platform-specific breakage (missing
+# Darwin constants, cimport of a header that does not exist there, a
+# signature that differs) in seconds on a Linux box, instead of waiting for
+# a macOS CI runner.
+#
+# module.zig and server.zig are NOT in this list: both import bridge.zig,
+# which needs a real macOS Python.h. server.zig can still be forced through
+# with the export-wrapper trick (see AGENTS.md); module.zig's coverage is
+# the macOS CI runner's job.
+MACOS_CHECK_TARGET ?= aarch64-macos
+MACOS_CHECK_FILES  = eventloop eventloop_epoll eventloop_kqueue \
+                     procstats_darwin http h2 h2_encoder h2_response huffman \
+                     ws tls zlib brotli zstd pool timer master
+MACOS_ZIG_CACHE    ?= /tmp/saltare-zig-cache
+
+check-macos:
+	@mkdir -p $(MACOS_ZIG_CACHE)
+	@fail=0; \
+	for f in $(MACOS_CHECK_FILES); do \
+		printf '%-22s ' "$$f.zig"; \
+		if zig build-obj src/zig/$$f.zig -target $(MACOS_CHECK_TARGET) \
+			--cache-dir $(MACOS_ZIG_CACHE) \
+			--global-cache-dir $(MACOS_ZIG_CACHE)/global \
+			-femit-bin=$(MACOS_ZIG_CACHE)/$$f.o >$(MACOS_ZIG_CACHE)/$$f.log 2>&1; then \
+			echo "OK"; \
+		else \
+			echo "FAIL"; sed -n '1,6p' $(MACOS_ZIG_CACHE)/$$f.log; fail=1; \
+		fi; \
+	done; \
+	if [ $$fail -ne 0 ]; then exit 1; fi; \
+	echo; \
+	echo "note: module.zig and server.zig are not covered here (bridge.zig"; \
+	echo "needs a macOS Python.h). The macOS CI runner is their gate."
+
+# Build the macOS arm64 wheel with cibuildwheel. Must be run on macOS with
+# Zig on PATH; cibuildwheel's macOS support has no container backend, so
+# this cannot be emulated from Linux the way `make build` can.
+test-macos:
+	pipx run cibuildwheel==3.4.1 --platform macos --archs arm64 --output-dir wheelhouse
+	@echo "now: pip install --no-deps wheelhouse/saltare-*-macosx_*_arm64.whl && pytest -q tests"
 
 help:
 	@echo "Targets (no Zig on host):"
@@ -36,6 +84,8 @@ help:
 	@echo "  valgrind           Run pytest under valgrind --leak-check=full"
 	@echo "  production-image   Build saltare-prod (jemalloc + MALLOC_ARENA_MAX=2)"
 	@echo "  smoke-alpine       Verify the most-recent musllinux wheel boots on real Alpine"
+	@echo "  check-macos        Cross-compile-check the Zig core against aarch64-macos (fast, no Docker)"
+	@echo "  test-macos         Build the macOS arm64 wheel with cibuildwheel (macOS host only)"
 	@echo "  soak               Sustained 30-min load against bench app to catch slow leaks"
 	@echo ""
 	@echo "Other:"
