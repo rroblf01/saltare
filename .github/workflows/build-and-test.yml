@@ -181,8 +181,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # v1.12: all five built versions are tested. The build fans out
+          # over cp310-cp314 (`CIBW_BUILD="cp31?-*"`), so testing three of
+          # them meant cp311 and cp313 were *published without ever being
+          # run against* — and this suite has a track record of paths that
+          # only break on one interpreter. Two more jobs is a cheap price
+          # for not shipping untested wheels.
           - { python-version: "3.10", py_short: "310" }
+          - { python-version: "3.11", py_short: "311" }
           - { python-version: "3.12", py_short: "312" }
+          - { python-version: "3.13", py_short: "313" }
           - { python-version: "3.14", py_short: "314" }
     steps:
       - uses: actions/checkout@v4

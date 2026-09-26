@@ -79,11 +79,23 @@ def _make_ca(tmp_path: Path, name: str) -> tuple[str, str]:
     """
     ca_key = tmp_path / f"{name}-key.pem"
     ca_cert = tmp_path / f"{name}.pem"
+    # No `-addext basicConstraints=critical,CA:TRUE` here. `req -x509`
+    # already emits it — but only *once* on OpenSSL 3, and on OpenSSL 1.1.1
+    # it emits its own copy from openssl.cnf's x509_extensions *as well*,
+    # so the -addext produced a second one. A certificate with a
+    # duplicated extension violates RFC 5280 §4.2 and OpenSSL's verifier
+    # then refuses to use it as an issuer:
+    #
+    #   error 20 at 0 depth lookup: unable to get local issuer certificate
+    #
+    # which surfaced as three mTLS tests failing on the manylinux_2_28
+    # build image (OpenSSL 1.1.1k) while passing on the GitHub runner
+    # (OpenSSL 3.x) — an environment difference that had nothing to do
+    # with saltare. Letting the tool add it once works on both.
     _openssl(
         "req", "-x509", "-newkey", *_KEYGEN, "-sha256", "-days", "1", "-nodes",
         "-keyout", str(ca_key), "-out", str(ca_cert),
         "-subj", f"/CN={name}-ca",
-        "-addext", "basicConstraints=critical,CA:TRUE",
     )
     return str(ca_cert), str(ca_key)
 
