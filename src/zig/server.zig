@@ -2146,7 +2146,10 @@ const Protocol = enum { http, websocket };
 
 /// WebSocket-only state stored in a tagged union alongside the http
 /// `void` variant so HTTP connections pay zero bytes for WS fields.
-/// ~52 B saved per HTTP conn; at 1024 idle connections ~52 KiB.
+/// 72 B saved per HTTP conn; at 1024 idle connections ~72 KiB. (The
+/// figure was documented as ~52 B, which was already stale; measured
+/// with @sizeOf. The v1.12 `close_sent` field fit in existing padding
+/// and cost nothing.)
 const WsState = struct {
     /// Opaque handle returned by Python's `ws_open`.
     handle: c_long = 0,
@@ -2235,8 +2238,8 @@ const Connection = struct {
     ssl: ?*tls.Ssl,
 
     /// Tagged union: `.http` (void) or `.websocket` (WsState).
-    /// HTTP connections pay zero RAM for WS state (~52 B saved per HTTP conn).
-    /// The tag doubles as the protocol discriminator.
+    /// HTTP connections pay zero RAM for WS state (72 B saved per HTTP
+    /// conn). The tag doubles as the protocol discriminator.
     data: union(Protocol) {
         http: void,
         websocket: WsState,
