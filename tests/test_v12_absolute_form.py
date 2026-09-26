@@ -221,3 +221,39 @@ def test_absolute_form_with_a_body():
     head, _, body = buf.partition(b"\r\n\r\n")
     assert int(head.split(b"\r\n", 1)[0].split(b" ")[1]) == 200
     assert body == b"POST /submit "
+
+
+# ---------------------------------------------------------------------------
+# Header field-count limit (RFC 6585 §5)
+# ---------------------------------------------------------------------------
+
+
+def _raw_with_headers(port: int, n_x_fields: int) -> int:
+    """Sends `n_x_fields` X- fields and returns the status.
+
+    `_raw` also sends `Host` and `Connection: close`, so the total field
+    count the parser sees is `n_x_fields + 2`.
+    """
+    extra = "".join(f"X-N-{i}: v\r\n" for i in range(n_x_fields))
+    status, _ = _raw(port, "/", extra=extra)
+    return status
+
+
+def test_header_count_at_the_limit_is_served() -> None:
+    """30 X- fields + Host + Connection = 32 total, exactly
+    `max_headers=32`. Must be served — an off-by-one here would reject
+    legitimate traffic."""
+    port = _serve()
+    assert _raw_with_headers(port, 30) == 200
+
+
+def test_header_count_over_the_limit_is_431() -> None:
+    """31 X- fields + Host + Connection overflows `max_headers=32`.
+
+    This used to answer 400, which is the wrong code: a field-count
+    overflow is the same condition as the byte ceiling, and RFC 6585 §5
+    gives it 431. `http.zig` even documented 431 here while the code
+    returned 400.
+    """
+    port = _serve()
+    assert _raw_with_headers(port, 31) == 431

@@ -21,6 +21,11 @@ pub const ParseError = error{
     BadRequestLine,
     BadHeader,
     HeadersTooLarge,
+    /// v1.12: more than `max_headers` header fields. Split out from
+    /// `HeadersTooLarge` (which is the *byte* ceiling) so the server can
+    /// answer 431 for both, as RFC 6585 §5 describes, instead of
+    /// lumping a field-count limit in with malformed syntax and 400ing it.
+    TooManyHeaders,
     UnsupportedVersion,
     InvalidContentLength,
 };
@@ -316,7 +321,7 @@ pub fn parse(buf: []const u8, headers_out: []Header) ParseError!Request {
         const value_off: u16 = @intCast(pos + v_start);
         const value_len: u16 = @intCast(v_end - v_start);
 
-        if (header_count >= headers_out.len) return error.HeadersTooLarge;
+        if (header_count >= headers_out.len) return error.TooManyHeaders;
         headers_out[header_count] = .{
             .name_off = name_off,
             .name_len = name_len,

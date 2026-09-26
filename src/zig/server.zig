@@ -4057,6 +4057,14 @@ fn doReadHttp(loop: *eventloop.Loop, conn: *Connection) void {
                 }
             } else |err| switch (err) {
                 error.Incomplete => continue,
+                // v1.12: a field-count overflow is 431, not 400 — it is
+                // the same condition as the byte ceiling, just tripped
+                // inside the parser, and RFC 6585 §5 covers both.
+                // Everything else here is genuinely malformed.
+                error.TooManyHeaders => {
+                    sendStatus(loop, conn, 431, "Request Header Fields Too Large");
+                    return;
+                },
                 else => {
                     std.log.warn("parse failed: {s}", .{@errorName(err)});
                     sendStatus(loop, conn, 400, "Bad Request");
