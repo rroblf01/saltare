@@ -27,17 +27,30 @@ jobs:
     name: wheels ${{ matrix.libc }} ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     env:
-      # `runner` is NOT in scope for a job-level `env` — the contexts
-      # available there are github/needs/strategy/matrix/vars/secrets/inputs,
-      # so `${{ runner.temp }}` here makes the whole workflow fail to parse
-      # with zero jobs. `github.workspace` is valid, and a workspace subdir
-      # is easier to reason about than runner temp anyway.
+      # Every directory the build reads or writes is declared here, once,
+      # and referenced as `${{ env.NAME }}` everywhere else. v1.12 had
+      # ZIG_DIR / ZIG_CACHE_DIR on the *build step* instead, and an edit
+      # that rewrote that step's `command:` block dropped the `env:` that
+      # defined them. Nothing complained: both references expanded to an
+      # empty string, so cibuildwheel asked docker to mount
+      # `:/host-zig:ro` and died with "invalid spec: :/host-zig:ro: empty
+      # section between colons" — after burning three 30-minute retry
+      # attempts on it. A path that is referenced but defined somewhere
+      # fragile fails as a malformed mount rather than as a missing
+      # variable, which is why it gets exactly one definition.
       #
-      # CIBW_CACHE_DIR points the *container's* pip cache at this host
-      # directory; PIP_CACHE_DIR does the same for macOS, which has no
-      # container. Declared once so the cache step and the build command
-      # cannot disagree about the path.
+      # `runner` is NOT in scope for a job-level `env`: the contexts
+      # available there are github/needs/strategy/matrix/vars/secrets/inputs,
+      # so `${{ runner.temp }}` here would make the workflow fail to parse
+      # with zero jobs. `github.workspace` is valid, and a workspace
+      # subdirectory is easier to reason about than runner temp.
+      #
+      # CIBW_CACHE_DIR points the *container's* pip cache at PIP_CACHE_DIR;
+      # the Zig toolchain and the Zig build cache are bind-mounted into the
+      # manylinux image the same way.
       PIP_CACHE_DIR: ${{ github.workspace }}/.pip-cache
+      ZIG_DIR: ${{ github.workspace }}/.zig-toolchain
+      ZIG_CACHE_DIR: ${{ github.workspace }}/.zig-build-cache
     strategy:
       fail-fast: false
       matrix:
@@ -67,20 +80,20 @@ jobs:
         id: zig-cache
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/zig
+          path: ${{ env.ZIG_DIR }}
           key: zig-${{ env.ZIG_VERSION }}-${{ matrix.libc }}-${{ matrix.arch }}-${{ runner.os }}
 
       - name: Install Zig on runner
         if: steps.zig-cache.outputs.cache-hit != 'true'
         env:
-          ZIG_INSTALL_DIR: ${{ runner.temp }}/zig
+          ZIG_INSTALL_DIR: ${{ env.ZIG_DIR }}
           ZIG_SKIP_SYMLINK: "1"
         run: bash scripts/install-zig.sh
 
       - name: Cache Zig build artifacts
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/zig-global-cache
+          path: ${{ env.ZIG_CACHE_DIR }}
           key: zig-build-${{ matrix.arch }}-${{ matrix.libc }}-${{ github.sha }}
           restore-keys: |
             zig-build-${{ matrix.arch }}-${{ matrix.libc }}-
