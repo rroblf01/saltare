@@ -31,6 +31,18 @@ on:
       - "v*.*.*"
   workflow_dispatch:
 
+# Serialise releases per ref, but **never cancel one**. This is the
+# deliberate opposite of `ci.yml`, and the reason is that publishing to
+# PyPI is not safely interruptible: a run cancelled between uploading some
+# wheels and others leaves a partial release, and a release cannot be
+# un-published. So a second run for the same tag queues behind the first
+# instead of replacing it, and a new tag runs concurrently rather than
+# waiting — `ci.yml` is in a different group, so a push to main cannot
+# disturb a release either.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-and-test:
     # A called workflow, not a job: it is a single unit of work whose

@@ -29,6 +29,18 @@ on:
       - "tests/**"
       - ".github/workflows/**"
 
+# Superseded runs are dead work: this pipeline fans out to four wheel builds
+# and five test jobs, so a run left behind while you keep pushing costs
+# minutes of runner time and tells you nothing. `github.ref` keeps the scope
+# per-branch — a run for a pull request is `refs/pull/N/merge`, so pushing
+# to a PR cancels that PR's previous run and nothing else. A *global* group
+# would be wrong: it would let a push to main cancel an unrelated release.
+#
+# `release.yml` deliberately has its own group, below.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
     uses: ./.github/workflows/build-and-test.yml
