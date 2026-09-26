@@ -515,23 +515,30 @@ def test_repeated_messages_survive_without_takeover() -> None:
         sock.close()
 
 
-def test_compression_level_is_accepted_across_the_range() -> None:
+@pytest.mark.parametrize("level", [1, 6, 9])
+def test_compression_level_is_accepted_across_the_range(level: int) -> None:
     """`ws_compression_level` had no test that reached it. Levels 1 and 9
     both have to produce a working connection — an out-of-range or
     misparsed level would otherwise show up as a decode failure in
-    production and nowhere in CI."""
-    for level in (1, 6, 9):
-        port = _free_port()
-        _serve(_lifespan_and_echo, port, ws_compression_level=level)
-        sock, client, head = _handshake(port)
-        try:
-            token = _head_value(head, b"sec-websocket-extensions")
-            assert token is not None, f"level {level}: nothing negotiated"
-            sock.sendall(_text_frame(_REDUNDANT, compressed=True))
-            _fin, rsv1, _op, payload = client.read_frame()
-            assert rsv1, f"level {level}: RSV1 not set"
-            assert _inflate(payload) == b"echo:" + _REDUNDANT.encode(), (
-                f"level {level}: payload did not round-trip"
-            )
-        finally:
-            sock.close()
+    production and nowhere in CI.
+
+    Parametrised rather than looped: several `serve()` calls in one
+    process is not a supported model (the Zig config globals are
+    set-once, so a second call clobbers the first), and a multi-server
+    test leaves daemon threads behind that make the conftest teardown
+    fixture wait its full 3 s for every later test in the module.
+    """
+    port = _free_port()
+    _serve(_lifespan_and_echo, port, ws_compression_level=level)
+    sock, client, head = _handshake(port)
+    try:
+        token = _head_value(head, b"sec-websocket-extensions")
+        assert token is not None, f"level {level}: nothing negotiated"
+        sock.sendall(_text_frame(_REDUNDANT, compressed=True))
+        _fin, rsv1, _op, payload = client.read_frame()
+        assert rsv1, f"level {level}: RSV1 not set"
+        assert _inflate(payload) == b"echo:" + _REDUNDANT.encode(), (
+            f"level {level}: payload did not round-trip"
+        )
+    finally:
+        sock.close()
