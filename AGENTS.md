@@ -159,6 +159,16 @@ release; nothing reads it, so a mismatch is pure confusion.
   directory named `saltare`. Opt out with `SALTARE_NO_OPTIMIZE=1`.
 - `socket()` calls use `SOCK_NONBLOCK | SOCK_CLOEXEC`, and `accept` goes through
   `accept4` when available. SIGPIPE is ignored via `signal()`.
-- Release: tag `v<X.Y.Z>` and push. `.github/workflows/release.yml` builds wheels with
-  cibuildwheel, tests them, and publishes to PyPI via Trusted Publishing. Only publish
-  when the whole suite is green.
+- Release: tag `v<X.Y.Z>` and push. CI is three files, and the split is the point:
+  - `ci.yml` — push to `main` and pull requests. Builds wheels with cibuildwheel and
+    tests them. **No publish job exists in this file.**
+  - `build-and-test.yml` — the actual matrix (`build_wheels`, `test_wheels`,
+    `test_macos`, `build_sdist`), `on: workflow_call`. Called by both of the others so
+    the matrix is defined once and cannot drift.
+  - `release.yml` — tag pushes only. Calls `build-and-test`, then publishes to PyPI via
+    Trusted Publishing.
+
+  A branch push therefore cannot reach PyPI *structurally*, not just via a condition.
+  Before this split the pipeline was tag-only, so a push to `main` ran nothing at all
+  and the macOS gate could not be exercised until the release was already committed to.
+  Only publish when the whole suite is green.

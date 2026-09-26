@@ -1,0 +1,34 @@
+name: CI
+
+# Push to main and pull requests: build the wheels and test them, and
+# nothing else. There is no publish job in this file, and no way to reach
+# one from here — see `release.yml`, which is tag-only.
+#
+# v1.12: the entire pipeline lived in `release.yml` behind a tag trigger, so
+# a push to main ran *nothing*. That made "validate before you tag"
+# impossible, and the macOS gate in particular could not be exercised until
+# the release was already committed to: `module.zig` and `server.zig` were
+# never compiled for Darwin on a runner, and the macOS-only platform test
+# never executed. This file is the fix.
+#
+# The build + test matrix is called from `build-and-test.yml` rather than
+# repeated, so `ci.yml` and `release.yml` cannot drift apart.
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+    paths:
+      - "build.zig"
+      - "build.zig.zon"
+      - "CMakeLists.txt"
+      - "pyproject.toml"
+      - "src/**"
+      - "scripts/**"
+      - "tests/**"
+      - ".github/workflows/**"
+
+jobs:
+  build-and-test:
+    uses: ./.github/workflows/build-and-test.yml
