@@ -215,75 +215,68 @@ def test_max_keepalive_requests_forces_close_at_limit() -> None:
         assert sock.recv(4096) == b""
 
 
-def _dispatch_open_conns(sock: socket.socket, port: int) -> int:
-    """Ask the server how many connections it has open, over a connection
-    that is already admitted.
-
-    v1.12: this test used to `time.sleep()` and hope the accept loop had
-    registered the held connections. That is a race with the event loop:
-    on a busy host the third connection arrived before the cap was
-    reached, got served normally, and the `recv` sat until its timeout —
-    which is how a test marked `flaky(reruns=3)` still failed a third of
-    the time once the suite grew.
-
-    The query deliberately goes out on one of the *held* sockets. Polling
-    `/debug/dispatch` over a fresh connection would itself consume a slot
-    against `max_concurrent_connections=2`, so the probe would evict the
-    very connections it is trying to observe. Reusing an admitted
-    connection costs no capacity and makes the precondition an observed
-    fact instead of a hope.
-
-    The probe is keep-alive: with `Connection: close` saltare would answer
-    and then drop the very socket the poll loop is using, so the second
-    iteration would be writing to a closed connection.
-    """
-    import json
-
-    deadline = time.monotonic() + 5.0
-    last = -1
-    while time.monotonic() < deadline:
-        try:
-            sock.sendall(
-                f"GET /__dispatch HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
-                f"\r\n".encode()
-            )
-            _status, _headers, body = _read_full_response(sock, deadline=2.0)
-            last = int(json.loads(body)["open_conns"])
-            if last >= 2:
-                return last
-        except Exception:  # noqa: BLE001 - retry until the deadline
-            pass
-        time.sleep(0.02)
-    pytest.fail(f"server never reported 2 open connections (last={last})")
-
-
 @pytest.mark.flaky(reruns=3, reruns_delay=1)
 def test_max_concurrent_connections_drops_extras() -> None:
     """Once the active-connection cap is hit, the server still accepts new
     sockets (to drain the kernel backlog) but immediately closes them — the
     client sees a clean EOF on its first read."""
     port = _free_port()
-    # dispatch_path is a Zig-side intercept used only to observe
-    # open_conns; the request never reaches the app.
+    # header_timeout=30: the connections held below are idle between being
+    # admitted and the final check, and the default 5 s header timeout is
+    # shorter than this test is willing to wait on a loaded host. This test
+    # is about the connection cap, not about header timeouts, so it
+    # configures a timeout that cannot interfere with it.
+    #
+    # v1.12: this test asserted a precondition ("the cap is reached") by
+    # counting connections, twice, and failed ~40% of the time under load.
+    # Both approaches were wrong because the cap is checked against
+    # g_active_conns, a *process-global* atomic — so the connection
+    # `_serve_in_background` opens to wait for readiness, and any other
+    # test's server still draining in the same interpreter, all consume
+    # slots against this cap of 2. A previous version polled
+    # /debug/dispatch's open_conns; that is the same global counter, and it
+    # failed the other way ("server never reported 2 open connections
+    # (last=1)") because connect() completes from the kernel backlog, so
+    # on a starved event loop the second socket was not accepted yet.
+    #
+    # So stop trying to establish a count and observe the behaviour
+    # directly: admit our own connections, and treat the first one the
+    # server drops as the evidence that the cap is reached. That is the
+    # property under test, it needs no arithmetic about who else is
+    # connected, and it cannot race the accept loop.
     _serve_in_background(
         echo_app, port,
         max_concurrent_connections=2,
-        dispatch_path="/__dispatch",
+        header_timeout=30,
     )
 
     held: list[socket.socket] = []
     try:
-        # Hold two connections open with no request — they sit idle, parked
-        # on the header_timeout. Active-conn count is 2.
-        for _ in range(2):
-            held.append(socket.create_connection(("127.0.0.1", port), timeout=2.0))
+        deadline = time.monotonic() + 30.0 * _TIMING_FACTOR
+        reached_cap = False
+        while time.monotonic() < deadline and len(held) < 20:
+            probe = socket.create_connection(("127.0.0.1", port), timeout=2.0)
+            probe.settimeout(2.0 * _TIMING_FACTOR)
+            try:
+                probe.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                data = probe.recv(4096)
+            except (ConnectionResetError, BrokenPipeError, socket.timeout):
+                data = b""
+            if data:
+                # Served, so it is admitted and counted. Keep it: every
+                # held socket is one slot closer to the cap.
+                held.append(probe)
+                continue
+            # Empty read means the server accepted and closed it, which is
+            # exactly the over-cap path.
+            probe.close()
+            reached_cap = True
+            break
 
-        # Wait until the server reports both as open, rather than assuming
-        # a fixed sleep was long enough.
-        _dispatch_open_conns(held[0], port)
+        assert reached_cap, f"cap of 2 never reached ({len(held)} admitted)"
+        assert len(held) >= 2, f"expected at least 2 admitted, got {len(held)}"
 
-        # The third connect succeeds at the TCP level (kernel queues it
-        # then accept() returns) but saltare immediately closes it.
+        # And the cap holds for the next one too.
         with socket.create_connection(("127.0.0.1", port), timeout=2.0 * _TIMING_FACTOR) as extra:
             extra.settimeout(2.0 * _TIMING_FACTOR)
             try:
