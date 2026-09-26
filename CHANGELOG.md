@@ -123,6 +123,59 @@ Neither would have been caught by the existing suite.
   which is the default, so the common path allocates nothing beyond the
   status line it already built.
 
+Three more, found by driving raw sockets at the wire format rather than
+through a client library — a library normalises the request line before
+it reaches the socket, which is exactly the code under test.
+
+- **Absolute-form request targets 404'd** (`http.zig`). RFC 7230 §5.3.2
+  lets a client send `GET http://example.com/path` and requires that an
+  origin server "MUST ignore the scheme and authority" and route on the
+  rest. The parser took the target verbatim, so the router matched the
+  literal string `http://example.com/path` and rejected it. Rare from
+  browsers, not exotic in front of a server: forward proxies address the
+  next hop this way and some health checkers and load balancers do too.
+
+  The parser addresses its slices by offset+len into the read buffer, so
+  the empty-path forms (`http://host`, `http://host?a=1`) have no `/` to
+  point at even though RFC 3986 §6.2.3 defines that path as `/`. That
+  substitution is recorded in a flag and applied by `target()`; the query
+  would have been dropped along with it, so `targetRemainder()` exposes
+  the bytes that followed the authority and both dispatch paths recover
+  the query from there. `absoluteFormPath()` only fires on a real scheme —
+  a slash *before* the `://` means the target is a path that happens to
+  contain one, which is legal and must survive intact.
+
+- **A 414/431 was reported to the client as a TCP reset** (`server.zig`).
+  A head too long to buffer is rejected while the peer is still sending
+  it, so the receive queue still holds the tail; closing there makes the
+  kernel emit RST instead of FIN, and the RST discards the response just
+  written. The client saw "connection reset" and learned nothing.
+  Reproduced deterministically — every head over the 16 KiB read buffer
+  reset, and so did a 70 KiB request line.
+
+  This is worth fixing *because* the head ceiling is tight: uvicorn has
+  no default head limit and answered 200 to both of those requests, so
+  traffic that works there lands here and used to report a reset rather
+  than the status naming the actual problem. The drain is bounded twice
+  over, by a byte budget and by a wall-clock timer, because a byte budget
+  alone does not stop a slow trickle. Cost when off is one word per
+  connection and nothing per request, and rejection is keyed off the
+  existing `response_status` rather than a new flag.
+
+  One visible consequence: an over-long *target* now reports 431, not
+  414. 414 is only reachable once the head parses, and a target too long
+  to buffer never gets that far.
+
+- **Exceeding `max_headers` answered 400, not 431** (`http.zig`). The
+  field-count limit and the head *byte* ceiling returned the same
+  `HeadersTooLarge` error, and both fell into the catch-all 400 arm — so
+  the same underlying condition got two different status codes depending
+  on which limit tripped. RFC 6585 §5 gives it 431, and the comment on
+  `max_headers` already promised 431 while the code returned 400. Split
+  into a `TooManyHeaders` error; the re-parse sites are deliberately left
+  alone, since they re-parse a head that already passed the first parse
+  and the arm would be unreachable.
+
 ### Test debt paid
 
 61 new tests, all for features that were documented and shipped but
@@ -174,8 +227,13 @@ because it looks like coverage.
 - **Platform** (7 tests). The platform gate itself, and the documented
   per-platform degradations, so "works everywhere" is not claimed for
   something that quietly no-ops.
+- **HTTP/1.1 request-target forms** (19 tests, plus 11 Zig unit tests for
+  the parser). The wire-level surface a client library hides: absolute-form
+  and its empty-path variants, asterisk-form, a path segment containing
+  `://`, the exact `max_headers` boundary from both sides, and the three
+  status codes an over-long head can produce. Raw sockets throughout.
 
-Suite: **467 passing**, 7 skipped, from 368.
+Suite: **506 passing**, 7 skipped, from 368.
 
 ### Where the RAM actually goes — and the one lever left
 
