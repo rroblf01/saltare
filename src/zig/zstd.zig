@@ -46,9 +46,14 @@ pub const ZSTD_c_compressionLevel: c_int = 100;
 var funcs: ?Funcs = null;
 var lib_handle: ?*anyopaque = null;
 
+// v1.12: the `.dylib` names are for macOS (install name rather than
+// soname). zstd is not in the macOS base system, so without these
+// `--response-zstd` is a no-op there and `run()` warns at startup.
 const SONAMES = [_][:0]const u8{
     "libzstd.so.1",
     "libzstd.so",
+    "libzstd.1.dylib",
+    "libzstd.dylib",
 };
 
 pub const DEFAULT_LEVEL: c_int = 3; // zstd's "fast" sweet spot for HTTP

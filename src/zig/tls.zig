@@ -122,10 +122,23 @@ var libssl_handle: ?*anyopaque = null;
 /// SONAME variants we try in order. Modern systems (Debian/Ubuntu 22+,
 /// RHEL 9+, manylinux_2_28) ship libssl.so.3; older long-tail keeps
 /// .so.1.1 around. Stop at the first one that loads.
+///
+/// v1.12: the `.dylib` names are for macOS, where the shared library is
+/// reached by install name rather than soname. Homebrew's openssl@3
+/// installs `libssl.3.dylib` next to a `libssl.dylib` symlink, and the
+/// system LibreSSL/OpenSSL on older macOS is `libssl.dylib` too. Listing
+/// the versioned name first matters for the same reason `.so.3` precedes
+/// `.so.1.1`: a dlopen by bare name can otherwise pick up a stale copy
+/// from the default search path. Without these entries TLS silently
+/// no-ops on macOS — `newContext` returns `LibSslNotFound` and the
+/// server starts in plain-HTTP mode with only a stderr warning.
 const SONAMES = [_][:0]const u8{
     "libssl.so.3",
     "libssl.so.1.1",
     "libssl.so", // some distros ship the unversioned dev symlink
+    "libssl.3.dylib", // macOS + Homebrew openssl@3
+    "libssl.dylib", // macOS system / unversioned symlink
+    "libssl.1.1.dylib",
 };
 
 fn loadFuncs() bool {

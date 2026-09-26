@@ -23,6 +23,12 @@ const ws = @import("ws.zig");
 const timer = @import("timer.zig");
 const h2 = @import("h2.zig");
 const h2_response = @import("h2_response.zig");
+// v1.12 (macOS): Darwin-only process stats, reached exclusively from inside
+// `comptime builtin.os.tag == .macos` branches. The import itself is free on
+// Linux — Zig analyzes container decls lazily, so this module's
+// mach/libproc cimport is never touched there, which is what keeps those
+// headers out of the Linux build.
+const procstats_darwin = @import("procstats_darwin.zig");
 
 const c = @cImport({
     // sys/types.h first so musl's `bits/types/struct_timespec.h` /
@@ -35,7 +41,10 @@ const c = @cImport({
     @cInclude("netinet/tcp.h");
     @cInclude("sys/un.h");
     @cInclude("sys/resource.h");
-    @cInclude("sys/sendfile.h");
+    // v1.12: sys/sendfile.h is deliberately NOT cimport'd. Linux has it,
+    // Darwin does not ship it in the form Zig's bundled libc expects, and
+    // the two `sendfile` calls have incompatible signatures anyway (see
+    // sendFileChunk below). Both are declared by hand instead.
     @cInclude("sys/stat.h");
     @cInclude("unistd.h");
     @cInclude("signal.h");
@@ -45,16 +54,128 @@ const c = @cImport({
     @cInclude("dirent.h");
 });
 
+// sendfile(2), declared per platform. The signatures are incompatible:
+//
+//   Linux:   sendfile(out_fd, in_fd, off_t *offset, size_t count)
+//   Darwin:  sendfile(fd, s, fd, off_t l, size_t n, sf_hdtr *hdtr, int flags)
+//
+// and the offset handling differs too, which is the part that actually
+// matters. Linux takes a *pointer* and advances it for you. Darwin takes
+// the offset **by value** and only honours it on the first call of a
+// stream; afterwards the kernel continues from where it left off, so the
+// caller has to keep its own cursor. sendFileChunk normalises both into
+// "give me the next chunk from this offset" so the caller's loop is
+// identical on either platform.
+extern fn sendfile(out_fd: c_int, in_fd: c_int, offset: *c.off_t, count: usize) isize;
+
+/// Darwin's `struct sf_hdtr` is the scatter/gather descriptor; NULL means
+/// "no header/trailer", which is all we need. Declared as opaque so
+/// sys/sendfile.h stays out of the cimport.
+const SfHdtr = opaque {};
+
+extern fn sendfile_darwin(
+    fd: c_int,
+    s: c_int,
+    fd2: c_int,
+    l: c.off_t,
+    n: usize,
+    hdtr: ?*SfHdtr,
+    flags: c_int,
+) isize;
+
+/// Copy up to `len` bytes from `file_fd` at `offset` to `sock_fd`.
+/// Returns the byte count, or a negative errno (as the raw syscalls do).
+inline fn sendFileChunk(sock_fd: c_int, file_fd: c_int, offset: c.off_t, len: usize) isize {
+    if (comptime builtin.os.tag == .linux) {
+        // Linux advances `off` itself, but the caller keeps its own
+        // cursor, so hand it a scratch copy and let the caller do the
+        // arithmetic. That keeps one loop for both platforms.
+        var off = offset;
+        return sendfile(sock_fd, file_fd, &off, len);
+    }
+    return sendfile_darwin(file_fd, sock_fd, file_fd, offset, len, null, 0);
+}
+
 // accept4 is a Linux/glibc extension. Defining _GNU_SOURCE in the @cImport
 // would expose it but also pulls in glibc's `__CONST_SOCKADDR_ARG`
 // transparent-union magic, which breaks `bind()` translation. Declaring
 // the prototype ourselves keeps the rest of the cimport clean.
+//
+// v1.12 (macOS): Darwin has no accept4. The declaration is unreferenced
+// on Darwin — `acceptOne` compiles the accept4 call only on Linux, and an
+// `extern fn` that is never called emits no relocation — so it is safe to
+// leave in place. Darwin falls back to plain accept(2) plus the two
+// fcntl(2) calls accept4 would have folded in: two syscalls per accepted
+// connection instead of one, and a brief window in blocking mode between
+// accept and fcntl. Neither matters here, because the accept loop is
+// single-threaded and the descriptors are marked CLOEXEC before anything
+// can fork or exec.
 extern fn accept4(
     sockfd: c_int,
     addr: ?*anyopaque,
     addrlen: ?*c_uint,
     flags: c_int,
 ) c_int;
+
+/// Set O_NONBLOCK and FD_CLOEXEC on `fd`. Returns false if either fcntl
+/// fails, in which case the caller must close the descriptor.
+fn setNonBlockCloexec(fd: c_int) bool {
+    // fcntl is variadic; a bare `0` literal is comptime_float-ish to Zig and
+    // has to be cast to the concrete argument type.
+    const flags = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
+    if (flags < 0 or c.fcntl(fd, c.F_SETFL, flags | c.O_NONBLOCK) < 0) return false;
+    const fd_flags = c.fcntl(fd, c.F_GETFD, @as(c_int, 0));
+    if (fd_flags < 0 or c.fcntl(fd, c.F_SETFD, fd_flags | c.FD_CLOEXEC) < 0) return false;
+    return true;
+}
+
+/// socket(2), non-blocking and close-on-exec.
+///
+/// v1.12 (macOS): SOCK_NONBLOCK and SOCK_CLOEXEC are Linux extensions to
+/// socket(2) and Darwin does not define either, so passing them there is
+/// a compile error, not a runtime one. Darwin gets the same end state via
+/// the two fcntl(2) calls those flags would have saved. Everywhere in this
+/// file that needs a non-blocking, non-inheriting descriptor goes through
+/// here rather than calling c.socket directly.
+fn socketNonBlock(domain: c_int, sock_type: c_int, protocol: c_int) c_int {
+    if (comptime builtin.os.tag == .linux) {
+        return c.socket(domain, sock_type | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, protocol);
+    }
+    const fd = c.socket(domain, sock_type, protocol);
+    if (fd < 0) return fd;
+    if (!setNonBlockCloexec(fd)) {
+        _ = c.close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/// Accept one connection, non-blocking and close-on-exec.
+inline fn acceptOne(
+    listen_fd: c_int,
+    addr: *anyopaque,
+    addr_len: *c_uint,
+) c_int {
+    if (comptime builtin.os.tag == .linux) {
+        return accept4(listen_fd, addr, addr_len, c.SOCK_NONBLOCK | c.SOCK_CLOEXEC);
+    }
+    // Darwin declares accept(2) with a concrete `struct sockaddr *`
+    // rather than the `void *` accept4 takes, so cast to whatever the
+    // local cimport produced. The caller always passes a
+    // `struct sockaddr_storage`, which is the documented requirement
+    // for accept(2) anyway.
+    const fd = c.accept(listen_fd, @ptrCast(@alignCast(addr)), addr_len);
+    if (fd < 0) return fd;
+    // Best-effort in the same spirit as the setsockopt calls below: a
+    // failure here would leak the descriptor, so close it and report
+    // failure rather than hand back a socket that is blocking or
+    // inheritable across exec.
+    if (!setNonBlockCloexec(fd)) {
+        _ = c.close(fd);
+        return -1;
+    }
+    return fd;
+}
 
 // glibc-only. `extern fn` would fail to resolve at .so load time on
 // musl (musllinux wheel target), so we look up the symbol via
@@ -1076,10 +1197,16 @@ fn readCgroupMemoryLimitBytes() ?u64 {
 }
 
 /// Read VmRSS (resident set) from `/proc/self/status`. Best-effort: any
-/// parse failure returns 0 so the metric still renders. Linux-only; on
-/// macOS the comptime branch in `serveMetrics` skips it. Uses libc
+/// parse failure returns 0 so the metric still renders. Uses libc
 /// directly because Zig 0.16's `std.posix.open` is absent.
+///
+/// v1.12 (macOS): delegates to `task_info`, so
+/// `process_resident_memory_bytes` reports a real number there instead of
+/// the hard 0 it used to.
 fn readVmRssBytes() u64 {
+    if (comptime builtin.os.tag == .macos) {
+        return procstats_darwin.rssBytes();
+    }
     const fd = c.open("/proc/self/status", c.O_RDONLY);
     if (fd < 0) return 0;
     defer _ = c.close(fd);
@@ -1097,10 +1224,14 @@ fn readVmRssBytes() u64 {
     return kib * 1024;
 }
 
-/// Count open file descriptors by listing `/proc/self/fd`. Linux-only.
-/// Best-effort: returns 0 on any error. Used by the `/metrics`
+/// Count open file descriptors by listing `/proc/self/fd` on Linux, or
+/// `proc_pidinfo(PROC_PIDLISTFDS)` on macOS (v1.12 — it used to report 0
+/// there). Best-effort: returns 0 on any error. Used by the `/metrics`
 /// `process_open_fds` gauge.
 fn readOpenFds() u64 {
+    if (comptime builtin.os.tag == .macos) {
+        return procstats_darwin.openFds();
+    }
     if (comptime builtin.os.tag != .linux) return 0;
     const dir = c.opendir("/proc/self/fd") orelse return 0;
     defer _ = c.closedir(dir);
@@ -1118,8 +1249,14 @@ fn readOpenFds() u64 {
 /// CPU time consumed (user + kernel) since process start, in seconds.
 /// Reads `/proc/self/stat` field 14 (utime) + 15 (stime), both in
 /// clock ticks. `_SC_CLK_TCK` (typically 100) converts to seconds.
-/// Linux-only.
+///
+/// v1.12 (macOS): there is no /proc, so this uses `getrusage(RUSAGE_SELF)`
+/// there. Same scope (process-wide) and same units, so the series means
+/// the same thing on both platforms.
 fn readCpuSeconds() f64 {
+    if (comptime builtin.os.tag == .macos) {
+        return procstats_darwin.cpuSeconds();
+    }
     if (comptime builtin.os.tag != .linux) return 0.0;
     const fd = c.open("/proc/self/stat", c.O_RDONLY);
     if (fd < 0) return 0.0;
@@ -1215,7 +1352,7 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
         \\# HELP saltare_bytes_received_total Bytes read from client sockets.
         \\# TYPE saltare_bytes_received_total counter
         \\saltare_bytes_received_total {d}
-        \\# HELP saltare_process_resident_memory_bytes RSS of the worker, from /proc/self/status (Linux only; 0 elsewhere).
+        \\# HELP saltare_process_resident_memory_bytes RSS of the worker, from /proc/self/status (Linux) or proc_pidinfo (macOS).
         \\# TYPE saltare_process_resident_memory_bytes gauge
         \\saltare_process_resident_memory_bytes {d}
         \\# HELP process_open_fds Open file descriptors. Prom client convention.
@@ -1603,7 +1740,7 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
     var offset: c.off_t = 0;
     var remaining: usize = @intCast(size);
     while (remaining > 0) {
-        const sent = c.sendfile(conn.fd, fd, &offset, remaining);
+        const sent = sendFileChunk(conn.fd, fd, offset, remaining);
         if (sent < 0) {
             const err = std.posix.errno(sent);
             // EINTR: a signal hit between syscall entry and any data
@@ -1628,6 +1765,12 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
             return;
         }
         if (sent == 0) break;
+        // v1.12: the cursor is ours on both platforms. Linux's sendfile
+        // advances the pointer it was given, but we hand it a scratch copy
+        // (see sendFileChunk), and Darwin only honours the offset on the
+        // first call of a stream — so advancing here is what keeps the two
+        // behaving identically across loop iterations.
+        offset += @intCast(sent);
         remaining -= @intCast(sent);
     }
     _ = c.close(fd);
@@ -2378,11 +2521,7 @@ fn bindTcpSocket(host: []const u8, port: u16) !c_int {
     if (isIpv6(host)) return bindTcpSocketV6(host, port);
 
     const addr = try parseIpv4(host, port);
-    const fd = c.socket(
-        c.AF_INET,
-        c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC,
-        c.IPPROTO_TCP,
-    );
+    const fd = socketNonBlock(c.AF_INET, c.SOCK_STREAM, c.IPPROTO_TCP);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = c.close(fd);
 
@@ -2403,11 +2542,7 @@ fn bindTcpSocket(host: []const u8, port: u16) !c_int {
 
 fn bindTcpSocketV6(host: []const u8, port: u16) !c_int {
     const addr = try parseIpv6(host, port);
-    const fd = c.socket(
-        c.AF_INET6,
-        c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC,
-        c.IPPROTO_TCP,
-    );
+    const fd = socketNonBlock(c.AF_INET6, c.SOCK_STREAM, c.IPPROTO_TCP);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = c.close(fd);
 
@@ -2441,7 +2576,7 @@ fn bindUnixSocket(path: []const u8) !c_int {
     if (path.len == 0 or path.len >= @sizeOf(@TypeOf(@as(c.struct_sockaddr_un, undefined).sun_path))) {
         return error.InvalidAddress;
     }
-    const fd = c.socket(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_NONBLOCK | c.SOCK_CLOEXEC, 0);
+    const fd = socketNonBlock(c.AF_UNIX, c.SOCK_STREAM, 0);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = c.close(fd);
 
@@ -2874,11 +3009,10 @@ fn acceptAll(
     while (true) {
         var addr_storage: c.struct_sockaddr_storage = undefined;
         var addr_len: c_uint = @sizeOf(c.struct_sockaddr_storage);
-        const client = accept4(
+        const client = acceptOne(
             listen_fd,
             @ptrCast(&addr_storage),
             &addr_len,
-            c.SOCK_NONBLOCK | c.SOCK_CLOEXEC,
         );
         if (client < 0) return; // EAGAIN: drained the backlog
 
@@ -2945,9 +3079,21 @@ fn acceptAll(
         // explicitly opted into. Kernel defaults (7200 s idle, 75 s
         // interval, 9 probes) are usually fine for LAN traffic but too
         // generous for mobile / NAT-heavy fronts.
+        //
+        // v1.12 (macOS): the idle knob has a different name there.
+        // Linux calls it TCP_KEEPIDLE; Darwin has never had it and spells
+        // the same idea TCP_KEEPALIVE, while TCP_KEEPINTVL and
+        // TCP_KEEPCNT keep their names. TCP_KEEPALIVE collides with the
+        // SO_KEEPALIVE socket option above only in name — the option
+        // *level* differs (IPPROTO_TCP vs SOL_SOCKET), so there is no
+        // ambiguity at the setsockopt call.
         if (g_limits.tcp_keepidle > 0) {
             var v = g_limits.tcp_keepidle;
-            _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPIDLE, @ptrCast(&v), @sizeOf(c_int));
+            if (comptime builtin.os.tag == .linux) {
+                _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPIDLE, @ptrCast(&v), @sizeOf(c_int));
+            } else {
+                _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPALIVE, @ptrCast(&v), @sizeOf(c_int));
+            }
         }
         if (g_limits.tcp_keepintvl > 0) {
             var v = g_limits.tcp_keepintvl;
@@ -2957,7 +3103,13 @@ fn acceptAll(
             var v = g_limits.tcp_keepcnt;
             _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_KEEPCNT, @ptrCast(&v), @sizeOf(c_int));
         }
-        if (g_limits.tcp_user_timeout_ms > 0) {
+        // v1.12 (macOS): TCP_USER_TIMEOUT is a Linux extension with no
+        // portable equivalent — Darwin has no per-socket unacknowledged-
+        // data deadline, and `TCP_USER_TIMEOUT` there is not available to
+        // third-party sockets. Silently skipped rather than warned about:
+        // it is an opt-in tuning knob, and the keepalive cadence above
+        // already bounds how long a dead peer is held open.
+        if (g_limits.tcp_user_timeout_ms > 0 and comptime builtin.os.tag == .linux) {
             var v: c_uint = @intCast(g_limits.tcp_user_timeout_ms);
             _ = c.setsockopt(client, c.IPPROTO_TCP, c.TCP_USER_TIMEOUT, @ptrCast(&v), @sizeOf(c_uint));
         }

@@ -1,102 +1,38 @@
-// Minimal epoll wrapper for the v0.4 non-blocking server.
+// Event-loop backend selection.
 //
-// Only Linux is supported in this milestone. macOS (kqueue) lands in a
-// follow-up; cibuildwheel jobs for macOS will fail at compile time until
-// then, which is a deliberate, visible TODO rather than silent breakage.
+// v1.12: the epoll implementation moved to eventloop_epoll.zig and a
+// kqueue one was added in eventloop_kqueue.zig. This module picks one at
+// comptime and re-exports it, which has two consequences that matter:
+//
+//   - server.zig is unchanged. It has always imported "eventloop.zig" and
+//     used only `Loop`, `Loop.init`, and the add/modify/remove/wait/deinit
+//     methods plus the `runtime` field. Because the re-export is a
+//     comptime alias, the struct it gets is literally the backend's own
+//     type: same layout, same field offsets, no vtable, no tag check.
+//
+//   - The hot path pays nothing for supporting two platforms. The OS is
+//     fixed when the extension is compiled, so there is no runtime
+//     dispatch anywhere; the alternative — one `Loop` with a union and a
+//     branch in every method — would have cost a predictable branch on
+//     every event, against a project whose stated goal is minimum RAM and
+//     maximum req/sec.
+//
+// Previously this file held the epoll code directly and carried a
+// `@compileError` for every non-Linux target, which is why macOS wheels
+// were impossible: the server could not be built there at all.
 
-const std = @import("std");
 const builtin = @import("builtin");
 
-comptime {
-    if (builtin.os.tag != .linux) {
-        @compileError(
-            "saltare's v0.4 event loop currently supports Linux only. " ++
-                "macOS (kqueue) is on the roadmap; until then, build inside " ++
-                "the Docker pipeline.",
-        );
-    }
-}
-
-const c = @cImport({
-    @cInclude("sys/epoll.h");
-    @cInclude("unistd.h");
-});
-
-pub const Event = struct {
-    /// User pointer registered when this fd was added (or null for the listener).
-    data: ?*anyopaque,
-    readable: bool,
-    writable: bool,
-    /// Hangup or error — caller should close and free.
-    closed: bool,
+const backend = switch (builtin.os.tag) {
+    .linux => @import("eventloop_epoll.zig"),
+    .macos => @import("eventloop_kqueue.zig"),
+    else => @compileError(
+        "saltare supports Linux (epoll) and macOS (kqueue). " ++
+            "Other targets have no event-loop backend; build inside the " ++
+            "Docker pipeline or add one.",
+    ),
 };
 
-// 64 keeps the per-wait stack footprint low (~1 KiB raw + 1 KiB cooked).
-// Saturating it just means epoll_wait returns sooner — the next iteration
-// drains the rest. Picked over 128 after the v1.2.2 audit found the larger
-// array spent most iterations less than half full while still costing
-// ~10 KiB stack per loop step.
-const max_events_per_wait = 64;
-
-pub const Loop = struct {
-    epfd: c_int,
-    raw_events: [max_events_per_wait]c.struct_epoll_event = undefined,
-    out_events: [max_events_per_wait]Event = undefined,
-    // v1.11 PEP 684 groundwork: opaque pointer to the owning serve()'s
-    // per-interpreter `Runtime` (server.zig). Held as `?*anyopaque` to avoid
-    // a circular import on the Connection type. Set once right after init.
-    runtime: ?*anyopaque = null,
-
-    pub fn init() !Loop {
-        const fd = c.epoll_create1(c.EPOLL_CLOEXEC);
-        if (fd < 0) return error.EpollCreateFailed;
-        return Loop{ .epfd = fd };
-    }
-
-    pub fn deinit(self: *Loop) void {
-        _ = c.close(self.epfd);
-    }
-
-    pub fn add(self: *Loop, fd: c_int, data: ?*anyopaque, want_read: bool, want_write: bool) !void {
-        var ev: c.struct_epoll_event = std.mem.zeroes(c.struct_epoll_event);
-        if (want_read) ev.events |= c.EPOLLIN;
-        if (want_write) ev.events |= c.EPOLLOUT;
-        ev.events |= c.EPOLLRDHUP;
-        ev.data.ptr = data;
-        if (c.epoll_ctl(self.epfd, c.EPOLL_CTL_ADD, fd, &ev) != 0) {
-            return error.EpollCtlFailed;
-        }
-    }
-
-    pub fn modify(self: *Loop, fd: c_int, data: ?*anyopaque, want_read: bool, want_write: bool) !void {
-        var ev: c.struct_epoll_event = std.mem.zeroes(c.struct_epoll_event);
-        if (want_read) ev.events |= c.EPOLLIN;
-        if (want_write) ev.events |= c.EPOLLOUT;
-        ev.events |= c.EPOLLRDHUP;
-        ev.data.ptr = data;
-        if (c.epoll_ctl(self.epfd, c.EPOLL_CTL_MOD, fd, &ev) != 0) {
-            return error.EpollCtlFailed;
-        }
-    }
-
-    pub fn remove(self: *Loop, fd: c_int) void {
-        // Best-effort: errors on remove are typically benign (already gone).
-        _ = c.epoll_ctl(self.epfd, c.EPOLL_CTL_DEL, fd, null);
-    }
-
-    pub fn wait(self: *Loop, timeout_ms: c_int) []const Event {
-        const n = c.epoll_wait(self.epfd, &self.raw_events, max_events_per_wait, timeout_ms);
-        if (n <= 0) return self.out_events[0..0]; // EINTR or timeout
-
-        const count: usize = @intCast(n);
-        for (self.raw_events[0..count], 0..) |raw, i| {
-            self.out_events[i] = .{
-                .data = raw.data.ptr,
-                .readable = (raw.events & c.EPOLLIN) != 0,
-                .writable = (raw.events & c.EPOLLOUT) != 0,
-                .closed = (raw.events & (c.EPOLLRDHUP | c.EPOLLHUP | c.EPOLLERR)) != 0,
-            };
-        }
-        return self.out_events[0..count];
-    }
-};
+pub const Event = backend.Event;
+pub const Loop = backend.Loop;
+pub const max_events_per_wait = backend.max_events_per_wait;

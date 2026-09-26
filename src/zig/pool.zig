@@ -137,22 +137,36 @@ pub const Pool = struct {
         }
     }
 
-    /// Walk the free lists and call `madvise(MADV_DONTNEED)` on every
-    /// buffer that has been idle longer than `IDLE_ADVISE_NS`. The page-
-    /// aligned data block is released to the kernel; subsequent re-use
-    /// costs a soft fault per page touched (microseconds). No-op outside
-    /// Linux.
+    /// Walk the free lists and `madvise` every buffer that has been idle
+    /// longer than `IDLE_ADVISE_NS`. The page-aligned data block is
+    /// released to the kernel; subsequent re-use costs a soft fault per
+    /// page touched (microseconds).
+    ///
+    /// v1.12 (macOS): the advice differs per platform. Linux has
+    /// MADV_DONTNEED, which drops the pages immediately. Darwin has no
+    /// MADV_DONTNEED for this purpose — its MADV_DONTNEED is not
+    /// equivalent — and MADV_FREE is the one that actually returns pages,
+    /// lazily, which is fine here since a buffer being swept is idle by
+    /// definition. The sweep used to be a no-op off Linux, which left
+    /// long-idle pool buffers holding their pages on macOS and undid part
+    /// of the reason they exist.
     pub fn sweepIdle(self: *Pool, now_ns: i64) void {
-        if (comptime builtin.os.tag != .linux) return;
+        if (builtin.os.tag != .linux and builtin.os.tag != .macos) return;
         adviseList(self.small_free, now_ns);
         adviseList(self.large_free, now_ns);
     }
+
+    /// The per-platform "give these pages back" advice.
+    const REclaimAdvice = switch (builtin.os.tag) {
+        .macos => c.MADV_FREE,
+        else => c.MADV_DONTNEED,
+    };
 
     fn adviseList(head: ?*Buffer, now_ns: i64) void {
         var node = head;
         while (node) |b| {
             if (!b.advised and b.released_at_ns != 0 and (now_ns - b.released_at_ns) > IDLE_ADVISE_NS) {
-                _ = c.madvise(b.data.ptr, b.data.len, c.MADV_DONTNEED);
+                _ = c.madvise(b.data.ptr, b.data.len, REclaimAdvice);
                 b.advised = true;
             }
             node = b.next;

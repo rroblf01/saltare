@@ -23,20 +23,46 @@ const c = @cImport({
     @cInclude("unistd.h");
     @cInclude("sys/types.h");
     @cInclude("sys/wait.h");
-    @cInclude("sys/prctl.h");
+    // v1.12: sys/prctl.h is deliberately NOT cimport'd — it does not exist
+    // on Darwin, and a top-level @cImport is evaluated unconditionally, so
+    // including it made macOS builds fail before any of our own code ran.
+    // prctl is declared by hand below instead, the same way server.zig
+    // declares accept4 and sendfile.
     @cInclude("signal.h");
 });
+
+// prctl(2), declared by hand. The prototype and the two option numbers we
+// use are stable Linux ABI (asm-generic/prctl.h), so hard-coding them is
+// safe and keeps the cimport portable. Like accept4, an `extern fn` that is
+// never called emits no relocation, so leaving it in place for non-Linux
+// targets is harmless — every call site is behind a comptime OS check.
+extern fn prctl(
+    option: c_int,
+    arg2: c_ulong,
+    arg3: c_ulong,
+    arg4: c_ulong,
+    arg5: c_ulong,
+) c_int;
+
+const PR_SET_PDEATHSIG: c_int = 1;
+const PR_SET_NAME: c_int = 15;
 
 /// Set the process short-name visible in `ps -e -o comm`, `top`,
 /// `htop`. Linux-only (glibc `prctl(PR_SET_NAME)`); silently no-ops
 /// elsewhere. Truncated to 15 chars. v1.3 cosmetic helper for ops.
+///
+/// v1.12 (macOS): Darwin has no prctl and no equivalent for PR_SET_NAME.
+/// The idiomatic substitute is setting the process name via
+/// `setprogname(3)`, which only affects argv[0]-adjacent reporting and is
+/// not worth a dependency for a cosmetic `ps` label, so this stays a
+/// no-op there.
 fn setProcName(name: []const u8) void {
     if (comptime builtin.os.tag != .linux) return;
     var buf: [16]u8 = std.mem.zeroes([16]u8);
     const n = @min(name.len, 15);
     @memcpy(buf[0..n], name[0..n]);
-    _ = c.prctl(
-        c.PR_SET_NAME,
+    _ = prctl(
+        PR_SET_NAME,
         @as(c_ulong, @intFromPtr(&buf)),
         @as(c_ulong, 0),
         @as(c_ulong, 0),
@@ -551,8 +577,19 @@ fn runMultiWorker(
             // away unexpectedly (so an SIGKILL'd master doesn't leave
             // orphan workers behind, which would then take the full
             // shutdown_timeout to notice the world ended).
+            //
+            // v1.12 (macOS): PR_SET_PDEATHSIG has no Darwin equivalent.
+            // The two idiomatic substitutes are a kqueue EVFILT_PROC
+            // watch on the parent pid, or a Dispatch Source — both need
+            // the supervisor (`master.zig`) to own a kqueue descriptor and
+            // poll it, which is a larger change than this knob justifies.
+            // Without it a SIGKILL'd master leaves workers that keep
+            // serving until their own idle timeouts fire, which is the
+            // same exposure a single-worker deployment already has when it
+            // is SIGKILLed. Documented rather than silently different:
+            // see the multi-worker section of the README.
             if (comptime builtin.os.tag == .linux) {
-                _ = c.prctl(c.PR_SET_PDEATHSIG, @as(c_ulong, c.SIGTERM), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
+                _ = prctl(PR_SET_PDEATHSIG, @as(c_ulong, c.SIGTERM), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
             }
             // Operational ergonomics: rename in `ps` / `top` so
             // operators see `saltare:wkr0` instead of the full

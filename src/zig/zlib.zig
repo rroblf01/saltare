@@ -58,9 +58,15 @@ const Funcs = struct {
 var funcs: ?Funcs = null;
 var libz_handle: ?*anyopaque = null;
 
+/// v1.12: the `.dylib` names are for macOS, where zlib ships as
+/// `libz.dylib` (both the system copy and Homebrew's). Without them
+/// `loadFuncs` fails on macOS and `--response-gzip` /
+/// `--request-decompression` become silent no-ops.
 const SONAMES = [_][:0]const u8{
     "libz.so.1",
     "libz.so",
+    "libz.1.dylib",
+    "libz.dylib",
 };
 
 fn loadFuncs() bool {

@@ -30,13 +30,24 @@ var funcs: ?Funcs = null;
 var enc_handle: ?*anyopaque = null;
 var dec_handle: ?*anyopaque = null;
 
+// v1.12: the `.dylib` names are for macOS, where the shared library is
+// reached by install name. Homebrew's brotli installs
+// `libbrotlienc.1.dylib` with a `libbrotlienc.dylib` symlink. Brotli is
+// not in the macOS base system at all, so without these entries
+// `--response-brotli` is a no-op there and `run()` warns at startup
+// rather than failing — which is the correct behaviour for a codec that
+// is simply absent.
 const ENC_SONAMES = [_][:0]const u8{
     "libbrotlienc.so.1",
     "libbrotlienc.so",
+    "libbrotlienc.1.dylib",
+    "libbrotlienc.dylib",
 };
 const DEC_SONAMES = [_][:0]const u8{
     "libbrotlidec.so.1",
     "libbrotlidec.so",
+    "libbrotlidec.1.dylib",
+    "libbrotlidec.dylib",
 };
 
 // Brotli quality 0..11; 4-6 is the gzip-equivalent sweet spot for
