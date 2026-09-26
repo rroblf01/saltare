@@ -232,8 +232,107 @@ because it looks like coverage.
   and its empty-path variants, asterisk-form, a path segment containing
   `://`, the exact `max_headers` boundary from both sides, and the three
   status codes an over-long head can produce. Raw sockets throughout.
+- **WebSockets** (19 tests). Ten through FastAPI and Starlette's own
+  `WebSocket` (payload types, handshake surface, subprotocols, the three
+  disconnect codes, concurrency, fragmentation across the buffer
+  boundary), plus the four that were `pass` stubs skipped since v0.10,
+  and five pre-existing ones in `test_ws_frame_sizes.py`.
 
-Suite: **506 passing**, 7 skipped, from 368.
+Suite: **521 passing**, 2 skipped, from 368.
+
+### WebSocket fragmentation corrupted the heap on every fragmented message
+
+The most serious bug found in this cycle, and it was hiding behind a
+passing test suite. **Any** fragmented WebSocket message aborted the
+process: glibc reported `double free or corruption (!prev)` or
+`corrupted size vs. prev_size while consolidating`. Not a stress case —
+three 1 KB fragments was enough, which is an ordinary streamed upload.
+
+The final continuation detached the reassembly buffer like this:
+
+```zig
+wsDeliverToApp(loop, conn, assembled_op, assembled, rsv1);
+conn.allocator.free(conn.data.websocket.frag_buf.?);
+```
+
+but `wsDeliverToApp` can destroy the connection — a Python-side error
+routes through `wsTeardown`, and `destroy()` frees `frag_buf` and then
+the `Connection` itself. So the `free()` hit a block that was already
+freed, and read the allocator off a `Connection` that had been freed
+too. Instrumenting both frees confirmed it: the same pointer logged
+twice, with `destroy()` logging in between.
+
+The fix takes the allocator as a local and nulls the field before
+delivering, so exactly one free happens whichever way the call goes —
+`destroy()` sees `frag_buf == null` and leaves it alone, and the local
+allocator is still valid after the `Connection` is gone.
+
+**Why the existing tests missed it** is the interesting part.
+`test_ws_frame_sizes.py` does exercise fragmentation, and passed
+throughout. Its raw ASGI handler loops forever on `receive()` and
+returns only on disconnect, so the coroutine never completes and
+`wsDeliverToApp` never tears anything down — the double-free path is
+never entered. Any handler that *finishes* after replying hits it,
+which is the normal shape of a real WebSocket endpoint and of every
+FastAPI one. The coverage gap and the bug were the same gap.
+
+### The app now learns *why* a WebSocket closed
+
+`destroy()` told the application `websocket.disconnect` with code 1006 —
+"abnormal closure" — unconditionally, even when saltare had just sent a
+close frame itself. So a client that received 1009 (RFC 6455 §7.4.1,
+"message too big", added in v1.12) left the handler with a code
+indistinguishable from a dead network. The side that can act on the
+information got it; the side that would use it to log and clean up did
+not.
+
+`WsState` now records the code when the close frame is built, and
+`destroy()` passes it through. Falling back to 1006 when nothing was
+sent keeps peer RST and idle teardown reporting an abnormal closure,
+which is what they are. One `u16` in a struct HTTP connections never
+allocate.
+
+### The v0.10 WebSocket teardown skips are gone
+
+Four of the five WebSocket tests in `tests/test_websocket.py` were `pass`
+stubs skipped since v0.10, on the claim that several WebSocket tests in
+one pytest process crash during teardown. **That no longer reproduces.**
+The suite is green with them enabled, and so is a purpose-built probe
+running up to four WebSocket tests per process across three teardown
+shapes — clean close, a connection abandoned while the server still owns
+it, and a hard abort — including inside the full suite, where the
+autouse fixture drains each server between tests.
+
+Two changes that postdate the original report and would plausibly have
+fixed it: the autouse `_saltare_thread_cleanup` fixture (`conftest.py`,
+v1.6) removes exactly the server overlap the crash needed, and
+`destroy()` (v1.7.1) centralised WebSocket teardown onto one path. That
+is a hypothesis about the history, **not a verified root cause** — the
+original stack trace was never recorded in the repo — so the module
+docstring says so rather than claiming a fix.
+
+All four are now real tests: binary echo (a different ASGI key from text,
+so it can be dropped without the other noticing), a clean close asserted
+via the client's close code, close-before-assert answered with HTTP 403
+per the ASGI spec, and the FastAPI route.
+
+### FastAPI + WebSocket coverage
+
+Ten new tests in `tests/test_v12_fastapi_ws.py`, one behaviour each. Every
+other WebSocket test drives saltare from a hand-written ASGI app, which
+proves the wire protocol and skips the layer real applications live in:
+Starlette's `WebSocket` owns the state machine, the `receive_*` /
+`send_*` helpers, `WebSocketDisconnect`, `query_params` / `headers`, and
+FastAPI's dependency resolution. Payload types, the handshake surface,
+subprotocol negotiation, the three disconnect codes that differ (clean
+close, peer RST, oversized message), eight concurrent connections with
+per-connection tokens so a state leak surfaces as a wrong token rather
+than a lost message, and a fragmented message crossing the pool-buffer
+boundary.
+
+The oversized case builds its frame by hand: the `websockets` client
+fragments large sends on its own, so it cannot produce the single
+unfragmented frame the 1009 path is about.
 
 ### Where the RAM actually goes — and the one lever left
 
