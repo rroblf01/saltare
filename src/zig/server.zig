@@ -2166,6 +2166,14 @@ const WsState = struct {
     log_path: ?[]u8 = null,
     /// CLOCK_MONOTONIC ns of last inbound WS activity.
     last_activity_ns: i64 = 0,
+    /// v1.12: the close code this server sent, if any. `destroy()` hands
+    /// it to the app as the `websocket.disconnect` code so a handler can
+    /// tell *why* the connection ended — saltare rejects an oversized
+    /// message with 1009 (RFC 6455 §7.4.1) and the client sees exactly
+    /// that, but the app was told 1006, the same code it gets when the
+    /// network dies. Null means "we never sent a close", so peer RST and
+    /// teardown still report 1006.
+    close_sent: ?u16 = null,
 };
 
 const Connection = struct {
@@ -2391,7 +2399,11 @@ const Connection = struct {
             //    case that simulated 40 dropped connections previously
             //    leaked ~5 KiB Python heap each.
             if (self.data.websocket.handle != 0) {
-                const final = bridge.wsDisconnect(self.data.websocket.handle, 1006, self.allocator);
+                const final = bridge.wsDisconnect(
+                    self.data.websocket.handle,
+                    self.data.websocket.close_sent orelse 1006,
+                    self.allocator,
+                );
                 if (final.len > 0) self.allocator.free(final);
                 self.data.websocket.handle = 0;
             }
@@ -5301,6 +5313,9 @@ fn flushOutbound(loop: *eventloop.Loop, conn: *Connection) void {
 }
 
 fn sendCloseFrame(conn: *Connection, code: u16) !void {
+    // Recorded before the write so destroy() can pass the reason on to
+    // the app even if the socket dies before the frame drains.
+    conn.data.websocket.close_sent = code;
     const payload = [_]u8{ @intCast((code >> 8) & 0xFF), @intCast(code & 0xFF) };
     const frame_size = ws.frameSize(payload.len);
     const buf = try conn.allocator.alloc(u8, frame_size);
