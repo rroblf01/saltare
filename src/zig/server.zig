@@ -73,15 +73,31 @@ extern fn sendfile(out_fd: c_int, in_fd: c_int, offset: *c.off_t, count: usize) 
 /// sys/sendfile.h stays out of the cimport.
 const SfHdtr = opaque {};
 
-extern fn sendfile_darwin(
-    fd: c_int,
-    s: c_int,
-    fd2: c_int,
-    l: c.off_t,
-    n: usize,
-    hdtr: ?*SfHdtr,
-    flags: c_int,
-) isize;
+/// Darwin's `sendfile`, under its real name.
+///
+/// v1.12: this used to be declared as `extern fn sendfile_darwin`, renamed
+/// so the two platforms' incompatible signatures could share a file. But
+/// for an `extern fn` the Zig identifier *is* the symbol — renaming the
+/// declaration renames the call, it does not alias anything. So the macOS
+/// wheel compiled, passed delocate's platform check, and then failed to
+/// load: "symbol not found in flat namespace '_sendfile_darwin'", a name
+/// no system provides. `_sendfile` is present in libSystem; `_sendfile_darwin`
+/// never was.
+///
+/// The signatures cannot share one scope, so Darwin's lives in a struct that
+/// is only ever formed on Darwin (the `if` is comptime, and the type is
+/// resolved per branch). That lets both spell the symbol `sendfile`.
+const darwin = if (builtin.os.tag == .macos) struct {
+    extern "c" fn sendfile(
+        fd: c_int,
+        s: c_int,
+        fd2: c_int,
+        l: c.off_t,
+        n: usize,
+        hdtr: ?*SfHdtr,
+        flags: c_int,
+    ) isize;
+} else struct {};
 
 /// Copy up to `len` bytes from `file_fd` at `offset` to `sock_fd`.
 /// Returns the byte count, or a negative errno (as the raw syscalls do).
@@ -93,7 +109,7 @@ inline fn sendFileChunk(sock_fd: c_int, file_fd: c_int, offset: c.off_t, len: us
         var off = offset;
         return sendfile(sock_fd, file_fd, &off, len);
     }
-    return sendfile_darwin(file_fd, sock_fd, file_fd, offset, len, null, 0);
+    return darwin.sendfile(file_fd, sock_fd, file_fd, offset, len, null, 0);
 }
 
 // accept4 is a Linux/glibc extension. Defining _GNU_SOURCE in the @cImport

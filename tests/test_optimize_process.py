@@ -184,18 +184,31 @@ def test_public_function_reexecs_when_all_gates_pass(
 # Prints its state *before* the call as well as after. A re-exec replaces
 # the process, so the pre-exec line is the proof the first pass ran and
 # the post-exec line is the proof a second one did.
+#
+# v1.12: this used to do `sys.path.insert(0, REPO_SRC)` so the child would
+# exercise the working tree. That works with an editable install — where
+# `saltare` already resolves to src/ and only `_core` is redirected into
+# site-packages — and breaks with a real wheel install, which is what CI
+# runs. There, src/saltare shadows the installed package and has no `_core`
+# beside it, so the child died with "cannot import name '_core' from
+# partially initialized module 'saltare'". Five tests, on every platform.
+#
+# So insert nothing. The child imports the same saltare the pytest process
+# imported: the working tree under an editable install, and the installed
+# wheel otherwise — and the wheel is built from this same commit, so it is
+# the same code either way. It is also the stronger assertion, because it
+# tests what a user actually gets.
 _CHILD = """
 import json, os, sys
-sys.path.insert(0, {src!r})
 
 def state():
-    return {{
+    return {
         "pid": os.getpid(),
         "reexec": os.environ.get("SALTARE_REEXECED") == "1",
         "optimize": sys.flags.optimize,
         "arena": os.environ.get("MALLOC_ARENA_MAX"),
         "faulthandler": os.environ.get("PYTHONFAULTHANDLER"),
-    }}
+    }
 
 print(json.dumps(state()), flush=True)
 from saltare import optimize_process
@@ -209,7 +222,7 @@ def _run_child(tmp_path: Path, args: list[str] | None = None, **env: str) -> lis
     import json
 
     script = tmp_path / "child.py"
-    script.write_text(textwrap.dedent(_CHILD).format(src=REPO_SRC))
+    script.write_text(textwrap.dedent(_CHILD))
     e = dict(os.environ)
     for k in ("SALTARE_NO_OPTIMIZE", "SALTARE_REEXECED", "PYTHONOPTIMIZE"):
         e.pop(k, None)
@@ -294,7 +307,6 @@ def test_cli_still_reexecs_itself() -> None:
     e = dict(os.environ)
     for k in ("SALTARE_NO_OPTIMIZE", "SALTARE_REEXECED", "PYTHONOPTIMIZE"):
         e.pop(k, None)
-    e["PYTHONPATH"] = REPO_SRC
     proc = subprocess.run(
         [sys.executable, "-c",
          "import runpy, sys; sys.argv = ['saltare', '--version'];"
