@@ -5010,23 +5010,39 @@ fn doReadWs(loop: *eventloop.Loop, conn: *Connection) void {
                                 wsTeardown(loop, conn);
                                 return;
                             }
+                            // v1.12: detach the reassembly buffer before
+                            // handing it over. wsDeliverToApp can destroy
+                            // the connection — a Python-side error routes
+                            // through wsTeardown, and destroy() frees
+                            // frag_buf — so leaving the pointer in the
+                            // struct meant the free() below hit an
+                            // already-freed block, and read the allocator
+                            // off a Connection that destroy() had itself
+                            // freed. Every fragmented message corrupted
+                            // the heap: glibc aborted with "double free or
+                            // corruption" as little as three 1 KB
+                            // fragments. Taking the allocator as a local
+                            // and nulling the field first means exactly
+                            // one free whichever way the call goes.
+                            const frag_alloc = conn.allocator;
+                            const frag_buf = conn.data.websocket.frag_buf.?;
+                            const assembled_len = conn.data.websocket.frag_len;
                             const assembled_op = conn.data.websocket.frag_opcode;
-                            const assembled = conn.data.websocket.frag_buf.?[0..conn.data.websocket.frag_len];
-                            // Hand off to wsDeliverToApp; it copies
-                            // bytes to the Python side, so freeing
-                            // after is safe.
-                            wsDeliverToApp(loop, conn, assembled_op, assembled, conn.data.websocket.frag_rsv1);
-                            conn.allocator.free(conn.data.websocket.frag_buf.?);
+                            const assembled_rsv1 = conn.data.websocket.frag_rsv1;
                             conn.data.websocket.frag_buf = null;
                             conn.data.websocket.frag_len = 0;
                             conn.data.websocket.frag_opcode = 0;
                             conn.data.websocket.frag_rsv1 = false;
+                            // Hand off to wsDeliverToApp; it copies bytes
+                            // to the Python side, so freeing after is safe.
+                            wsDeliverToApp(loop, conn, assembled_op, frag_buf[0..assembled_len], assembled_rsv1);
+                            frag_alloc.free(frag_buf);
+                            if (conn.data != .websocket) return;
                             const leftover2 = conn.read_total - total;
                             if (leftover2 > 0) {
                                 std.mem.copyForwards(u8, data[0..leftover2], data[total..total + leftover2]);
                             }
                             conn.read_total = leftover2;
-                            if (conn.data != .websocket) return;
                             if (conn.state == .writing) return;
                             continue;
                         }
