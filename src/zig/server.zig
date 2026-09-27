@@ -57,7 +57,11 @@ const c = @cImport({
 // sendfile(2), declared per platform. The signatures are incompatible:
 //
 //   Linux:   sendfile(out_fd, in_fd, off_t *offset, size_t count)
-//   Darwin:  sendfile(fd, s, fd, off_t l, size_t n, sf_hdtr *hdtr, int flags)
+//   Darwin:  sendfile(int fd, int s, off_t offset, off_t *len,
+//                     struct sf_hdtr *hdtr, int flags)
+//
+// (an earlier revision documented FreeBSD's 7-arg shape here — Darwin
+// takes 6 args, with the byte count in/out via `len` and a 0/-1 return.)
 //
 // and the offset handling differs too, which is the part that actually
 // matters. Linux takes a *pointer* and advances it for you. Darwin takes
@@ -91,12 +95,11 @@ const darwin = if (builtin.os.tag == .macos) struct {
     extern "c" fn sendfile(
         fd: c_int,
         s: c_int,
-        fd2: c_int,
-        l: c.off_t,
-        n: usize,
+        offset: c.off_t,
+        len: ?*c.off_t,
         hdtr: ?*SfHdtr,
         flags: c_int,
-    ) isize;
+    ) c_int;
 } else struct {};
 
 /// Copy up to `len` bytes from `file_fd` at `offset` to `sock_fd`.
@@ -109,7 +112,14 @@ inline fn sendFileChunk(sock_fd: c_int, file_fd: c_int, offset: c.off_t, len: us
         var off = offset;
         return sendfile(sock_fd, file_fd, &off, len);
     }
-    return darwin.sendfile(file_fd, sock_fd, file_fd, offset, len, null, 0);
+    // Darwin returns 0 on success (bytes via *len) or -1 with errno —
+    // unlike Linux, which returns the byte count or -errno. Normalise
+    // to the Linux convention so the caller's loop stays identical.
+    var n: c.off_t = @intCast(len);
+    if (darwin.sendfile(file_fd, sock_fd, offset, &n, null, 0) != 0) {
+        return -@as(isize, @intCast(std.c._errno().*));
+    }
+    return @intCast(n);
 }
 
 // accept4 is a Linux/glibc extension. Defining _GNU_SOURCE in the @cImport
@@ -4537,14 +4547,22 @@ fn dispatchWithBody(loop: *eventloop.Loop, conn: *Connection, more_body: bool) v
         // the body straight to the socket without bouncing bytes
         // through Python.
         if (bridge.httpDispatchPopSendfile(start.handle, conn.allocator)) |sf| {
-            defer conn.allocator.free(sf.path);
-            defer conn.allocator.free(sf.headers_block);
+            // v1.13 (macOS): serveSendfile can destroy conn synchronously
+            // (404/500 paths go sendStatus→doWrite→destroy when the write
+            // completes, as does the success path with `Connection: close`).
+            // Capture the allocator first — reading conn.allocator in the
+            // defers below would then be use-after-free. Silent on glibc
+            // (freed-but-mapped bytes still read back), fatal on Darwin's
+            // allocator (EXC_BAD_ACCESS in rawFree).
+            const alloc = conn.allocator;
+            defer alloc.free(sf.path);
+            defer alloc.free(sf.headers_block);
             // We've already taken responsibility for the dispatch
             // task — clear the bridge handle so destroy() doesn't
             // try to abort it.
             conn.dispatch_handle = 0;
             conn.dispatch_active = false;
-            if (start.chunks.len > 0) conn.allocator.free(start.chunks);
+            if (start.chunks.len > 0) alloc.free(start.chunks);
             return serveSendfile(loop, conn, sf);
         }
     }
