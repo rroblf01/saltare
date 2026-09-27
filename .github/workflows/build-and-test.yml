@@ -220,16 +220,22 @@ jobs:
 
           if [ "${{ matrix.libc }}" = "macos" ]; then
             # v1.12: no container on macOS — cibuildwheel builds in
-            # runner-local virtualenvs, so Zig goes on PATH (the
-            # Install-Zig step above put it in ZIG_DIR) and there is no
-            # container mount. Delocate (the default macOS repair) runs
+            # runner-local virtualenvs. Zig is exposed via a symlink into
+            # /usr/local/bin (already on PATH) rather than a PATH
+            # override: cibuildwheel requires `python` on PATH to resolve
+            # to the framework instance it just installed, and a
+            # PATH=$PATH override puts the setup-python hostedtoolcache
+            # ahead of it ("python doesn't match our installed
+            # instance"). Delocate (the default macOS repair) runs
             # automatically; the extension links only libSystem.
-            export PATH="${{ env.ZIG_DIR }}:$PATH"
+            ln -sf "${{ env.ZIG_DIR }}/zig" /usr/local/bin/zig 2>/dev/null \
+              || sudo ln -sf "${{ env.ZIG_DIR }}/zig" /usr/local/bin/zig
+            zig version
             # No MACOSX_DEPLOYMENT_TARGET here: cibuildwheel exports its
             # default into the build env, and CMakeLists.txt maps whatever
             # it finds to -Dtarget=<arch>-macos.<ver> (defaulting to 11.0
             # when unset) so the .so minos and the delocate tag agree.
-            export CIBW_ENVIRONMENT_MACOS="PATH=$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=${{ env.ZIG_CACHE_DIR }} PIP_CACHE_DIR=${{ env.PIP_CACHE_DIR }} PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+            export CIBW_ENVIRONMENT_MACOS="ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=${{ env.ZIG_CACHE_DIR }} PIP_CACHE_DIR=${{ env.PIP_CACHE_DIR }} PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
             # Diagnostics: which python.org frameworks are preinstalled?
             # Anything missing is sudo-installed from a python.org .pkg
             # download inside cibuildwheel — if that download fails, the
