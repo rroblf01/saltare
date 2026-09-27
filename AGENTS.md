@@ -47,9 +47,7 @@ uv pip install -e . --no-deps --no-build-isolation   # rebuild the Zig core (~6 
 
 **macOS is not released.** The kqueue backend (`eventloop_kqueue.zig`) is in the tree
 and cross-compiles, but there is no macOS wheel, no macOS CI job, and nothing macOS
-in the release gate — a hosted `macos-14` runner builds the wheel but cannot pass the
-suite, and `test_macos` was a `needs` entry on `publish`, so the options were shipping
-red or dropping the platform. Treat macOS as **unvalidated source**: `module.zig` and
+in the release gate. Treat macOS as **unvalidated source**: `module.zig` and
 `server.zig` are excluded from `make check-macos` (they import `bridge.zig`, which
 needs a macOS `Python.h`), so nothing in CI compiles them for Darwin at all. Anything
 touching the Darwin path needs a real Mac, which is the next release's job.
@@ -68,21 +66,27 @@ the first call, and there is no `prctl` or `/proc`. A top-level `@cImport` of a 
 that does not exist on the other platform breaks the build *before any of our own code
 runs* — that is how `sys/prctl.h` and `sys/sendfile.h` had to go.
 
-## Adding or changing a server option — 4 coupled places
+## Adding or changing a server option — check which layer first
 
-`run()` forwards ~78 kwargs to `_core.serve` **positionally**, and `src/zig/module.zig`
-parses them with a single `PyArg_ParseTuple` format string. Argument order *is* the
-contract. Touch all four:
+`run()` takes ~78 kwargs but only ~52 reach `_core.serve` **positionally**, parsed in
+`src/zig/module.zig` by a single `PyArg_ParseTuple` format string. Argument order *is*
+the contract. The rest never cross the C ABI — they are wired via
+`_dispatcher.set_*` setters (compression, HSTS, proxy-headers, WS upgrade/compression,
+tracemalloc already covered that way), via `workers=0 → min(cpu,4)` normalization, or
+via `_reload.supervise` (`reload*`, which forces `workers=1`).
 
-1. `src/saltare/__init__.py` — kwarg + docstring + positional arg to `_core.serve(...)`
-2. `src/saltare/cli.py` — argparse flag + `run(...)` kwarg (flat parser, no subcommands;
-   `--check-config FILE` is a *flag*, not a subcommand)
-3. `src/zig/module.zig` — format-string char + matching out-param + the `g_*` config global
-4. `src/saltare/_core.pyi` — the stub
-
-**Append new arguments at the end. Never insert in the middle.** A past release shipped a
-segfault from a `PyObject_CallFunction` arg-count mismatch; a silent misalignment here
-type-checks fine and corrupts memory at runtime.
+- **Zig-backed option** (timeouts, limits, sockets, TLS, paths served from Zig): touch all four,
+  **appended at the end, never inserted in the middle** (a past release segfaulted from a
+  `PyObject_CallFunction` arg-count mismatch; misalignment type-checks fine and corrupts
+  memory at runtime):
+  1. `src/saltare/__init__.py` — kwarg + docstring + positional arg to `_core.serve(...)`
+  2. `src/saltare/cli.py` — argparse flag + `run(...)` kwarg (flat parser, no subcommands;
+     `--check-config FILE` is a *flag*, not a subcommand)
+  3. `src/zig/module.zig` — format-string char + matching out-param + the `g_*` config global
+  4. `src/saltare/_core.pyi` — the stub
+- **Python-only option** (dispatcher tuning, reload supervisor): `__init__.py` + `cli.py` +
+  the `_dispatcher.set_*` / `_reload` call. Do **not** extend the `PyArg_ParseTuple` string
+  for these — every unused positional slot still shifts the ABI.
 
 ## Zig changes need a reinstall; Python changes do not
 
@@ -121,36 +125,34 @@ there rather than introducing a link-time dependency.
 - There is **no shared server fixture**. Each test module defines its own
   `_serve_in_background(app, port, **kwargs)` that spawns `saltare.run` in a daemon thread
   and polls a TCP connect with a 2 s deadline. Copy the local one.
-- 5 tests in `tests/test_websocket.py` are permanently skipped: multiple WS tests in one
-  pytest process hit a daemon-thread teardown segfault (v0.10). Verify WebSocket changes
-  **one test per process**.
+- WebSocket tests run together in one process since v1.12 (the v0.10 teardown crash no
+  longer reproduces — `conftest.py` drain fixture + centralised `destroy()` fixed the
+  overlap). If a WS teardown segfault ever returns, re-adding skips is cheaper than
+  re-deriving it; see the `test_websocket.py` docstring for the history.
 - TLS tests shell out to the `openssl` CLI to mint a self-signed cert per test.
 - `tests/test_cli_unit.py` loads `cli.py` by path with a mocked `saltare` module and
   restores `sys.modules["saltare"]` afterwards — do not drop that restore.
+- Silent suite loss: `tests/test_http2.py` skips wholesale without `h2` installed, and
+  `@pytest.mark.flaky` reruns are no-ops without `pytest-rerunfailures`. Both live in
+  the `dev` dependency group / extra — keep them installed or you will "pass" with
+  coverage missing.
 - New feature coverage lands in a new `tests/test_v<NN>*.py` module whose docstring states
   which edge cases it targets.
 - Tests are timing-sensitive: most modules scale their deadline by
-  `_TIMING_FACTOR = 4.0 if platform.machine() in {"aarch64", "arm64"} else 2.0`.
+  `_TIMING_FACTOR = 4.0 if platform.machine() in {"aarch64", "arm64"} else ...`
+  (the else-branch varies: 2.0 in older modules, 1.0 in newer ones — copy the local one).
 
 ## Version bumps
 
 One source of truth for the runtime version: `pub const VERSION` in `src/zig/server.zig`
-— it feeds both `_core.version()` and the default `Server:` header. A bump touches:
+— it feeds both `_core.version()` and the default `Server:` header. A bump touches all six:
 
 - `src/zig/server.zig` (`VERSION`)
 - `pyproject.toml` (`[project] version`)
+- `build.zig.zon` (`.version` — tracks the release; nothing reads it, so a mismatch is pure confusion)
 - `tests/test_smoke.py` (two hardcoded version asserts)
 - `tests/test_cli_unit.py` (the mocked `__version__`)
 - `CHANGELOG.md` and the README status block
-
-`build.zig.zon`'s `.version` is the Zig *package manifest* version and is not what
-the wheel reports — that comes from `pyproject.toml` and `server.zig`. But it
-should still be set to the same release number. It tracked `pyproject.toml`
-exactly through 0.10.0, then drifted at the 0.x→1.x transition: the wheel became
-1.10.0 while the manifest became 0.11.0, as if the project were still 0.x. That
-was a slip, and an earlier version of this file codified it as "it lags on
-purpose — leave it alone", which is why the drift survived. Bump it with the
-release; nothing reads it, so a mismatch is pure confusion.
 
 ## Conventions
 
