@@ -1357,7 +1357,7 @@ fn serveMetrics(loop: *eventloop.Loop, conn: *Connection) void {
     const total_5xx = g_total_5xx.load(.seq_cst);
     const total_bytes_sent = g_total_bytes_sent.load(.seq_cst);
     const total_bytes_recv = g_total_bytes_received.load(.seq_cst);
-    const rss_bytes: u64 = if (comptime builtin.os.tag == .linux) readVmRssBytes() else 0;
+    const rss_bytes: u64 = readVmRssBytes();
 
     w.write(
         \\# HELP saltare_open_connections Currently accepted connections held open.
@@ -1864,7 +1864,7 @@ fn serveDispatch(loop: *eventloop.Loop, conn: *Connection) void {
     const total_bytes_sent = g_total_bytes_sent.load(.seq_cst);
     const total_bytes_recv = g_total_bytes_received.load(.seq_cst);
     const draining: u32 = if (g_draining.load(.seq_cst)) 1 else 0;
-    const rss_bytes: u64 = if (comptime builtin.os.tag == .linux) readVmRssBytes() else 0;
+    const rss_bytes: u64 = readVmRssBytes();
     const body = std.fmt.bufPrint(
         &body_buf,
         "{{\"open_conns\":{d},\"in_flight\":{d}," ++
@@ -2081,7 +2081,7 @@ fn dumpStats() void {
     const open_conns = g_active_conns.load(.seq_cst);
     const in_flight = g_in_flight.load(.seq_cst);
     const total_reqs = g_total_requests.load(.seq_cst);
-    const rss_kib: u64 = if (comptime builtin.os.tag == .linux) (readVmRssBytes() / 1024) else 0;
+    const rss_kib: u64 = readVmRssBytes() / 1024;
     const draining = g_draining.load(.seq_cst);
     var buf: [512]u8 = undefined;
     const out = std.fmt.bufPrint(
@@ -2679,7 +2679,11 @@ pub fn run(
 ) !void {
     g_tls_ctx = tls_ctx;
     defer g_tls_ctx = null;
-    g_ktls_enabled = ktls;
+    // v1.13 (macOS): kernel TLS is Linux-only. Forcing the flag off on
+    // Darwin keeps `--ktls` accepted-but-inert there: serveSendfile's
+    // existing `!g_ktls_enabled` check 500s sendfile-over-HTTPS instead
+    // of emitting plaintext on a TLS socket.
+    g_ktls_enabled = ktls and builtin.os.tag == .linux;
     defer g_ktls_enabled = false;
     g_timeouts = timeouts;
     defer g_timeouts = .{};

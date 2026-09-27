@@ -252,7 +252,10 @@ pub fn newContext(
         );
     }
 
-    if (enable_ktls) {
+    // v1.13 (macOS): kernel TLS is Linux-only — don't ask OpenSSL for
+    // it on Darwin. server.zig already forces g_ktls_enabled off there;
+    // this keeps the SSL_CTX option mask clean too.
+    if (enable_ktls and comptime builtin.os.tag == .linux) {
         // SSL_CTX_set_options is a macro over SSL_CTX_ctrl with
         // cmd=SSL_CTRL_OPTIONS. Returns the new option mask. We don't
         // care about the return — failure to set on OpenSSL < 3.0

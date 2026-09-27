@@ -42,8 +42,12 @@ pub fn build(b: *std.Build) void {
     //   3. Users who need TLS install system OpenSSL (`apt install libssl3`
     //      or equivalent) — the same libs they'd already have for `pip`,
     //      `requests`, and most other Python deps.
-    // libdl is needed for dlopen / dlsym on glibc.
-    root_module.linkSystemLibrary("dl", .{});
+    // libdl is needed for dlopen / dlsym on glibc. On Darwin those live
+    // in libSystem — linking -ldl there is at best unnecessary.
+    // v1.13: gate it to Linux so the macOS link stays clean.
+    if (target.result.os.tag == .linux) {
+        root_module.linkSystemLibrary("dl", .{});
+    }
 
     const lib = b.addLibrary(.{
         .name = "saltare_core",
