@@ -205,9 +205,14 @@ jobs:
           # fnmatch globs and multiple selectors are separated by a space
           # — which is also why the old `cp31?-*` pattern worked (`?` is
           # fnmatch for one char), and why `|` is invalid there.
+          # v1.13.1: the macOS platform tag is `macosx`, not `macos`
+          # (cibuildwheel identifiers look like `cp310-macosx_arm64`) —
+          # the matrix `libc` value is only the artifact-name word.
+          build_tag="${{ matrix.libc }}"
+          if [ "$build_tag" = "macos" ]; then build_tag="macosx"; fi
           export CIBW_BUILD=""
           for p in ${{ matrix.pys }}; do
-            CIBW_BUILD="${CIBW_BUILD:+$CIBW_BUILD }${p}-${{ matrix.libc }}_*"
+            CIBW_BUILD="${CIBW_BUILD:+$CIBW_BUILD }${p}-${build_tag}_*"
           done
           export CIBW_TEST_SKIP="*"
 
