@@ -226,7 +226,7 @@ fn malloc_trim(pad: usize) c_int {
 /// `module.zig`'s `version()` returns this, and it backs the default
 /// `Server:` header below — keeping both from drifting the way the old
 /// hardcoded "1.6.0" / "1.9.0" literals did.
-pub const VERSION = "1.12.0";
+pub const VERSION = "1.13.0";
 const SERVER_HEADER = "saltare/" ++ VERSION;
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of

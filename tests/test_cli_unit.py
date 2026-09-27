@@ -27,7 +27,7 @@ _SRC = os.path.join(os.path.dirname(__file__), "..", "src", "saltare", "cli.py")
 if os.path.exists(_SRC):
     # Load from source (no _core dependency needed)
     _mock_saltare = _types.ModuleType("saltare")
-    _mock_saltare.__version__ = "1.12.0"
+    _mock_saltare.__version__ = "1.13.0"
     # v1.12: point the mock at the real package directory. `cli.py` does
     # `from saltare import _optimize`, and resolving a *submodule* needs
     # `__path__` — without it the import raises "unknown location" and the

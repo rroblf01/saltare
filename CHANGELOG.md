@@ -1,5 +1,67 @@
 # Changelog
 
+## 1.13.0
+
+**Theme: macOS arm64 ships.** The kqueue backend written in v1.12 —
+unreleased then because a hosted runner could build the wheel but not
+pass the suite — is now a gated release platform: macOS arm64 wheels
+build on `macos-14`, the full suite runs against them, and `test_macos`
+blocks publish. Validated on real Apple Silicon hardware (520 passed,
+3 skipped), not just cross-compiled.
+
+Bring-up found five real Darwin bugs, all fixed here:
+
+- **Wrong `CLOCK_MONOTONIC` id.** Both time readers hardcoded Linux's
+  `1`; Darwin's is `6`, so `clock_gettime` failed and the callers —
+  which ignore the return — read undefined stack garbage. The timer
+  wheel then walked a garbage-huge bucket count and the event loop
+  spun at 100% CPU without ever reaching kevent: the server listened
+  but never answered. One-line symptom, two-line fix (`timer.zig`,
+  `server.zig`).
+- **FreeBSD's `sendfile` signature declared as Darwin's.** The extern
+  took 7 args; Darwin takes 6 (`fd, sock, offset-by-value, len
+  in/out, hdtr, flags`) and returns 0/-1, not a byte count. GET/HEAD
+  via the extension faulted or misreported until normalised to the
+  Linux convention.
+- **Two use-after-free crashes.** The sendfile dispatch path and
+  `startWebSocket` (plus `serveTracemalloc` and the H2 headers block,
+  same pattern) deferred frees via `conn.allocator` after paths that
+  synchronously destroy the connection. Silent on glibc
+  (freed-but-mapped bytes still read back), `EXC_BAD_ACCESS` on
+  Darwin's allocator. Deterministic on 404-sendfile and rejected WS
+  handshakes. Both are fixed by capturing the allocator first — and
+  both were latent Linux bugs, found only because Darwin crashes.
+- **System LibreSSL must never load.** `libssl.dylib` on macOS exports
+  every symbol we `dlsym`, but its structs are ABI-incompatible with
+  OpenSSL 3: handshakes corrupt the heap (SIGABRT). `loadFuncs` now
+  verifies the `OpenSSL_version` prefix and keeps trying candidates;
+  absolute Homebrew `openssl@3` paths come first so keg-only installs
+  resolve with no env vars; the bare system name is dropped (macOS
+  has not shipped real OpenSSL since 10.6).
+- **RSS rendered as 0 on macOS.** `readVmRssBytes` already delegated
+  to `proc_pidinfo`, but all three render sites gated on `.linux`.
+  Now unconditional. Also: kTLS forced off on Darwin (kernel TLS is
+  Linux-only; otherwise sendfile-over-HTTPS would emit plaintext),
+  and `-ldl` links on Linux only (it lives in libSystem on Darwin).
+
+### Not built — and why
+
+- **Intel (x86_64) macOS wheels** — declined. Negligible demand, and
+  the choice is Rosetta emulation on an arm64 runner or a separate
+  Intel runner, both poor value for a platform nobody asked for.
+- **Benchmarks on macOS** — `benchmarks/` reads `/proc`, which does
+  not exist on Darwin (readers fail soft to 0). RAM numbers stay
+  Linux-only; a Mach-based sampler (`phys_footprint`) is a later
+  release's job.
+- **kTLS on macOS, `PR_SET_PDEATHSIG` equivalent** — both declined as
+  in v1.12. `--ktls` is accepted-but-inert on Darwin (sendfile-over-
+  HTTPS 500s); a SIGKILL'd multi-worker master can orphan macOS
+  workers until idle timeouts reap them.
+- **brotli/zstd on stock macOS** — graceful identity fallback, as on
+  minimal Linux images. Neither ships with the OS; the test job
+  `brew install`s them for coverage, operators who want them do the
+  same.
+
 ## 1.12.0
 
 **Theme: six real bugs, and a CI pipeline that had never run.** The headline

@@ -43,14 +43,35 @@ uv pip install -e . --no-deps --no-build-isolation   # rebuild the Zig core (~6 
   `zig fmt`** — `server.zig`, `h2.zig`, `bridge.zig` and `h2_static.zig` are already not
   `zig fmt` clean, so it would bury any real change in noise.
 
-## Platform support: Linux is the released target
+## Platform support: Linux is primary, macOS arm64 ships since v1.13
 
-**macOS is not released.** The kqueue backend (`eventloop_kqueue.zig`) is in the tree
-and cross-compiles, but there is no macOS wheel, no macOS CI job, and nothing macOS
-in the release gate. Treat macOS as **unvalidated source**: `module.zig` and
-`server.zig` are excluded from `make check-macos` (they import `bridge.zig`, which
-needs a macOS `Python.h`), so nothing in CI compiles them for Darwin at all. Anything
-touching the Darwin path needs a real Mac, which is the next release's job.
+macOS arm64 is a released, CI-gated platform (wheels build on `macos-14`,
+`test_macos` runs the full suite and blocks publish). There is deliberately
+**no Intel wheel** (negligible demand; would need Rosetta or a second runner)
+and benchmarks stay Linux-only (`benchmarks/` reads `/proc`, fails soft to 0).
+
+Darwin lessons that still bite (all earned bringing v1.13 up on real hardware):
+
+- `CLOCK_MONOTONIC` is **6** on Darwin, 1 on Linux. `clock_gettime(1)` fails
+  with EINVAL — and both time readers ignored the return value, so the wheel
+  walked garbage-huge bucket counts and the loop spun at 100% without ever
+  reaching kevent. Any new time reader must use the per-OS id.
+- Darwin `sendfile` is 6 args `(fd, sock, offset-by-value, len in/out, hdtr,
+  flags)` returning 0/-1 — not FreeBSD's 7-arg shape, not Linux's convention.
+- Never touch `conn` (not even `conn.allocator` in a defer) after a call that
+  can destroy it synchronously (`sendStatus→doWrite` on close, explicit
+  `destroy`). Silent on glibc, `EXC_BAD_ACCESS` on Darwin's allocator. When
+  in doubt, capture `const alloc = conn.allocator;` first.
+- The system `libssl.dylib` is LibreSSL (same symbols, incompatible structs →
+  SIGABRT). `tls.zig` verifies the `OpenSSL_version` prefix and tries absolute
+  Homebrew paths first; TLS needs `brew install openssl@3`. kTLS is forced off
+  on Darwin (`--ktls` accepted-but-inert, sendfile-over-HTTPS 500s).
+- A macOS `SIGKILL`'d multi-worker master orphans workers (no `PR_SET_PDEATHSIG`
+  equivalent) until idle timeouts reap them. Tests enumerate workers via
+  `pgrep -P` (`tests/test_multiworker.py`); `/proc` does not exist.
+- The stock LibreSSL `openssl` CLI mints test certs fine (supports `-addext`),
+  so no PATH surgery is needed for cert gen — but the *test job* still
+  `brew install`s `openssl@3 brotli zstd` for TLS/compression coverage.
 
 `src/zig/eventloop.zig` still picks a backend at comptime — `eventloop_epoll.zig` or
 `eventloop_kqueue.zig` — and re-exports it, so `server.zig` stays platform-agnostic and
@@ -179,8 +200,10 @@ One source of truth for the runtime version: `pub const VERSION` in `src/zig/ser
   - `release.yml` — tag pushes only. Calls `build-and-test`, then publishes to PyPI via
     Trusted Publishing.
 
-  There is no macOS job in any of the three, and no macOS wheel.
+  There is no macOS x86_64 job and no Intel wheel (declined).
 
   A branch push therefore cannot reach PyPI *structurally*, not just via a condition.
   Before this split the pipeline was tag-only, so a push to `main` ran nothing at all.
-  Only publish when the whole suite is green.
+  Only publish when the whole suite is green — `test_macos` (full suite on
+  `macos-14`, after `brew install openssl@3 brotli zstd`) blocks publish
+  since v1.13, same as the Linux stages.
