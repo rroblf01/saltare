@@ -72,6 +72,14 @@ add_custom_command(
         "-Doptimize=${ZIG_OPTIMIZE}"
         "-Dpython-include=${Python_INCLUDE_DIRS}"
         "-Dext-suffix=${PY_EXT_SUFFIX}"
+        # v1.12: pin the CPU model to baseline. Without this, Zig targets
+        # the *build host's* CPU when host == target (the case inside the
+        # manylinux containers), baking AVX2/AVX512 into a wheel that PyPI
+        # installs on arbitrary older CPUs — Illegal instruction on the
+        # first vectorized memcpy, depending on which hosts the build and
+        # test shards happened to land on. Baseline x86_64/aarch64 costs
+        # nothing measurable on this I/O-bound server.
+        "-Dcpu=baseline"
         ${SALTARE_ZIG_TARGET_ARGS}
         --cache-dir "${ZIG_CACHE_DIR}"
         --prefix "${ZIG_OUT_DIR}"
