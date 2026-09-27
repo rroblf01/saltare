@@ -6,10 +6,10 @@ name: CI
 #
 # v1.12: the entire pipeline lived in `release.yml` behind a tag trigger, so
 # a push to main ran *nothing*. That made "validate before you tag"
-# impossible, and the macOS gate in particular could not be exercised until
-# the release was already committed to: `module.zig` and `server.zig` were
-# never compiled for Darwin on a runner, and the macOS-only platform test
-# never executed. This file is the fix.
+# impossible. v1.13: macOS arm64 builds and tests on macos-14 runners
+# here too, so module.zig and server.zig are compiled for Darwin on a
+# real Mac on every push — `make check-macos` remains the fast local
+# pre-check for platform-only edits.
 #
 # The build + test matrix is called from `build-and-test.yml` rather than
 # repeated, so `ci.yml` and `release.yml` cannot drift apart.

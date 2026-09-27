@@ -24,6 +24,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
 ]
 
@@ -123,14 +124,21 @@ musllinux-aarch64-image = "musllinux_1_2"
 select = "*-musllinux*"
 before-all = "bash {project}/scripts/install-zig.sh"
 
-# v1.12: macOS support exists in the source (eventloop_kqueue.zig, and the
-# per-OS fixes in the Zig sources) but is NOT built or published. The
-# [tool.cibuildwheel.macos] block and the macOS CI jobs were removed for
-# this release: no macOS wheel is produced, no macOS test job runs, and
-# nothing macOS-related is gated on publishing. The Darwin code path stays
-# in the tree and is still cross-compile-checked by `make check-macos`, so
-# a Darwin-only compile error surfaces on a Linux box in seconds. It gets
-# validated on real hardware in a later release.
+# v1.13: macOS arm64 is a shipped platform (kqueue backend, validated
+# on real hardware). Linux builds run in manylinux containers with Zig
+# mounted in; macOS builds run runner-locally (no container backend),
+# so before-all just ensures Zig is on PATH and archs pins arm64 —
+# there is no Intel wheel. The extension links only libSystem;
+# OpenSSL/brotli/zstd stay lazy dlopen at runtime (Homebrew absolute
+# paths first), so no brew packages are needed at build time — but the
+# *test* job does `brew install openssl@3 brotli zstd` for suite
+# coverage. MACOSX_DEPLOYMENT_TARGET is intentionally unset here:
+# cibuildwheel exports its default into the build env and
+# CMakeLists.txt maps it to -Dtarget=<arch>-macos.<ver> (default 11.0)
+# so the .so minos and the delocate tag cannot disagree.
+[tool.cibuildwheel.macos]
+before-all = "bash {project}/scripts/install-zig.sh"
+archs = ["arm64"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

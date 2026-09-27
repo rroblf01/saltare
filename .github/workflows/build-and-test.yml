@@ -76,11 +76,12 @@ jobs:
           - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 1, pys: "cp310 cp311" }
           - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 2, pys: "cp312 cp313" }
           - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 3, pys: "cp314" }
-          # v1.12: macos-14 was dropped from this matrix. No macOS wheel is
-          # built and no macOS job runs, so the platform is not gated on
-          # anything. The kqueue backend stays in the tree and is still
-          # cross-compile-checked by `make check-macos`; it gets validated
-          # on real hardware in a later release.
+          # v1.13: macOS arm64 rejoins the matrix (2+2+1 shards like
+          # Linux). No macOS x86_64: negligible demand, and an Intel
+          # wheel would need Rosetta or a separate runner.
+          - { os: macos-14, arch: arm64, libc: macos, shard: 1, pys: "cp310 cp311" }
+          - { os: macos-14, arch: arm64, libc: macos, shard: 2, pys: "cp312 cp313" }
+          - { os: macos-14, arch: arm64, libc: macos, shard: 3, pys: "cp314" }
     steps:
       - uses: actions/checkout@v4
 
@@ -184,13 +185,11 @@ jobs:
       - name: Build wheels
         timeout-minutes: 45
         run: |
-          # v1.12: the macOS branch of this script is gone along with the
-          # macos-14 matrix entry — nothing selects `libc = macos` any
-          # more, so the if/else had one arm. CIBW_CACHE_DIR points the
-          # container's pip cache at this host directory; it used to be
-          # unset, and the "Cache pip downloads" step was caching
-          # ~/.cache/pip, which the container never reads, so the saving
-          # that step's comment promised was not actually happening.
+          # CIBW_CACHE_DIR points the container's pip cache at this host
+          # directory; it used to be unset, and the "Cache pip downloads"
+          # step was caching ~/.cache/pip, which the container never
+          # reads, so the saving that step's comment promised was not
+          # actually happening.
           export CIBW_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
           export PIP_CACHE_DIR="${{ env.PIP_CACHE_DIR }}"
           mkdir -p "$CIBW_CACHE_DIR" "${{ env.ZIG_CACHE_DIR }}"
@@ -214,8 +213,22 @@ jobs:
 
           export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
 
-          export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw --volume $CIBW_CACHE_DIR:/pip-cache:rw"
-          export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_CACHE_DIR=/pip-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+          if [ "${{ matrix.libc }}" = "macos" ]; then
+            # v1.13: no container on macOS — cibuildwheel builds in
+            # runner-local virtualenvs, so Zig goes on PATH (the
+            # Install-Zig step above put it in ZIG_DIR) and there is no
+            # container mount. Delocate (the default macOS repair) runs
+            # automatically; the extension links only libSystem.
+            export PATH="${{ env.ZIG_DIR }}:$PATH"
+            # No MACOSX_DEPLOYMENT_TARGET here: cibuildwheel exports its
+            # default into the build env, and CMakeLists.txt maps whatever
+            # it finds to -Dtarget=<arch>-macos.<ver> (defaulting to 11.0
+            # when unset) so the .so minos and the delocate tag agree.
+            export CIBW_ENVIRONMENT_MACOS="PATH=$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=${{ env.ZIG_CACHE_DIR }} PIP_CACHE_DIR=${{ env.PIP_CACHE_DIR }} PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+          else
+            export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw --volume $CIBW_CACHE_DIR:/pip-cache:rw"
+            export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_CACHE_DIR=/pip-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+          fi
 
           cibuildwheel --output-dir wheelhouse
       - uses: actions/upload-artifact@v4
@@ -294,14 +307,60 @@ jobs:
       - name: Run pytest
         run: pytest -q tests
 
-  # v1.12: the `test_macos` job is gone. It was the gate for the kqueue
-  # port, and it did its job — it caught the phantom `_sendfile_darwin`
-  # symbol that no amount of Linux testing or cross-compiling could see.
-  # But it also cannot be made green on a hosted runner: the suite aborts
-  # there, and no macOS wheel is published, so there is nothing to gate a
-  # release on. The Darwin code stays in the tree and stays
-  # cross-compile-checked by `make check-macos`; validating it on real
-  # hardware is the next release's job, with a Mac.
+  # v1.13: `test_macos` is back, and it is a blocking gate — publish
+  # waits for the whole called workflow, so a red macOS suite stops
+  # the release. TLS tests need a real OpenSSL 3 (the system
+  # libssl.dylib is LibreSSL, which saltare refuses to run against),
+  # and the brotli/zstd suites need their libs: all three come from
+  # Homebrew. The stock LibreSSL `openssl` CLI is fine for minting
+  # test certs (it supports -addext), so no PATH surgery needed there.
+  test_macos:
+    name: test macos arm64 cp${{ matrix.py_short }}
+    needs: build_wheels
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python-version: "3.10", py_short: "310" }
+          - { python-version: "3.11", py_short: "311" }
+          - { python-version: "3.12", py_short: "312" }
+          - { python-version: "3.13", py_short: "313" }
+          - { python-version: "3.14", py_short: "314" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-arm64-macos-s*
+          merge-multiple: true
+          path: wheelhouse
+
+      - name: Install Homebrew TLS/compression libs
+        run: brew install openssl@3 brotli zstd
+
+      - name: Cache pip downloads (test macos)
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/pip
+          key: pip-test-macos-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            pip-test-macos-${{ matrix.python-version }}-
+
+      - name: Install wheel + test deps
+        run: |
+          pip install --upgrade pip
+          # Same list as the Linux test jobs and pyproject.toml's
+          # test-requires — the four must move together.
+          pip install pytest httpx fastapi websockets pytest-rerunfailures h2
+          # Pick the wheel matching this runner's CPython tag.
+          pip install --no-deps wheelhouse/saltare-*-cp${{ matrix.py_short }}-cp${{ matrix.py_short }}*-macosx_*_arm64.whl
+
+      - name: Run pytest
+        run: pytest -q tests
 
   # ---------------------------------------------------------------------------
   # aarch64 test stage. The wheels above were built but — like cp311/cp313
