@@ -128,7 +128,7 @@ var libssl_handle: ?*anyopaque = null;
 /// .so.1.1 around. Stop at the first one that loads *and* identifies as
 /// OpenSSL (see loadFuncs).
 ///
-/// v1.13 (macOS): two hazards here. (1) Bare `libssl.3.dylib` resolves via
+/// v1.12 (macOS): two hazards here. (1) Bare `libssl.3.dylib` resolves via
 /// dyld's default search path, which does not include keg-only Homebrew
 /// dirs — so the absolute Homebrew paths come first and skip the search
 /// entirely. (2) The system `libssl.dylib` is LibreSSL, which exports
@@ -272,7 +272,7 @@ pub fn newContext(
         );
     }
 
-    // v1.13 (macOS): kernel TLS is Linux-only — don't ask OpenSSL for
+    // v1.12 (macOS): kernel TLS is Linux-only — don't ask OpenSSL for
     // it on Darwin. server.zig already forces g_ktls_enabled off there;
     // this keeps the SSL_CTX option mask clean too.
     if (enable_ktls and comptime builtin.os.tag == .linux) {

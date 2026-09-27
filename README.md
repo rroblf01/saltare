@@ -157,7 +157,7 @@ Local time. Drops the v0.15 JSON shape — easier to grep / awk. The format is p
 
 ## Status
 
-> **Status: 1.13.0 — macOS arm64 ships. 520 tests pass on Apple Silicon.** The v1.12 kqueue backend is now a gated release platform: wheels build on `macos-14`, the suite runs against them, `test_macos` blocks publish. Bring-up fixed five real Darwin bugs (wrong `CLOCK_MONOTONIC` id hung the loop at 100% CPU; FreeBSD's `sendfile` signature declared as Darwin's; two use-after-free crashes silent on glibc; system LibreSSL refused at load; RSS rendered as 0) — two of them latent Linux bugs found only because Darwin crashes. No Intel wheel (declined), benchmarks stay Linux-only (`/proc`), kTLS is accepted-but-inert on macOS. Full detail, including what was **not** built and why, in [CHANGELOG.md](CHANGELOG.md).
+> **Status: 1.12.0 — macOS arm64 ships. 520 tests pass on Apple Silicon.** The kqueue backend is a gated release platform: wheels build on `macos-14`, the suite runs against them, `test_macos` blocks publish. Bring-up fixed five real Darwin bugs (wrong `CLOCK_MONOTONIC` id hung the loop at 100% CPU; FreeBSD's `sendfile` signature declared as Darwin's; two use-after-free crashes silent on glibc; system LibreSSL refused at load; RSS rendered as 0) — two of them latent Linux bugs found only because Darwin crashes. No Intel wheel (declined), benchmarks stay Linux-only (`/proc`), kTLS is accepted-but-inert on macOS. Full detail, including what was **not** built and why, in [CHANGELOG.md](CHANGELOG.md).
 
 > Earlier release history is in [CHANGELOG.md](CHANGELOG.md), which records each
 > version's decisions — including what was deliberately *not* built and the

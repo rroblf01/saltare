@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
     //      `requests`, and most other Python deps.
     // libdl is needed for dlopen / dlsym on glibc. On Darwin those live
     // in libSystem — linking -ldl there is at best unnecessary.
-    // v1.13: gate it to Linux so the macOS link stays clean.
+    // v1.12: gate it to Linux so the macOS link stays clean.
     if (target.result.os.tag == .linux) {
         root_module.linkSystemLibrary("dl", .{});
     }

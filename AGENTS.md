@@ -43,14 +43,14 @@ uv pip install -e . --no-deps --no-build-isolation   # rebuild the Zig core (~6 
   `zig fmt`** — `server.zig`, `h2.zig`, `bridge.zig` and `h2_static.zig` are already not
   `zig fmt` clean, so it would bury any real change in noise.
 
-## Platform support: Linux is primary, macOS arm64 ships since v1.13
+## Platform support: Linux is primary, macOS arm64 ships since v1.12
 
 macOS arm64 is a released, CI-gated platform (wheels build on `macos-14`,
 `test_macos` runs the full suite and blocks publish). There is deliberately
 **no Intel wheel** (negligible demand; would need Rosetta or a second runner)
 and benchmarks stay Linux-only (`benchmarks/` reads `/proc`, fails soft to 0).
 
-Darwin lessons that still bite (all earned bringing v1.13 up on real hardware):
+Darwin lessons that still bite (all earned bringing v1.12 up on real hardware):
 
 - `CLOCK_MONOTONIC` is **6** on Darwin, 1 on Linux. `clock_gettime(1)` fails
   with EINVAL — and both time readers ignored the return value, so the wheel
@@ -206,4 +206,4 @@ One source of truth for the runtime version: `pub const VERSION` in `src/zig/ser
   Before this split the pipeline was tag-only, so a push to `main` ran nothing at all.
   Only publish when the whole suite is green — `test_macos` (full suite on
   `macos-14`, after `brew install openssl@3 brotli zstd`) blocks publish
-  since v1.13, same as the Linux stages.
+  since v1.12, same as the Linux stages.

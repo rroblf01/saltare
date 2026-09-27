@@ -25,7 +25,7 @@ const Timespec = extern struct {
     tv_nsec: c_long,
 };
 extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
-// v1.13 (macOS): Darwin's CLOCK_MONOTONIC is 6, not Linux's 1.
+// v1.12 (macOS): Darwin's CLOCK_MONOTONIC is 6, not Linux's 1.
 // clock_gettime(1) fails with EINVAL there, and monoSec ignored the
 // return value — so every time read returned undefined stack garbage,
 // Wheel.tick walked a garbage-huge bucket count, and the event loop

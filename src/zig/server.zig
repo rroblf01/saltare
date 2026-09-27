@@ -226,7 +226,7 @@ fn malloc_trim(pad: usize) c_int {
 /// `module.zig`'s `version()` returns this, and it backs the default
 /// `Server:` header below — keeping both from drifting the way the old
 /// hardcoded "1.6.0" / "1.9.0" literals did.
-pub const VERSION = "1.13.0";
+pub const VERSION = "1.12.0";
 const SERVER_HEADER = "saltare/" ++ VERSION;
 
 /// Per-connection deadlines, in seconds. Set by `run()` for the duration of
@@ -962,7 +962,7 @@ const Timespec = extern struct {
     tv_nsec: c_long,
 };
 extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
-// v1.13 (macOS): same Darwin clock-id fix as timer.zig — CLOCK_MONOTONIC
+// v1.12 (macOS): same Darwin clock-id fix as timer.zig — CLOCK_MONOTONIC
 // is 6 there, 1 on Linux. monoNs feeds timeouts, rate limiting, WS
 // keepalive and the access log, so all of those read garbage before this.
 const CLOCK_MONOTONIC_COMPAT: c_int = if (builtin.os.tag == .macos) 6 else 1;
@@ -1823,7 +1823,7 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
 /// app never sees this path.
 fn serveTracemalloc(loop: *eventloop.Loop, conn: *Connection) void {
     const body = bridge.tracemallocDump(conn.allocator);
-    // v1.13 (macOS): serveFixedBody can destroy conn synchronously via
+    // v1.12 (macOS): serveFixedBody can destroy conn synchronously via
     // doWrite (Connection: close path) — capture the allocator so the
     // defer below is not use-after-free.
     const alloc = conn.allocator;
@@ -2683,7 +2683,7 @@ pub fn run(
 ) !void {
     g_tls_ctx = tls_ctx;
     defer g_tls_ctx = null;
-    // v1.13 (macOS): kernel TLS is Linux-only. Forcing the flag off on
+    // v1.12 (macOS): kernel TLS is Linux-only. Forcing the flag off on
     // Darwin keeps `--ktls` accepted-but-inert there: serveSendfile's
     // existing `!g_ktls_enabled` check 500s sendfile-over-HTTPS instead
     // of emitting plaintext on a TLS socket.
@@ -3845,7 +3845,7 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
         }
         if (result.headers) |headers| {
             var hdrs = headers;
-            // v1.13 (macOS): exits below destroy conn (dispatch failure,
+            // v1.12 (macOS): exits below destroy conn (dispatch failure,
             // sendStatus→doWrite paths) before this block returns — the
             // defer must not read conn.allocator from freed memory.
             const alloc = conn.allocator;
@@ -4559,7 +4559,7 @@ fn dispatchWithBody(loop: *eventloop.Loop, conn: *Connection, more_body: bool) v
         // the body straight to the socket without bouncing bytes
         // through Python.
         if (bridge.httpDispatchPopSendfile(start.handle, conn.allocator)) |sf| {
-            // v1.13 (macOS): serveSendfile can destroy conn synchronously
+            // v1.12 (macOS): serveSendfile can destroy conn synchronously
             // (404/500 paths go sendStatus→doWrite→destroy when the write
             // completes, as does the success path with `Connection: close`).
             // Capture the allocator first — reading conn.allocator in the
@@ -4621,7 +4621,7 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
     };
-    // v1.13 (macOS): several exits below destroy conn synchronously
+    // v1.12 (macOS): several exits below destroy conn synchronously
     // (reject/400 paths via sendStatus→doWrite, plus explicit destroy
     // on alloc failures). Capture the allocator up front — the defers
     // below run after those destroys, and reading conn.allocator then

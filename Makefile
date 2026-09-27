@@ -67,7 +67,7 @@ check-macos:
 	if [ $$fail -ne 0 ]; then exit 1; fi; \
 	echo; \
 	echo "note: module.zig and server.zig are not covered here (bridge.zig"; \
-	echo "needs a macOS Python.h). Since v1.13 those two compile for Darwin"; \
+	echo "needs a macOS Python.h). Since v1.12 those two compile for Darwin"; \
 	echo "on the macos-14 CI runners, where the full suite also runs; this"; \
 	echo "target remains the fast local pre-check. See AGENTS.md for the"; \
 	echo "symlink trick to force server.zig through anyway."

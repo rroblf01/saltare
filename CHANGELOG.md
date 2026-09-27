@@ -1,91 +1,33 @@
 # Changelog
 
-## 1.13.0
-
-**Theme: macOS arm64 ships.** The kqueue backend written in v1.12 —
-unreleased then because a hosted runner could build the wheel but not
-pass the suite — is now a gated release platform: macOS arm64 wheels
-build on `macos-14`, the full suite runs against them, and `test_macos`
-blocks publish. Validated on real Apple Silicon hardware (520 passed,
-3 skipped), not just cross-compiled.
-
-Bring-up found five real Darwin bugs, all fixed here:
-
-- **Wrong `CLOCK_MONOTONIC` id.** Both time readers hardcoded Linux's
-  `1`; Darwin's is `6`, so `clock_gettime` failed and the callers —
-  which ignore the return — read undefined stack garbage. The timer
-  wheel then walked a garbage-huge bucket count and the event loop
-  spun at 100% CPU without ever reaching kevent: the server listened
-  but never answered. One-line symptom, two-line fix (`timer.zig`,
-  `server.zig`).
-- **FreeBSD's `sendfile` signature declared as Darwin's.** The extern
-  took 7 args; Darwin takes 6 (`fd, sock, offset-by-value, len
-  in/out, hdtr, flags`) and returns 0/-1, not a byte count. GET/HEAD
-  via the extension faulted or misreported until normalised to the
-  Linux convention.
-- **Two use-after-free crashes.** The sendfile dispatch path and
-  `startWebSocket` (plus `serveTracemalloc` and the H2 headers block,
-  same pattern) deferred frees via `conn.allocator` after paths that
-  synchronously destroy the connection. Silent on glibc
-  (freed-but-mapped bytes still read back), `EXC_BAD_ACCESS` on
-  Darwin's allocator. Deterministic on 404-sendfile and rejected WS
-  handshakes. Both are fixed by capturing the allocator first — and
-  both were latent Linux bugs, found only because Darwin crashes.
-- **System LibreSSL must never load.** `libssl.dylib` on macOS exports
-  every symbol we `dlsym`, but its structs are ABI-incompatible with
-  OpenSSL 3: handshakes corrupt the heap (SIGABRT). `loadFuncs` now
-  verifies the `OpenSSL_version` prefix and keeps trying candidates;
-  absolute Homebrew `openssl@3` paths come first so keg-only installs
-  resolve with no env vars; the bare system name is dropped (macOS
-  has not shipped real OpenSSL since 10.6).
-- **RSS rendered as 0 on macOS.** `readVmRssBytes` already delegated
-  to `proc_pidinfo`, but all three render sites gated on `.linux`.
-  Now unconditional. Also: kTLS forced off on Darwin (kernel TLS is
-  Linux-only; otherwise sendfile-over-HTTPS would emit plaintext),
-  and `-ldl` links on Linux only (it lives in libSystem on Darwin).
-
-### Not built — and why
-
-- **Intel (x86_64) macOS wheels** — declined. Negligible demand, and
-  the choice is Rosetta emulation on an arm64 runner or a separate
-  Intel runner, both poor value for a platform nobody asked for.
-- **Benchmarks on macOS** — `benchmarks/` reads `/proc`, which does
-  not exist on Darwin (readers fail soft to 0). RAM numbers stay
-  Linux-only; a Mach-based sampler (`phys_footprint`) is a later
-  release's job.
-- **kTLS on macOS, `PR_SET_PDEATHSIG` equivalent** — both declined as
-  in v1.12. `--ktls` is accepted-but-inert on Darwin (sendfile-over-
-  HTTPS 500s); a SIGKILL'd multi-worker master can orphan macOS
-  workers until idle timeouts reap them.
-- **brotli/zstd on stock macOS** — graceful identity fallback, as on
-  minimal Linux images. Neither ships with the OS; the test job
-  `brew install`s them for coverage, operators who want them do the
-  same.
-
 ## 1.12.0
 
-**Theme: six real bugs, and a CI pipeline that had never run.** The headline
-findings are a heap corruption that aborted the process on **every fragmented
-WebSocket message**, and a WebSocket test suite that only passed under an
-editable install — so every release job had been failing for a reason nobody
-saw, because the pipeline itself was invalid. The rest is a category of debt
-this repo had accumulated: features with a README section, a CLI flag, and no
-test that ever reached them.
+**Theme: six real bugs, a CI pipeline that had never run — and macOS arm64
+ships.** The headline findings are a heap corruption that aborted the process
+on **every fragmented WebSocket message**, and a WebSocket test suite that
+only passed under an editable install — so every release job had been failing
+for a reason nobody saw, because the pipeline itself was invalid. The rest is
+a category of debt this repo had accumulated: features with a README section,
+a CLI flag, and no test that ever reached them. And the kqueue backend, written
+but unreleasable while no Mac could pass the suite, is now a gated release
+platform: macOS arm64 wheels build on `macos-14`, the full suite (520 passed)
+runs against them, and `test_macos` blocks publish.
 
-**macOS is not in this release.** A kqueue backend was written and is still in
-the tree, but no macOS wheel is built, no macOS test job runs, and nothing
-macOS-related gates the release. The reasoning is recorded under *Not built —
-and why*; the short version is that a hosted macOS runner could build the
-wheel but could not pass the suite, and gating a release on a platform we do
-not ship is worse than not claiming it. The Darwin code path stays
-cross-compile-checked by `make check-macos`, and gets validated on real
-hardware in a later release.
+**macOS ships in this release.** The kqueue backend written during this cycle
+is validated on real Apple Silicon hardware, not just cross-compiled — which
+is what made the release possible at all. Bring-up on a real Mac found five
+Darwin bugs (wrong `CLOCK_MONOTONIC` id hanging the loop at 100% CPU,
+FreeBSD's `sendfile` signature declared as Darwin's, two use-after-free
+crashes silent on glibc, system LibreSSL refused at load, RSS rendered as
+0); two of them were latent Linux bugs, found only because Darwin crashes.
+Details under *macOS* below; declined items (Intel wheels, macOS benchmarks,
+kTLS, brotli/zstd on stock macOS) under *Not built — and why*.
 
-### macOS — written, not shipped
+### macOS — ships, validated on real hardware
 
-Kept in the tree, absent from the release. Everything below landed and
-cross-compiles; none of it is exercised by CI in this cycle.
-
+Everything below was validated on Apple Silicon (520 passed, 3 skipped),
+not just cross-compiled — which is the only reason the five bring-up bugs
+at the end of this section were found at all.
 
 - **kqueue event loop** (`src/zig/eventloop_kqueue.zig`, new). The epoll
   implementation moved verbatim to `eventloop_epoll.zig`; `eventloop.zig`
@@ -163,9 +105,32 @@ cross-compiles; none of it is exercised by CI in this cycle.
   the two `SOCK_*` flags, a missing `fcntl.h`, a variadic literal needing a
   cast, `ident` being `usize` rather than `c_int`, a nonexistent `ext` field
   in `struct kevent`, `kevent`'s arity, and `accept(2)`'s concrete
-  `struct sockaddr *` parameter. `module.zig` is the one file still
-  unverifiable locally, so the new `test_macos` CI job — and the
-  `publish` gate that depends on it — is its real coverage.
+   `struct sockaddr *` parameter. `module.zig` is the one file still
+   unverifiable locally, so the `test_macos` CI job — full suite on
+   `macos-14`, blocking publish — is its real coverage.
+
+- **Bring-up on real hardware found five Darwin bugs** (all fixed; two
+  were latent Linux bugs, silent on glibc, found only because Darwin
+  crashes):
+  - Both time readers hardcoded Linux's `CLOCK_MONOTONIC` (`1`;
+    Darwin's is `6`), ignored the `EINVAL`, and fed undefined stack
+    garbage to the timer wheel — the loop spun at 100% CPU without
+    ever reaching kevent. The server listened but never answered.
+  - The `sendfile` extern declared FreeBSD's 7-arg shape; Darwin takes
+    6 args and returns 0/-1, normalised to the Linux convention.
+  - Two use-after-free crashes: the sendfile dispatch path and
+    `startWebSocket` (plus `serveTracemalloc` and the H2 headers
+    block, same pattern) deferred frees via `conn.allocator` after
+    paths that synchronously destroy the connection — deterministic
+    on 404-sendfile and rejected WS handshakes. Fixed by capturing
+    the allocator first.
+  - The system `libssl.dylib` (LibreSSL: same symbols, incompatible
+    structs) aborted handshakes with SIGABRT. `loadFuncs` verifies the
+    `OpenSSL_version` prefix, tries absolute Homebrew `openssl@3`
+    paths first, and dropped the bare system name entirely.
+  - `/metrics` RSS and friends rendered 0 off Linux although the
+    `proc_pidinfo` reader existed; kTLS forced off (would emit
+    plaintext); `-ldl` links on Linux only.
 
 ### Fixed
 
@@ -555,28 +520,25 @@ Two caveats recorded so the numbers are not misread later:
 
 ### Not built — and why (decision record)
 
-- **macOS wheels and the macOS test job — dropped from this release.** This
-  is the decision this cycle reversed, so the reasoning is worth stating
-  plainly rather than deleting. The kqueue backend was written, compiles,
-  and is cross-compile-checked by `make check-macos` on every change. The
-  macOS wheel also built — the `delocate` platform-tag check passes — and
-  the extension then loaded, after fixing a phantom `_sendfile_darwin`
+- **macOS wheels and the macOS test job — shipped, after nearly being
+  dropped.** The reasoning for the near-miss is worth stating plainly
+  rather than deleting. The kqueue backend was written, compiled, and
+  cross-compile-checked by `make check-macos` on every change. The macOS
+  wheel also built — the `delocate` platform-tag check passes — and the
+  extension then loaded, after fixing a phantom `_sendfile_darwin`
   symbol that only a real macOS runner could ever surface.
 
-  What could not be made green was the suite on `macos-14`. It failed with
-  the usual cross-platform timing suspects and then aborted the interpreter
-  outright (SIGABRT) with several `saltare.run` threads live, which points
-  at the process-global config that `module.zig` documents as one-serve-per-
-  process — a hazard the test suite itself walks into by starting a server
-  per test. Diagnosing that properly needs either a Mac to iterate on or a
-  root-cause stack from the runner, not a guess from a Linux box.
-
-  Releasing a wheel for a platform whose test suite aborts is worse than not
-  shipping that wheel: `test_macos` was a `needs` entry on `publish`, so the
-  alternatives were shipping red or dropping the platform. Dropped. The
-  `MACOSX_DEPLOYMENT_TARGET` plumbing in `CMakeLists.txt` stays, so a Mac
-  build still produces a correctly tagged `macosx_11_0_arm64` binary when
-  someone runs it.
+  What could not be made green from a Linux box was the suite on
+  `macos-14`: timing failures, then SIGABRT with several `saltare.run`
+  threads live, then SIGSEGV in WebSocket teardown — each pointing at
+  a different real bug (wrong `CLOCK_MONOTONIC`, LibreSSL loading,
+  use-after-free in destroy paths) rather than at the process-global
+  config first suspected. Diagnosing that properly needed a Mac to
+  iterate on, which is what unblocked it: with the five bring-up fixes
+  above, the suite is green on Apple Silicon (520 passed) and
+  `test_macos` blocks publish. Releasing a wheel for a platform whose
+  suite aborts would have been worse than not shipping it; that no
+  longer describes us.
 
 - **x86_64 macOS wheels — declined.** They would have to be a Rosetta build
   on an arm64 runner, or a separate Intel runner for a platform with
@@ -607,6 +569,9 @@ Two caveats recorded so the numbers are not misread later:
   comparable numbers, and the RAM story this project is measured on is a
   Linux server story. The macOS wheels exist for developer machines, not
   as a benchmark target.
+- **brotli/zstd on stock macOS — graceful identity fallback**, as on
+  minimal Linux images. Neither ships with the OS; the test job `brew
+  install`s them for coverage, operators who want them do the same.
 
 ## 1.11.0
 

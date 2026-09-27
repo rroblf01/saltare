@@ -6,7 +6,7 @@ name: CI
 #
 # v1.12: the entire pipeline lived in `release.yml` behind a tag trigger, so
 # a push to main ran *nothing*. That made "validate before you tag"
-# impossible. v1.13: macOS arm64 builds and tests on macos-14 runners
+# impossible. v1.12: macOS arm64 builds and tests on macos-14 runners
 # here too, so module.zig and server.zig are compiled for Darwin on a
 # real Mac on every push — `make check-macos` remains the fast local
 # pre-check for platform-only edits.

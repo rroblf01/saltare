@@ -76,7 +76,7 @@ jobs:
           - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 1, pys: "cp310 cp311" }
           - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 2, pys: "cp312 cp313" }
           - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 3, pys: "cp314" }
-          # v1.13: macOS arm64 rejoins the matrix (2+2+1 shards like
+          # v1.12: macOS arm64 rejoins the matrix (2+2+1 shards like
           # Linux). No macOS x86_64: negligible demand, and an Intel
           # wheel would need Rosetta or a separate runner.
           - { os: macos-14, arch: arm64, libc: macos, shard: 1, pys: "cp310 cp311" }
@@ -205,7 +205,7 @@ jobs:
           # fnmatch globs and multiple selectors are separated by a space
           # — which is also why the old `cp31?-*` pattern worked (`?` is
           # fnmatch for one char), and why `|` is invalid there.
-          # v1.13.1: the macOS platform tag is `macosx`, not `macos`
+          # v1.12: the macOS platform tag is `macosx`, not `macos`
           # (cibuildwheel identifiers look like `cp310-macosx_arm64`) —
           # the matrix `libc` value is only the artifact-name word.
           build_tag="${{ matrix.libc }}"
@@ -219,7 +219,7 @@ jobs:
           export CIBW_REPAIR_WHEEL_COMMAND_LINUX="auditwheel repair -w {dest_dir} {wheel}"
 
           if [ "${{ matrix.libc }}" = "macos" ]; then
-            # v1.13: no container on macOS — cibuildwheel builds in
+            # v1.12: no container on macOS — cibuildwheel builds in
             # runner-local virtualenvs, so Zig goes on PATH (the
             # Install-Zig step above put it in ZIG_DIR) and there is no
             # container mount. Delocate (the default macOS repair) runs
@@ -230,12 +230,35 @@ jobs:
             # it finds to -Dtarget=<arch>-macos.<ver> (defaulting to 11.0
             # when unset) so the .so minos and the delocate tag agree.
             export CIBW_ENVIRONMENT_MACOS="PATH=$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=${{ env.ZIG_CACHE_DIR }} PIP_CACHE_DIR=${{ env.PIP_CACHE_DIR }} PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
+            # Diagnostics: which python.org frameworks are preinstalled?
+            # Anything missing is sudo-installed from a python.org .pkg
+            # download inside cibuildwheel — if that download fails, the
+            # log below shows whether it was one version or all of them.
+            echo "preinstalled python.org frameworks:"
+            pkgutil --pkgs 2>/dev/null | grep -i "org.python.Python" || echo "(none)"
+            ls /Library/Frameworks/Python.framework/Versions/ 2>/dev/null || echo "(no Frameworks dir)"
           else
             export CIBW_CONTAINER_ENGINE="docker; create_args: --volume ${{ env.ZIG_DIR }}:/host-zig:ro --volume ${{ env.ZIG_CACHE_DIR }}:/zig-cache:rw --volume $CIBW_CACHE_DIR:/pip-cache:rw"
             export CIBW_ENVIRONMENT_LINUX="PATH=/host-zig:/usr/local/bin:\$PATH ZIG_VERSION=${{ env.ZIG_VERSION }} ZIG_GLOBAL_CACHE_DIR=/zig-cache PIP_CACHE_DIR=/pip-cache PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_WARN_SCRIPT_LOCATION=0 PIP_NO_BUILD_ISOLATION=0"
           fi
 
-          cibuildwheel --output-dir wheelhouse
+          # macOS only: cibuildwheel sudo-installs any missing framework
+          # CPython from a python.org .pkg download. That download has
+          # flaked (DNS) on hosted runners; installed frameworks persist
+          # on the runner for the job duration, so a bounded retry heals
+          # transients without rebuilding what already succeeded.
+          attempt=1
+          if [ "${{ matrix.libc }}" = "macos" ]; then
+            until cibuildwheel --output-dir wheelhouse; do
+              rc=$?
+              attempt=$((attempt + 1))
+              if [ "$attempt" -gt 3 ]; then exit "$rc"; fi
+              echo "cibuildwheel failed (rc=$rc), retrying ($attempt/3) in 30s..."
+              sleep 30
+            done
+          else
+            cibuildwheel --output-dir wheelhouse
+          fi
       - uses: actions/upload-artifact@v4
         with:
           # One artifact per shard: three shards of the same (arch, libc)
@@ -312,7 +335,7 @@ jobs:
       - name: Run pytest
         run: pytest -q tests
 
-  # v1.13: `test_macos` is back, and it is a blocking gate — publish
+  # v1.12: `test_macos` is back, and it is a blocking gate — publish
   # waits for the whole called workflow, so a red macOS suite stops
   # the release. TLS tests need a real OpenSSL 3 (the system
   # libssl.dylib is LibreSSL, which saltare refuses to run against),

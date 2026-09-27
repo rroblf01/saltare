@@ -89,7 +89,7 @@ def _list_worker_pids(master_pid: int) -> list[int]:
     on macOS (no /proc there). Used to verify both that workers
     are spawned AND that they're cleaned up on shutdown."""
     if sys.platform == "darwin":
-        # v1.13 (macOS): no /proc — pgrep lists direct children the
+        # v1.12 (macOS): no /proc — pgrep lists direct children the
         # same way. Non-zero exit = no children (yet), not an error.
         try:
             out = subprocess.run(

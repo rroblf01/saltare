@@ -54,7 +54,7 @@ jobs:
   # matrix passing — including test_macos, which runs inside the called
   # workflow. A release is not published with a red platform.
   #
-  # v1.13: macOS arm64 is a release-gated platform again (it builds and
+  # v1.12: macOS arm64 is a release-gated platform again (it builds and
   # its suite runs on macos-14). No macOS x86_64 wheel is built, so
   # there is nothing Intel to gate on.
   #

@@ -6,7 +6,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "saltare"
-version = "1.13.0"
+version = "1.12.0"
 description = "Low-RAM ASGI HTTP server with a Zig backbone."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -124,7 +124,7 @@ musllinux-aarch64-image = "musllinux_1_2"
 select = "*-musllinux*"
 before-all = "bash {project}/scripts/install-zig.sh"
 
-# v1.13: macOS arm64 is a shipped platform (kqueue backend, validated
+# v1.12: macOS arm64 is a shipped platform (kqueue backend, validated
 # on real hardware). Linux builds run in manylinux containers with Zig
 # mounted in; macOS builds run runner-locally (no container backend),
 # so before-all just ensures Zig is on PATH and archs pins arm64 —
