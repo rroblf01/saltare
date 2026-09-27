@@ -85,9 +85,24 @@ def _kill_if_alive(proc: subprocess.Popen) -> None:
 
 
 def _list_worker_pids(master_pid: int) -> list[int]:
-    """Linux-only: read /proc/<master>/task/<master>/children for the
-    direct children of `master_pid`. Used to verify both that workers
+    """Direct children of `master_pid`. Via /proc on Linux, `pgrep -P`
+    on macOS (no /proc there). Used to verify both that workers
     are spawned AND that they're cleaned up on shutdown."""
+    if sys.platform == "darwin":
+        # v1.13 (macOS): no /proc — pgrep lists direct children the
+        # same way. Non-zero exit = no children (yet), not an error.
+        try:
+            out = subprocess.run(
+                ["pgrep", "-P", str(master_pid)],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if out.returncode != 0:
+            return []
+        return [int(p) for p in out.stdout.split() if p.strip().isdigit()]
     path = f"/proc/{master_pid}/task/{master_pid}/children"
     try:
         with open(path) as f:
@@ -97,12 +112,13 @@ def _list_worker_pids(master_pid: int) -> list[int]:
 
 
 @pytest.mark.skipif(
-    not os.path.exists("/proc/self/task"),
-    reason="needs /proc to enumerate worker pids (Linux-only feature)",
+    not os.path.exists("/proc/self/task") and sys.platform != "darwin",
+    reason="needs /proc (Linux) or pgrep (macOS) to enumerate worker pids",
 )
 def test_multiworker_spawns_n_workers() -> None:
     """`workers=2` must result in exactly 2 child processes under the
-    master. Verified via `/proc/<pid>/task/<pid>/children`."""
+    master. Verified via `/proc/<pid>/task/<pid>/children` on Linux,
+    `pgrep -P` on macOS."""
     port = _free_port()
     proc = _spawn_saltare_subprocess(port, workers=2)
     try:

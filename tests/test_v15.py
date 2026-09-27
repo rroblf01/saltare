@@ -170,12 +170,12 @@ def test_metrics_includes_process_metrics():
 
 
 @pytest.mark.skipif(
-    _platform.machine() in {"aarch64", "arm64"},
+    _platform.system() == "Linux" and _platform.machine() == "aarch64",
     reason="QEMU-emulated aarch64 in CI takes >24 s to fork+exec+import a "
-           "fresh saltare subprocess; the SIGHUP path is identical between "
-           "x86_64 and aarch64 (it's a Python+Zig orchestration, no arch-"
-           "specific behaviour) so we keep coverage on x86_64 only. Native "
-           "aarch64 hosts (no QEMU) would re-enable easily.",
+            "fresh saltare subprocess; the SIGHUP path is identical between "
+            "x86_64 and aarch64 (it's a Python+Zig orchestration, no arch-"
+            "specific behaviour) so we keep coverage on x86_64 only. Native "
+            "aarch64 hosts (no QEMU — including Apple Silicon) run it.",
 )
 @pytest.mark.flaky(reruns=2, reruns_delay=1)
 def test_sighup_runtime_config_reload(tmp_path):
