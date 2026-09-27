@@ -1823,7 +1823,11 @@ fn serveSendfile(loop: *eventloop.Loop, conn: *Connection, sf: bridge.SendfileRe
 /// app never sees this path.
 fn serveTracemalloc(loop: *eventloop.Loop, conn: *Connection) void {
     const body = bridge.tracemallocDump(conn.allocator);
-    defer if (body.len > 0) conn.allocator.free(body);
+    // v1.13 (macOS): serveFixedBody can destroy conn synchronously via
+    // doWrite (Connection: close path) — capture the allocator so the
+    // defer below is not use-after-free.
+    const alloc = conn.allocator;
+    defer if (body.len > 0) alloc.free(body);
     const safe_body: []const u8 = if (body.len > 0) body else "tracemalloc not available\n";
     serveFixedBody(loop, conn, 200, "OK", "text/plain; charset=utf-8", safe_body, "");
 }
@@ -3841,7 +3845,11 @@ fn doReadHttp2(loop: *eventloop.Loop, conn: *Connection) void {
         }
         if (result.headers) |headers| {
             var hdrs = headers;
-            defer hdrs.deinit(conn.allocator);
+            // v1.13 (macOS): exits below destroy conn (dispatch failure,
+            // sendStatus→doWrite paths) before this block returns — the
+            // defer must not read conn.allocator from freed memory.
+            const alloc = conn.allocator;
+            defer hdrs.deinit(alloc);
             _ = h2c.streams.get(result.stream_id);
             var scheme: []const u8 = "https";
             var method: []const u8 = "";
@@ -4613,15 +4621,21 @@ fn startWebSocket(loop: *eventloop.Loop, conn: *Connection) void {
         sendStatus(loop, conn, 500, "Internal Server Error");
         return;
     };
+    // v1.13 (macOS): several exits below destroy conn synchronously
+    // (reject/400 paths via sendStatus→doWrite, plus explicit destroy
+    // on alloc failures). Capture the allocator up front — the defers
+    // below run after those destroys, and reading conn.allocator then
+    // is use-after-free (silent on glibc, EXC_BAD_ACCESS on Darwin).
+    const alloc = conn.allocator;
     // Subprotocol + extensions buffers owned by us; free in every
     // exit branch.
-    defer if (opened.subprotocol.len > 0) conn.allocator.free(opened.subprotocol);
-    defer if (opened.extensions.len > 0) conn.allocator.free(opened.extensions);
+    defer if (opened.subprotocol.len > 0) alloc.free(opened.subprotocol);
+    defer if (opened.extensions.len > 0) alloc.free(opened.extensions);
     // v1.7: close_reason is empty in the accept path; defer-free here so
     // the reject-branch's explicit free + this defer never double-up
     // (the reject branch sets reason.len = 0 before returning by freeing
     // and not nulling, but we early-return before this defer runs).
-    defer if (opened.close_reason.len > 0) conn.allocator.free(opened.close_reason);
+    defer if (opened.close_reason.len > 0) alloc.free(opened.close_reason);
 
     if (!opened.accepted) {
         // App rejected by closing without accepting.
