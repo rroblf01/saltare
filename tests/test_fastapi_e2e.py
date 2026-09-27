@@ -11,14 +11,12 @@ with a lifespan, path parameters, query parameters, request-body
 validation, a streaming response and a WebSocket endpoint, served by
 saltare and driven by `httpx` and the `websockets` client.
 
-The WebSocket test uses the real `websockets` library rather than raw
-frames, which makes it the only place in the suite that validates saltare
-against an independent RFC 6455 implementation. It is kept to **one**
-test for that reason: five tests in `tests/test_websocket.py` are
-permanently skipped because multiple WebSocket tests in one pytest
-process hit a daemon-thread teardown segfault (v0.10). One WS test per
-module is safe; the crash comes from the *interleaving*, not from the
-library.
+The WebSocket tests use the real `websockets` library rather than raw
+frames, which makes them the place in the suite that validates saltare
+against an independent RFC 6455 implementation. (An earlier revision
+kept this to one test on the theory — since disproven in v1.12 — that
+multiple WebSocket tests in one pytest process crash during teardown;
+see the `test_websocket.py` docstring for that history.)
 """
 
 from __future__ import annotations
