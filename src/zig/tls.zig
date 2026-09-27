@@ -68,6 +68,10 @@ const Funcs = struct {
     SSL_get_error: *const fn (*Ssl, c_int) callconv(.c) c_int,
     SSL_session_reused: *const fn (*Ssl) callconv(.c) c_int,
     SSL_get0_alpn_selected: *const fn (*Ssl, [*c][*c]const u8, [*c]c_uint) callconv(.c) void,
+    // Identity query: LibreSSL exports every symbol above under the same
+    // names, but its structs are ABI-incompatible with OpenSSL 3 — running
+    // our calls against it corrupts the heap (SIGABRT on first handshake).
+    OpenSSL_version: *const fn (c_int) callconv(.c) [*:0]const u8,
 };
 
 // Server ALPN selection callback type (OpenSSL `SSL_CTX_alpn_select_cb_func`).
@@ -121,53 +125,69 @@ var libssl_handle: ?*anyopaque = null;
 
 /// SONAME variants we try in order. Modern systems (Debian/Ubuntu 22+,
 /// RHEL 9+, manylinux_2_28) ship libssl.so.3; older long-tail keeps
-/// .so.1.1 around. Stop at the first one that loads.
+/// .so.1.1 around. Stop at the first one that loads *and* identifies as
+/// OpenSSL (see loadFuncs).
 ///
-/// v1.12: the `.dylib` names are for macOS, where the shared library is
-/// reached by install name rather than soname. Homebrew's openssl@3
-/// installs `libssl.3.dylib` next to a `libssl.dylib` symlink, and the
-/// system LibreSSL/OpenSSL on older macOS is `libssl.dylib` too. Listing
-/// the versioned name first matters for the same reason `.so.3` precedes
-/// `.so.1.1`: a dlopen by bare name can otherwise pick up a stale copy
-/// from the default search path. Without these entries TLS silently
-/// no-ops on macOS — `newContext` returns `LibSslNotFound` and the
-/// server starts in plain-HTTP mode with only a stderr warning.
+/// v1.13 (macOS): two hazards here. (1) Bare `libssl.3.dylib` resolves via
+/// dyld's default search path, which does not include keg-only Homebrew
+/// dirs — so the absolute Homebrew paths come first and skip the search
+/// entirely. (2) The system `libssl.dylib` is LibreSSL, which exports
+/// every symbol we need under identical names but with incompatible
+/// structs; loading it aborts the process on the first handshake.
+/// loadFuncs therefore rejects anything whose version string is not
+/// "OpenSSL ..." and keeps trying later candidates.
 const SONAMES = [_][:0]const u8{
     "libssl.so.3",
     "libssl.so.1.1",
     "libssl.so", // some distros ship the unversioned dev symlink
-    "libssl.3.dylib", // macOS + Homebrew openssl@3
-    "libssl.dylib", // macOS system / unversioned symlink
+    "/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib", // macOS arm64 Homebrew
+    "/usr/local/opt/openssl@3/lib/libssl.3.dylib", // macOS Intel Homebrew
+    "libssl.3.dylib", // macOS + Homebrew openssl@3 on the search path
+    // NOTE: no bare `libssl.dylib` on macOS. The system one is LibreSSL
+    // (same symbols, incompatible structs → SIGABRT), and macOS has not
+    // shipped real OpenSSL since 10.6, so the bare name can never resolve
+    // to anything usable. Worse, dlopen'ing it in a process that has not
+    // already loaded it aborts outright.
     "libssl.1.1.dylib",
 };
+
+const OPENSSL_VERSION_QUERY: c_int = 0;
 
 fn loadFuncs() bool {
     if (funcs != null) return true;
 
     for (SONAMES) |name| {
         const h = dl.dlopen(name.ptr, dl.RTLD_NOW | dl.RTLD_GLOBAL);
-        if (h != null) {
-            libssl_handle = h;
-            break;
+        if (h == null) continue;
+        // Resolve every symbol up front. If any one is missing we treat
+        // this candidate as a failure — partial resolution would leak
+        // null function pointers into the hot path.
+        var f: Funcs = undefined;
+        var resolved = true;
+        inline for (@typeInfo(Funcs).@"struct".fields) |field| {
+            const sym = dl.dlsym(h, field.name.ptr);
+            if (sym == null) {
+                resolved = false;
+                break;
+            }
+            @field(f, field.name) = @ptrCast(@alignCast(sym));
         }
-    }
-    if (libssl_handle == null) return false;
-
-    // Resolve every symbol up front. If any one is missing we treat the
-    // whole load as a failure — partial resolution would leak null
-    // function pointers into the hot path.
-    var f: Funcs = undefined;
-    inline for (@typeInfo(Funcs).@"struct".fields) |field| {
-        const sym = dl.dlsym(libssl_handle, field.name.ptr);
-        if (sym == null) {
-            _ = dl.dlclose(libssl_handle);
-            libssl_handle = null;
-            return false;
+        if (!resolved) {
+            _ = dl.dlclose(h);
+            continue;
         }
-        @field(f, field.name) = @ptrCast(@alignCast(sym));
+        // Reject LibreSSL (and anything else impersonating the ABI):
+        // same symbols, different structs, heap corruption at runtime.
+        const ver = std.mem.span(f.OpenSSL_version(OPENSSL_VERSION_QUERY));
+        if (!std.mem.startsWith(u8, ver, "OpenSSL ")) {
+            _ = dl.dlclose(h);
+            continue;
+        }
+        libssl_handle = h;
+        funcs = f;
+        return true;
     }
-    funcs = f;
-    return true;
+    return false;
 }
 
 pub const InitError = error{
