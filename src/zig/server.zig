@@ -952,7 +952,10 @@ const Timespec = extern struct {
     tv_nsec: c_long,
 };
 extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
-const CLOCK_MONOTONIC_COMPAT: c_int = 1;
+// v1.13 (macOS): same Darwin clock-id fix as timer.zig — CLOCK_MONOTONIC
+// is 6 there, 1 on Linux. monoNs feeds timeouts, rate limiting, WS
+// keepalive and the access log, so all of those read garbage before this.
+const CLOCK_MONOTONIC_COMPAT: c_int = if (builtin.os.tag == .macos) 6 else 1;
 
 fn monoNs() i64 {
     var ts: Timespec = undefined;

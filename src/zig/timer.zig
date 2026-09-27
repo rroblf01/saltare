@@ -14,6 +14,7 @@
 // covers all current configurable timeouts.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 // musl's `time.h` forward-declares `struct timespec` and puts the
 // definition behind feature gates Zig's translate-c misses. Same
@@ -24,7 +25,12 @@ const Timespec = extern struct {
     tv_nsec: c_long,
 };
 extern fn clock_gettime(clk_id: c_int, tp: *Timespec) c_int;
-const CLOCK_MONOTONIC: c_int = 1;
+// v1.13 (macOS): Darwin's CLOCK_MONOTONIC is 6, not Linux's 1.
+// clock_gettime(1) fails with EINVAL there, and monoSec ignored the
+// return value — so every time read returned undefined stack garbage,
+// Wheel.tick walked a garbage-huge bucket count, and the event loop
+// spun at 100% CPU without ever reaching kevent.
+const CLOCK_MONOTONIC: c_int = if (builtin.os.tag == .macos) 6 else 1;
 
 /// Monotonic seconds since some unspecified epoch. We don't use std.time
 /// here because Zig 0.16's std.time was trimmed down significantly (see
