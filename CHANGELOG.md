@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+**Theme: drop Python 3.10, add Python 3.15; migrate the Zig backbone to 0.17.**
+
+- **Python support window moved to 3.11–3.15.** `requires-python` is now
+  `>=3.11`; the cibuildwheel matrix, CI test matrices and docs no longer
+  reference 3.10. Full suite passes on CPython 3.15.0 (521 passed).
+- **Zig toolchain migrated from 0.16.0 to 0.17.0.** `@cImport` was removed
+  upstream, so every C interop block in `src/zig/` is now produced via
+  `zig translate-c` from small `.c` sources under `src/zig/c/`. Follow-up
+  std-library API updates (optimize enum casing, `@splat` for repeated
+  array initializers, `bufPrintSentinel`, `Type.Struct.field_names`,
+  `std.ascii.indexOfIgnoreCase` replacement, `**` whitespace) are included.
+  Build and full test suite pass on Zig 0.17.0.
+
+
 ## 1.12.0
 
 **Theme: six real bugs, a CI pipeline that had never run — and macOS arm64

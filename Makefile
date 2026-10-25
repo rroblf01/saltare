@@ -96,7 +96,7 @@ help:
 	@echo "  clean              Remove build artifacts"
 	@echo ""
 	@echo "Defaults: PYTHON_TAG=$(PYTHON_TAG)  MANYLINUX_TAG=$(MANYLINUX_TAG)  PLATFORM=$(DOCKER_PLATFORM)"
-	@echo "Override: make test PYTHON_TAG=cp310-cp310 MANYLINUX_TAG=manylinux_2_28_x86_64"
+	@echo "Override: make test PYTHON_TAG=cp311-cp311 MANYLINUX_TAG=manylinux_2_28_x86_64"
 
 build:
 	DOCKER_BUILDKIT=1 docker build \

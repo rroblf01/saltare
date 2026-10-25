@@ -11,9 +11,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const dl = @cImport({
-    @cInclude("dlfcn.h");
-});
+const dl = @import("dlfcn");
 
 /// Opaque z_stream — we only ever pass pointers, never look inside.
 pub const ZStream = extern struct {
@@ -81,14 +79,14 @@ fn loadFuncs() bool {
     if (libz_handle == null) return false;
 
     var f: Funcs = undefined;
-    inline for (@typeInfo(Funcs).@"struct".fields) |field| {
-        const sym = dl.dlsym(libz_handle, field.name.ptr);
+    inline for (@typeInfo(Funcs).@"struct".field_names) |field_name| {
+        const sym = dl.dlsym(libz_handle, field_name.ptr);
         if (sym == null) {
             _ = dl.dlclose(libz_handle);
             libz_handle = null;
             return false;
         }
-        @field(f, field.name) = @ptrCast(@alignCast(sym));
+        @field(f, field_name) = @ptrCast(@alignCast(sym));
     }
     funcs = f;
     return true;

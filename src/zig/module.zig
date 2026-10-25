@@ -19,17 +19,7 @@ const zlib_mod = @import("zlib.zig");
 const brotli_mod = @import("brotli.zig");
 const zstd_mod = @import("zstd.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-    @cInclude("sys/types.h");
-    @cInclude("sys/wait.h");
-    // v1.12: sys/prctl.h is deliberately NOT cimport'd — it does not exist
-    // on Darwin, and a top-level @cImport is evaluated unconditionally, so
-    // including it made macOS builds fail before any of our own code ran.
-    // prctl is declared by hand below instead, the same way server.zig
-    // declares accept4 and sendfile.
-    @cInclude("signal.h");
-});
+const c = @import("module_sys");
 
 // prctl(2), declared by hand. The prototype and the two option numbers we
 // use are stable Linux ABI (asm-generic/prctl.h), so hard-coding them is
@@ -79,9 +69,7 @@ fn setProcName(name: []const u8) void {
 // would still resolve at load time and ImportError the .so. Resolve via
 // `dlsym(RTLD_DEFAULT, ...)` at first use; if NULL (musl), the wrapper
 // no-ops. Same applies to `malloc_trim`.
-const dl = @cImport({
-    @cInclude("dlfcn.h");
-});
+const dl = @import("dlfcn");
 
 const Mallopt = *const fn (c_int, c_int) callconv(.c) c_int;
 const MallocTrim = *const fn (usize) callconv(.c) c_int;
@@ -408,10 +396,11 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
     if (both_set) {
         tls_ctx = tls.newContext(ssl_cert_z, ssl_key_z, tls_session_cache, ssl_ca_z, ssl_verify_client_flag != 0, ktls_flag != 0, http2_flag != 0) catch |err| {
             var msg_buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(
+            const msg = std.fmt.bufPrintSentinel(
                 &msg_buf,
                 "saltare TLS init failed: {s}",
                 .{@errorName(err)},
+                0,
             ) catch "saltare TLS init failed";
             py.PyErr_SetString(py.PyExc_RuntimeError, msg.ptr);
             return null;
@@ -427,7 +416,7 @@ fn saltareServe(_: ?*py.PyObject, args: ?*py.PyObject) callconv(.c) ?*py.PyObjec
         // never imports the user app's behaviour, only its references.
         const listen_fd = server.bindAndListen(host, @intCast(port), uds_path) catch |err| {
             var msg_buf: [128]u8 = undefined;
-            const msg = std.fmt.bufPrintZ(&msg_buf, "saltare bind failed: {s}", .{@errorName(err)}) catch "saltare bind failed";
+            const msg = std.fmt.bufPrintSentinel(&msg_buf, "saltare bind failed: {s}", .{@errorName(err)}, 0) catch "saltare bind failed";
             py.PyErr_SetString(py.PyExc_RuntimeError, msg.ptr);
             return null;
         };
@@ -501,10 +490,11 @@ fn runSingleWorker(
         bridge.lifespanShutdown();
         bridge.shutdown();
         var msg_buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrintZ(
+        const msg = std.fmt.bufPrintSentinel(
             &msg_buf,
             "saltare server failed: {s}",
             .{@errorName(err)},
+            0,
         ) catch "saltare server failed";
         py.PyErr_SetString(py.PyExc_RuntimeError, msg.ptr);
         return null;

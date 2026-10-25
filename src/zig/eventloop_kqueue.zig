@@ -29,13 +29,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const c = @cImport({
-    @cInclude("sys/event.h");
-    @cInclude("sys/time.h");
-    @cInclude("sys/types.h");
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-});
+const c = @import("kqueue_c");
 
 pub const Event = struct {
     /// User pointer registered when this fd was added (or null for the listener).

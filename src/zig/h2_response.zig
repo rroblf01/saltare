@@ -234,10 +234,25 @@ pub const Transcoder = struct {
 
             // Drop headers that are illegal / connection-specific in HTTP/2.
             if (isHopByHop(name)) {
-                if (std.mem.eql(u8, name, "transfer-encoding") and
-                    std.ascii.indexOfIgnoreCase(raw_value, "chunked") != null)
-                {
-                    chunked = true;
+                if (std.mem.eql(u8, name, "transfer-encoding")) {
+                    var has_chunked = false;
+                    var ci: usize = 0;
+                    while (ci + 7 <= raw_value.len) : (ci += 1) {
+                        if (std.ascii.toLower(raw_value[ci]) == 'c' and
+                            std.ascii.toLower(raw_value[ci + 1]) == 'h' and
+                            std.ascii.toLower(raw_value[ci + 2]) == 'u' and
+                            std.ascii.toLower(raw_value[ci + 3]) == 'n' and
+                            std.ascii.toLower(raw_value[ci + 4]) == 'k' and
+                            std.ascii.toLower(raw_value[ci + 5]) == 'e' and
+                            std.ascii.toLower(raw_value[ci + 6]) == 'd')
+                        {
+                            has_chunked = true;
+                            break;
+                        }
+                    }
+                    if (has_chunked) {
+                        chunked = true;
+                    }
                 }
                 self.allocator.free(name);
                 continue;
@@ -626,7 +641,7 @@ test "flow control: body beyond the window is held, then resumed by WINDOW_UPDAT
     defer out.deinit(a);
 
     // 25-byte body, windows only allow 10 initially.
-    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\n" ++ ("a" ** 25);
+    const resp = "HTTP/1.1 200 OK\r\nContent-Length: 25\r\n\r\n" ++ ("a"**25);
     try tc.feed(resp, &out);
     try tc.finish(&out);
     try testing.expect(!tc.isDone()); // blocked: only 10 of 25 sent

@@ -14,9 +14,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const dl = @cImport({
-    @cInclude("dlfcn.h");
-});
+const dl = @import("dlfcn");
 
 // Opaque types — we never look inside an SSL or SSL_CTX struct, so we
 // don't need OpenSSL's headers to typecheck pointer arguments.
@@ -164,13 +162,13 @@ fn loadFuncs() bool {
         // null function pointers into the hot path.
         var f: Funcs = undefined;
         var resolved = true;
-        inline for (@typeInfo(Funcs).@"struct".fields) |field| {
-            const sym = dl.dlsym(h, field.name.ptr);
+        inline for (@typeInfo(Funcs).@"struct".field_names) |field_name| {
+            const sym = dl.dlsym(h, field_name.ptr);
             if (sym == null) {
                 resolved = false;
                 break;
             }
-            @field(f, field.name) = @ptrCast(@alignCast(sym));
+            @field(f, field_name) = @ptrCast(@alignCast(sym));
         }
         if (!resolved) {
             _ = dl.dlclose(h);

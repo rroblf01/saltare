@@ -30,29 +30,7 @@ const h2_response = @import("h2_response.zig");
 // headers out of the Linux build.
 const procstats_darwin = @import("procstats_darwin.zig");
 
-const c = @cImport({
-    // sys/types.h first so musl's `bits/types/struct_timespec.h` /
-    // `bits/types/struct_stat.h` get pulled in transitively. Without
-    // this, Zig's translate-c reports both as opaque under musllinux
-    // (glibc inlines them in time.h / sys/stat.h directly).
-    @cInclude("sys/types.h");
-    @cInclude("sys/socket.h");
-    @cInclude("netinet/in.h");
-    @cInclude("netinet/tcp.h");
-    @cInclude("sys/un.h");
-    @cInclude("sys/resource.h");
-    // v1.12: sys/sendfile.h is deliberately NOT cimport'd. Linux has it,
-    // Darwin does not ship it in the form Zig's bundled libc expects, and
-    // the two `sendfile` calls have incompatible signatures anyway (see
-    // sendFileChunk below). Both are declared by hand instead.
-    @cInclude("sys/stat.h");
-    @cInclude("unistd.h");
-    @cInclude("signal.h");
-    @cInclude("fcntl.h");
-    @cInclude("time.h");
-    @cInclude("arpa/inet.h");
-    @cInclude("dirent.h");
-});
+const c = @import("server_c");
 
 // sendfile(2), declared per platform. The signatures are incompatible:
 //
@@ -206,16 +184,14 @@ inline fn acceptOne(
 // glibc-only. `extern fn` would fail to resolve at .so load time on
 // musl (musllinux wheel target), so we look up the symbol via
 // `dlsym(RTLD_DEFAULT, ...)` lazily; missing → no-op.
-const dl_server = @cImport({
-    @cInclude("dlfcn.h");
-});
+const dl = @import("dlfcn");
 const MallocTrim = *const fn (usize) callconv(.c) c_int;
 var g_malloc_trim_server: ?MallocTrim = null;
 var g_malloc_trim_probed: bool = false;
 fn malloc_trim(pad: usize) c_int {
     if (!g_malloc_trim_probed) {
         g_malloc_trim_probed = true;
-        const sym = dl_server.dlsym(null, "malloc_trim");
+        const sym = dl.dlsym(null, "malloc_trim");
         if (sym != null) g_malloc_trim_server = @ptrCast(@alignCast(sym));
     }
     if (g_malloc_trim_server) |fp| return fp(pad);

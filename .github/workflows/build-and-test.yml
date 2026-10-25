@@ -14,7 +14,7 @@ on:
   workflow_call:
 
 env:
-  ZIG_VERSION: "0.16.0"
+  ZIG_VERSION: "0.17.0"
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -64,24 +64,24 @@ jobs:
           # of five. `pys` is a space-separated list because CIBW_BUILD
           # takes space-separated selectors — the build step joins it
           # there.
-          - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 1, pys: "cp310 cp311" }
-          - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 2, pys: "cp312 cp313" }
-          - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 3, pys: "cp314" }
-          - { os: ubuntu-latest,     arch: x86_64,  libc: musllinux, shard: 1, pys: "cp310 cp311" }
-          - { os: ubuntu-latest,     arch: x86_64,  libc: musllinux, shard: 2, pys: "cp312 cp313" }
-          - { os: ubuntu-latest,     arch: x86_64,  libc: musllinux, shard: 3, pys: "cp314" }
-          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: manylinux, shard: 1, pys: "cp310 cp311" }
-          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: manylinux, shard: 2, pys: "cp312 cp313" }
-          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: manylinux, shard: 3, pys: "cp314" }
-          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 1, pys: "cp310 cp311" }
-          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 2, pys: "cp312 cp313" }
-          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 3, pys: "cp314" }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 1, pys: "cp311 cp312" }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 2, pys: "cp313 cp314" }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: manylinux, shard: 3, pys: "cp315" }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: musllinux, shard: 1, pys: "cp311 cp312" }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: musllinux, shard: 2, pys: "cp313 cp314" }
+          - { os: ubuntu-latest,     arch: x86_64,  libc: musllinux, shard: 3, pys: "cp315" }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: manylinux, shard: 1, pys: "cp311 cp312" }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: manylinux, shard: 2, pys: "cp313 cp314" }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: manylinux, shard: 3, pys: "cp315" }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 1, pys: "cp311 cp312" }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 2, pys: "cp313 cp314" }
+          - { os: ubuntu-24.04-arm,  arch: aarch64, libc: musllinux, shard: 3, pys: "cp315" }
           # v1.12: macOS arm64 rejoins the matrix (2+2+1 shards like
           # Linux). No macOS x86_64: negligible demand, and an Intel
           # wheel would need Rosetta or a separate runner.
-          - { os: macos-14, arch: arm64, libc: macos, shard: 1, pys: "cp310 cp311" }
-          - { os: macos-14, arch: arm64, libc: macos, shard: 2, pys: "cp312 cp313" }
-          - { os: macos-14, arch: arm64, libc: macos, shard: 3, pys: "cp314" }
+          - { os: macos-14, arch: arm64, libc: macos, shard: 1, pys: "cp311 cp312" }
+          - { os: macos-14, arch: arm64, libc: macos, shard: 2, pys: "cp313 cp314" }
+          - { os: macos-14, arch: arm64, libc: macos, shard: 3, pys: "cp315" }
     steps:
       - uses: actions/checkout@v4
 
@@ -295,7 +295,7 @@ jobs:
           # run against* — and this suite has a track record of paths that
           # only break on one interpreter. Two more jobs is a cheap price
           # for not shipping untested wheels.
-          - { python-version: "3.10", py_short: "310" }
+          - { python-version: "3.15", py_short: "315" }
           - { python-version: "3.11", py_short: "311" }
           - { python-version: "3.12", py_short: "312" }
           - { python-version: "3.13", py_short: "313" }
@@ -356,7 +356,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { python-version: "3.10", py_short: "310" }
+          - { python-version: "3.15", py_short: "315" }
           - { python-version: "3.11", py_short: "311" }
           - { python-version: "3.12", py_short: "312" }
           - { python-version: "3.13", py_short: "313" }
@@ -415,7 +415,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { python-version: "3.10", py_short: "310" }
+          - { python-version: "3.15", py_short: "315" }
           - { python-version: "3.11", py_short: "311" }
           - { python-version: "3.12", py_short: "312" }
           - { python-version: "3.13", py_short: "313" }

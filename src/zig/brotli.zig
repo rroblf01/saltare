@@ -5,9 +5,7 @@
 
 const std = @import("std");
 
-const dl = @cImport({
-    @cInclude("dlfcn.h");
-});
+const dl = @import("dlfcn");
 
 // Symbols we use from libbrotlienc + libbrotlidec. Streaming surface
 // (v1.6) added `BrotliEncoderCreateInstance` / `…SetParameter` /
@@ -82,11 +80,11 @@ fn loadFuncs() bool {
         return false;
     }
     var f: Funcs = undefined;
-    inline for (@typeInfo(Funcs).@"struct".fields) |field| {
+    inline for (@typeInfo(Funcs).@"struct".field_names) |field_name| {
         // Encoder symbols live in libbrotlienc; decoder symbols in
         // libbrotlidec. We try both handles and keep whichever resolves.
-        const enc_sym = dl.dlsym(enc_handle, field.name.ptr);
-        const dec_sym = dl.dlsym(dec_handle, field.name.ptr);
+        const enc_sym = dl.dlsym(enc_handle, field_name.ptr);
+        const dec_sym = dl.dlsym(dec_handle, field_name.ptr);
         const sym = if (enc_sym != null) enc_sym else dec_sym;
         if (sym == null) {
             _ = dl.dlclose(enc_handle);
@@ -95,7 +93,7 @@ fn loadFuncs() bool {
             dec_handle = null;
             return false;
         }
-        @field(f, field.name) = @ptrCast(@alignCast(sym));
+        @field(f, field_name) = @ptrCast(@alignCast(sym));
     }
     funcs = f;
     return true;

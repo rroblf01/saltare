@@ -778,7 +778,7 @@ test "WINDOW_UPDATE with a zero increment is a ProtocolError" {
     var conn = Connection.init(std.testing.allocator);
     defer conn.deinit();
     var buf: [32]u8 = undefined;
-    var inc = [_]u8{0} ** 4;
+    var inc: [4]u8 = @splat(0);
     const f = buildFrame(&buf, HTTP2_FRAME_TYPE_WINDOW_UPDATE, 0, 0, &inc);
     try std.testing.expectError(error.ProtocolError, conn.processFrame(f));
 }

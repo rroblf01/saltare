@@ -12,10 +12,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const c = @cImport({
-    @cInclude("sys/epoll.h");
-    @cInclude("unistd.h");
-});
+const c = @import("epoll_c");
 
 pub const Event = struct {
     /// User pointer registered when this fd was added (or null for the listener).

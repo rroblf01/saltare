@@ -12,13 +12,13 @@
 # stays as a fallback for hosts without Python.
 #
 # Override:
-#   ZIG_VERSION         (default 0.16.0)
+#   ZIG_VERSION         (default 0.17.0)
 #   ZIG_INSTALL_DIR     (default /opt/zig)
 #   ZIG_SKIP_SYMLINK    (default 0; set 1 to leave /usr/local/bin/zig alone)
 
 set -euo pipefail
 
-ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
+ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 INSTALL_DIR="${ZIG_INSTALL_DIR:-/opt/zig}"
 
 uname_s="$(uname -s)"
@@ -83,7 +83,7 @@ pypi_install() {
                      /opt/python/cp313-cp313/bin/python \
                      /opt/python/cp312-cp312/bin/python \
                      /opt/python/cp311-cp311/bin/python \
-                     /opt/python/cp310-cp310/bin/python \
+                     /opt/python/cp315-cp315/bin/python \
                      python3 python; do
         if command -v "${candidate}" >/dev/null 2>&1; then
             python="${candidate}"

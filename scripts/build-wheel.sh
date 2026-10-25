@@ -14,7 +14,7 @@ cd "${ROOT}"
 
 PYTHON_TAG="${PYTHON_TAG:-cp314-cp314}"
 MANYLINUX_TAG="${MANYLINUX_TAG:-manylinux_2_28_x86_64}"
-ZIG_VERSION="${ZIG_VERSION:-0.16.0}"
+ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 
 mkdir -p dist
 

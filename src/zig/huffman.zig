@@ -310,7 +310,7 @@ const SORTED: [257]SymEntry = blk: {
 // LEN_OFF[L] = index of the first SORTED entry whose nbits >= L. The bucket
 // for codes of exactly length L is SORTED[LEN_OFF[L]..LEN_OFF[L+1]].
 const LEN_OFF: [32]u16 = blk: {
-    var off: [32]u16 = .{0} ** 32;
+    var off: [32]u16 = @splat(0);
     var l: usize = 0;
     var idx: usize = 0;
     while (l <= 31) : (l += 1) {

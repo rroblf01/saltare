@@ -8,7 +8,7 @@ Low-RAM ASGI HTTP server with a **Zig backbone**. An alternative to uvicorn for 
 pip install saltare
 ```
 
-Linux x86_64 / aarch64 wheels (manylinux + musllinux) and macOS arm64 wheels, CPython 3.10–3.14. Zero runtime deps for plain HTTP; TLS / compression libraries (`libssl`, `libz`, `libbrotlienc`, `libzstd`) are `dlopen`'d on first use, so they only need to be present on the host when the matching feature is enabled. On macOS, TLS needs Homebrew `openssl@3` (`brew install openssl@3`) — the system libssl is LibreSSL, which saltare refuses to run against — and brotli/zstd likewise come from Homebrew when wanted.
+Linux x86_64 / aarch64 wheels (manylinux + musllinux) and macOS arm64 wheels, CPython 3.11–3.15. Zero runtime deps for plain HTTP; TLS / compression libraries (`libssl`, `libz`, `libbrotlienc`, `libzstd`) are `dlopen`'d on first use, so they only need to be present on the host when the matching feature is enabled. On macOS, TLS needs Homebrew `openssl@3` (`brew install openssl@3`) — the system libssl is LibreSSL, which saltare refuses to run against — and brotli/zstd likewise come from Homebrew when wanted.
 
 
 ## Quickstart
@@ -1389,7 +1389,7 @@ This invokes `Dockerfile`, which:
 3. Builds the wheel and runs `auditwheel repair`.
 4. Exports `dist/*.whl` to the host.
 
-Override target via env: `PYTHON_TAG=cp310-cp310 MANYLINUX_TAG=manylinux_2_28_aarch64 ./scripts/build-wheel.sh`.
+Override target via env: `PYTHON_TAG=cp311-cp311 MANYLINUX_TAG=manylinux_2_28_aarch64 ./scripts/build-wheel.sh`.
 
 ### Releasing
 

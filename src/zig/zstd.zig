@@ -5,9 +5,7 @@
 
 const std = @import("std");
 
-const dl = @cImport({
-    @cInclude("dlfcn.h");
-});
+const dl = @import("dlfcn");
 
 // zstd public ABI: stable across 1.x. v1.6 adds the streaming surface
 // (`ZSTD_createCCtx` + `ZSTD_compressStream2` + `ZSTD_freeCCtx`) so
@@ -73,14 +71,14 @@ fn loadFuncs() bool {
     }
     if (lib_handle == null) return false;
     var f: Funcs = undefined;
-    inline for (@typeInfo(Funcs).@"struct".fields) |field| {
-        const sym = dl.dlsym(lib_handle, field.name.ptr);
+    inline for (@typeInfo(Funcs).@"struct".field_names) |field_name| {
+        const sym = dl.dlsym(lib_handle, field_name.ptr);
         if (sym == null) {
             _ = dl.dlclose(lib_handle);
             lib_handle = null;
             return false;
         }
-        @field(f, field.name) = @ptrCast(@alignCast(sym));
+        @field(f, field_name) = @ptrCast(@alignCast(sym));
     }
     funcs = f;
     return true;

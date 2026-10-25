@@ -24,9 +24,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const http = @import("http.zig");
 
-const c = @cImport({
-    @cInclude("sys/mman.h");
-});
+const c = @import("pool_c");
 
 /// Bytes available for socket reads in the small (default) buffer.
 pub const SMALL_DATA_SIZE: usize = 4 * 1024;

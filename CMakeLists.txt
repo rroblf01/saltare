@@ -5,7 +5,7 @@ project(saltare LANGUAGES C)
 # find_package(Python). We need Development.Module so that Python.h is located
 # but we deliberately avoid linking libpython on Linux (the interpreter
 # provides the symbols at dlopen time).
-find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+find_package(Python 3.11 COMPONENTS Interpreter Development.Module REQUIRED)
 
 find_program(ZIG_EXECUTABLE zig)
 if(NOT ZIG_EXECUTABLE)
@@ -33,7 +33,7 @@ file(GLOB_RECURSE ZIG_SOURCES CONFIGURE_DEPENDS
 
 # Pick a Zig optimization mode. ReleaseSmall favours code size which is the
 # right trade-off for an embedded extension whose hot path is I/O bound.
-set(ZIG_OPTIMIZE "ReleaseSmall" CACHE STRING "Zig optimize mode")
+set(ZIG_OPTIMIZE "small" CACHE STRING "Zig optimize mode")
 
 # v1.12: Zig does not read MACOSX_DEPLOYMENT_TARGET. cibuildwheel sets it —
 # in pyproject.toml's [tool.cibuildwheel.macos] and again in the workflow —

@@ -34,12 +34,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const c = @cImport({
-    @cInclude("sys/proc_info.h");
-    @cInclude("sys/resource.h");
-    @cInclude("sys/types.h");
-    @cInclude("unistd.h");
-});
+const c = @import("procstats_darwin_c");
 
 /// From <libproc.h>, which we cannot include (see the note above).
 extern fn proc_pidinfo(

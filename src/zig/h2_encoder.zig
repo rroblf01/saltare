@@ -96,9 +96,9 @@ test "encoder/decoder round-trip incl. long values and Huffman" {
     const headers = [_]Header{
         .{ .name = ":status", .value = "200" }, // full static index
         .{ .name = "content-type", .value = "text/html; charset=utf-8" }, // static name, literal value
-        .{ .name = "location", .value = "https://example.com/" ++ "a" ** 300 }, // value >> 128 bytes
+        .{ .name = "location", .value = "https://example.com/" ++ "a"**300 }, // value >> 128 bytes
         .{ .name = "x-custom-header", .value = "some-value-123" }, // literal name + value
-        .{ .name = "set-cookie", .value = "sid=" ++ "b" ** 200 ++ "; Path=/; HttpOnly" },
+        .{ .name = "set-cookie", .value = "sid=" ++ "b"**200 ++ "; Path=/; HttpOnly" },
     };
     const wire = try Encoder.encode(&headers, a);
     defer a.free(wire);

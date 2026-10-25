@@ -24,12 +24,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const c = @cImport({
-    @cInclude("sys/types.h");
-    @cInclude("sys/wait.h");
-    @cInclude("signal.h");
-    @cInclude("unistd.h");
-});
+const c = @import("master_c");
 
 /// Maximum number of worker processes the master will manage. Bound by
 /// the size of the on-stack pid array; users have no business setting

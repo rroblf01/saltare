@@ -14,12 +14,7 @@
 const std = @import("std");
 const http = @import("http.zig");
 
-pub const py = @cImport({
-    // Required since Python 3.13 for any '#' length-prefixed format code
-    // (s#, y#, ...). Must be defined before <Python.h> is included.
-    @cDefine("PY_SSIZE_T_CLEAN", "1");
-    @cInclude("Python.h");
-});
+pub const py = @import("py");
 
 // Per-thread bridge state. Keeping these threadlocal avoids
 // cross-contamination when multiple `serve()` calls run in different
@@ -75,7 +70,7 @@ const COMMON_HEADER_NAMES = [_][]const u8{
     "x-forwarded-proto",
 };
 threadlocal var g_common_header_cache: [COMMON_HEADER_NAMES.len]?*py.PyObject =
-    .{null} ** COMMON_HEADER_NAMES.len;
+    @splat(null);
 
 /// Caller (module.zig) must hold the GIL.
 /// Acquires the references we need to dispatch requests.

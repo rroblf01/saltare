@@ -239,7 +239,7 @@ test "writeFrame: short text" {
 }
 
 test "writeFrame: 200-byte payload uses extended length" {
-    const payload = [_]u8{'a'} ** 200;
+    const payload = [_]u8{'a'}**200;
     var buf: [256]u8 = undefined;
     const out = try writeFrame(&buf, .binary, &payload);
     try testing.expectEqual(@as(usize, 4 + 200), out.len);
