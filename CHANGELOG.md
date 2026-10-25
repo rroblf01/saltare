@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.13.0
 
 **Theme: drop Python 3.10, add Python 3.15; migrate the Zig backbone to 0.17.**
 
