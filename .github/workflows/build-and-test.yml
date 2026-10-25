@@ -95,7 +95,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install cibuildwheel
-        run: pip install cibuildwheel==3.4.1
+        run: pip install cibuildwheel==4.3.4
 
       # Pre-install Zig on the runner (with caching) and mount it into
       # the cibuildwheel container. Avoids `ziglang.org` reachability
